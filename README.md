@@ -23,15 +23,67 @@ through the relay. The relay server never sees keys or endpoints.
 | `app/src-tauri/` | Rust backend: profiles, keychain, providers, context building, streaming. |
 | `docs/PLAN.md` | WebSocket protocol, data models and context-building rules. |
 | `tools/smoke-test.mjs` | Two scripted clients that exercise the relay protocol end to end. |
+| `start.cmd`, `start.ps1`, `start.sh` | One-step setup and launch for Windows, macOS and Linux. |
 | `tools/mock-llm.mjs` | Fake OpenAI and Anthropic streaming server for testing without API keys. |
 
-## Prerequisites
+## Quick start (one script per OS)
+
+The start scripts check for everything the app needs and offer to install anything
+missing. They then build the app (only when the code has changed) and run it.
+
+| OS | Run |
+|---|---|
+| Windows | Double-click `start.cmd`, or run `.\start.cmd` in a terminal |
+| macOS / Linux | `./start.sh` |
+
+What they check and install:
+
+| | Windows | macOS | Linux |
+|---|---|---|---|
+| Compiler | Visual Studio C++ Build Tools (winget) | Xcode Command Line Tools | `build-essential` / Development Tools |
+| System libraries | WebView2 Runtime (winget) | built in | WebKitGTK 4.1, librsvg, appindicator, OpenSSL, D-Bus (apt, dnf or pacman, via sudo) |
+| Rust 1.85+ | rustup (winget) | rustup | rustup |
+| Node.js 22+ | Node LTS (winget) | Homebrew, or nvm | nvm (installed in your home folder) |
+
+The scripts ask before installing anything. Add `--yes` to skip the questions. The first
+build takes a few minutes; after that the app starts right away.
+
+Options (the same on every OS):
+
+```bash
+./start.sh --server              # also host the relay for friends (prints the address to share)
+./start.sh --server --port 9000  # host on a different port
+./start.sh --instance bob        # a second local identity, for testing on one machine
+```
+
+With `--server`, the relay runs until you close the app window. On Windows, allow it
+through the firewall on private networks when asked.
+
+### Playing with a friend
+
+1. **Host:** run `start.cmd --server` or `./start.sh --server`.
+2. **Friend:** gets the project folder (zip or `git clone`) and runs the start script
+   without `--server`.
+3. **Connect:** in the app, each of you sets the relay server address on first launch,
+   or later in **Settings → General**.
+   - **Host:** `ws://127.0.0.1:8787/ws`
+   - **Friend on the same Wi-Fi:** the `ws://192.168.x.x:8787/ws` address the host's
+     terminal printed.
+   - **Friend elsewhere:** the host runs a tunnel such as
+     `cloudflared tunnel --url http://localhost:8787`. The friend uses the printed URL
+     with `wss://` instead of `https://` and `/ws` added at the end, for example
+     `wss://random-words.trycloudflare.com/ws`. Tailscale works too.
+4. **Chat:** the host clicks **New** and shares the invite code. The friend clicks
+   **Join**. Each of you adds your own AI profile in **Settings → AI profiles**.
+
+## Prerequisites (manual setup)
 
 - Rust (stable) and the [Tauri v2 system prerequisites](https://v2.tauri.app/start/prerequisites/)
   for your OS. Windows needs the WebView2 runtime, which ships with Windows 11.
+  On Linux you also need the D-Bus development package (`libdbus-1-dev`) for the keychain.
 - Node.js 22 or newer.
 
-## Run it locally (server and two clients)
+## Run it for development (server and two clients)
 
 **1. Start the relay**
 
