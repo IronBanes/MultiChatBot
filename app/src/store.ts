@@ -1,0 +1,367 @@
+// App state: relay connection, rooms, messages, and AI reply orchestration.
+
+import { create } from "zustand";
+import { backend, errorText } from "./lib/backend";
+import { Relay, type ConnStatus } from "./lib/relay";
+import type { ClientState, HistoryItem, Message, RoomInfo, ServerMsg } from "./lib/types";
+
+export interface Toast {
+  id: number;
+  text: string;
+  kind: "error" | "info";
+}
+
+interface ChatState {
+  client: ClientState | null;
+  status: ConnStatus;
+  rooms: Record<string, RoomInfo>;
+  roomOrder: string[];
+  messages: Record<string, Message[]>;
+  loaded: Record<string, boolean>;
+  unread: Record<string, number>;
+  activeRoomId: string | null;
+  /** AI message ids this client is currently generating. */
+  myGenerations: Record<string, true>;
+  toasts: Toast[];
+
+  init(): Promise<void>;
+  refreshClient(): Promise<void>;
+  saveIdentity(displayName: string, serverUrl: string): Promise<void>;
+  selectRoom(id: string): void;
+  createRoom(name: string): Promise<RoomInfo>;
+  joinRoom(code: string): Promise<RoomInfo>;
+  leaveRoom(id: string): void;
+  sendMessage(roomId: string, content: string, aiRequested: boolean, profileId: string | null): boolean;
+  regenerate(ai: Message, profileId: string): void;
+  stopAi(id: string): void;
+  setRoomPrompt(roomId: string, prompt: string): void;
+  chooseProfile(roomId: string, profileId: string): void;
+  toast(text: string, kind?: Toast["kind"]): void;
+  dismissToast(id: number): void;
+}
+
+let relay: Relay | null = null;
+/** Human message id → profile id, waiting for the server echo before the AI call starts. */
+const pendingAi = new Map<string, string>();
+const pendingRequests = new Map<string, { resolve: (r: RoomInfo) => void; reject: (e: Error) => void }>();
+let toastSeq = 0;
+
+function upsert(list: Message[] | undefined, m: Message): Message[] {
+  const next = (list ?? []).filter((x) => x.id !== m.id);
+  next.push(m);
+  next.sort((a, b) => a.seq - b.seq);
+  return next;
+}
+
+function patchMessage(list: Message[] | undefined, id: string, f: (m: Message) => Message): Message[] | undefined {
+  if (!list) return list;
+  const i = list.findIndex((m) => m.id === id);
+  if (i < 0) return list;
+  const next = list.slice();
+  next[i] = f(next[i]);
+  return next;
+}
+
+function request(build: (requestId: string) => Parameters<Relay["send"]>[0]): Promise<RoomInfo> {
+  return new Promise((resolve, reject) => {
+    const requestId = crypto.randomUUID();
+    if (!relay?.send(build(requestId))) {
+      reject(new Error("Not connected to the server"));
+      return;
+    }
+    pendingRequests.set(requestId, { resolve, reject });
+    window.setTimeout(() => {
+      if (pendingRequests.delete(requestId)) reject(new Error("The server did not respond"));
+    }, 10_000);
+  });
+}
+
+export const useChat = create<ChatState>((set, get) => {
+  const patchRoom = (roomId: string, f: (r: RoomInfo) => RoomInfo) =>
+    set((s) => (s.rooms[roomId] ? { rooms: { ...s.rooms, [roomId]: f(s.rooms[roomId]) } } : {}));
+
+  const stopAllGenerations = () => {
+    for (const id of Object.keys(get().myGenerations)) void backend.stopGeneration(id);
+  };
+
+  function connect() {
+    const client = get().client;
+    relay?.close();
+    relay = null;
+    if (!client?.display_name) return;
+    relay = new Relay(
+      client.server_url,
+      { user_id: client.user_id, display_name: client.display_name },
+      {
+        onMessage: handle,
+        onStatus: (status) => {
+          // The relay marks our in-flight replies as interrupted when the socket drops.
+          if (status === "offline") stopAllGenerations();
+          set({ status });
+        },
+      },
+    );
+  }
+
+  function startAi(roomId: string, anchor: Message, profileId: string) {
+    const s = get();
+    const profile = s.client?.profiles.find((p) => p.id === profileId);
+    if (!profile) {
+      get().toast("That AI profile no longer exists. Pick another one.");
+      return;
+    }
+    const room = s.rooms[roomId];
+    const history: HistoryItem[] = (s.messages[roomId] ?? [])
+      .filter((m) => m.seq <= anchor.seq && (m.kind === "human" || m.status === "complete"))
+      .map((m) => ({ kind: m.kind, author_name: m.author_name, content: m.content }));
+
+    const id = crypto.randomUUID();
+    if (!relay?.send({ type: "ai_start", room_id: roomId, id, anchor_id: anchor.id, model: profile.model })) {
+      get().toast("Not connected to the server");
+      return;
+    }
+    set((st) => ({ myGenerations: { ...st.myGenerations, [id]: true } }));
+    const finish = () =>
+      set((st) => {
+        const { [id]: _, ...rest } = st.myGenerations;
+        return { myGenerations: rest };
+      });
+
+    backend
+      .generate(id, profileId, history, room?.system_prompt ?? "", (ev) => {
+        if (ev.event === "delta") {
+          relay?.send({ type: "ai_delta", room_id: roomId, id, delta: ev.text });
+        } else if (ev.event === "done") {
+          relay?.send({ type: "ai_complete", room_id: roomId, id, content: ev.content });
+          finish();
+        } else {
+          relay?.send({ type: "ai_error", room_id: roomId, id, error: ev.message });
+          finish();
+        }
+      })
+      .catch((e) => {
+        relay?.send({ type: "ai_error", room_id: roomId, id, error: errorText(e) });
+        finish();
+      });
+  }
+
+  function handle(msg: ServerMsg) {
+    switch (msg.type) {
+      case "welcome": {
+        const rooms: Record<string, RoomInfo> = {};
+        for (const r of msg.rooms) rooms[r.id] = r;
+        const order = msg.rooms.map((r) => r.id);
+        let active = get().activeRoomId;
+        if (!active || !rooms[active]) active = order[0] ?? null;
+        set({ rooms, roomOrder: order, loaded: {}, activeRoomId: active });
+        if (active) relay?.send({ type: "open_room", room_id: active });
+        break;
+      }
+      case "room_joined": {
+        const r = msg.room;
+        set((s) => ({
+          rooms: { ...s.rooms, [r.id]: r },
+          roomOrder: s.roomOrder.includes(r.id) ? s.roomOrder : [...s.roomOrder, r.id],
+        }));
+        const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
+        if (msg.request_id) pendingRequests.delete(msg.request_id);
+        pending?.resolve(r);
+        get().selectRoom(r.id);
+        break;
+      }
+      case "room_left":
+        set((s) => {
+          const { [msg.room_id]: _, ...rooms } = s.rooms;
+          const roomOrder = s.roomOrder.filter((id) => id !== msg.room_id);
+          return {
+            rooms,
+            roomOrder,
+            activeRoomId: s.activeRoomId === msg.room_id ? (roomOrder[0] ?? null) : s.activeRoomId,
+          };
+        });
+        break;
+      case "room_history":
+        set((s) => {
+          // Keep anything live that arrived after the history snapshot.
+          const maxSeq = msg.messages.length ? msg.messages[msg.messages.length - 1].seq : -1;
+          const newer = (s.messages[msg.room_id] ?? []).filter((m) => m.seq > maxSeq);
+          return {
+            messages: { ...s.messages, [msg.room_id]: [...msg.messages, ...newer] },
+            loaded: { ...s.loaded, [msg.room_id]: true },
+          };
+        });
+        break;
+      case "message": {
+        const m = msg.message;
+        const mine = m.author_id === get().client?.user_id;
+        set((s) => ({
+          messages: { ...s.messages, [m.room_id]: upsert(s.messages[m.room_id], m) },
+          unread:
+            s.activeRoomId === m.room_id || (mine && m.kind === "human")
+              ? s.unread
+              : { ...s.unread, [m.room_id]: (s.unread[m.room_id] ?? 0) + 1 },
+        }));
+        const profileId = pendingAi.get(m.id);
+        if (profileId && m.kind === "human") {
+          pendingAi.delete(m.id);
+          startAi(m.room_id, m, profileId);
+        }
+        break;
+      }
+      case "ai_delta":
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [msg.room_id]: patchMessage(s.messages[msg.room_id], msg.id, (m) =>
+              m.status === "streaming" ? { ...m, content: m.content + msg.delta } : m,
+            )!,
+          },
+        }));
+        break;
+      case "ai_complete":
+      case "ai_error":
+      case "ai_interrupted":
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [msg.room_id]: patchMessage(s.messages[msg.room_id], msg.id, (m) =>
+              msg.type === "ai_complete"
+                ? { ...m, content: msg.content, status: "complete" }
+                : msg.type === "ai_error"
+                  ? { ...m, status: "error", error: msg.error }
+                  : { ...m, content: msg.content, status: "interrupted" },
+            )!,
+          },
+        }));
+        break;
+      case "member_joined":
+      case "member_updated":
+        patchRoom(msg.room_id, (r) => {
+          const exists = r.members.some((m) => m.user_id === msg.member.user_id);
+          return {
+            ...r,
+            members: exists
+              ? r.members.map((m) => (m.user_id === msg.member.user_id ? { ...m, display_name: msg.member.display_name } : m))
+              : [...r.members, msg.member],
+          };
+        });
+        break;
+      case "member_left":
+        patchRoom(msg.room_id, (r) => ({ ...r, members: r.members.filter((m) => m.user_id !== msg.user_id) }));
+        break;
+      case "presence":
+        patchRoom(msg.room_id, (r) => ({
+          ...r,
+          members: r.members.map((m) => (m.user_id === msg.user_id ? { ...m, online: msg.online } : m)),
+        }));
+        break;
+      case "room_updated":
+        patchRoom(msg.room_id, (r) => ({ ...r, system_prompt: msg.system_prompt }));
+        break;
+      case "error": {
+        const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
+        if (pending && msg.request_id) {
+          pendingRequests.delete(msg.request_id);
+          pending.reject(new Error(msg.message));
+        } else {
+          get().toast(msg.message);
+        }
+        break;
+      }
+    }
+  }
+
+  return {
+    client: null,
+    status: "offline",
+    rooms: {},
+    roomOrder: [],
+    messages: {},
+    loaded: {},
+    unread: {},
+    activeRoomId: null,
+    myGenerations: {},
+    toasts: [],
+
+    async init() {
+      await get().refreshClient();
+      connect();
+    },
+
+    async refreshClient() {
+      set({ client: await backend.getState() });
+    },
+
+    async saveIdentity(displayName, serverUrl) {
+      const before = get().client;
+      await backend.setIdentity(displayName, serverUrl);
+      await get().refreshClient();
+      const after = get().client!;
+      if (!relay || before?.server_url !== after.server_url || !before?.display_name) {
+        set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null });
+        connect();
+      } else if (before.display_name !== after.display_name) {
+        relay.rename(after.display_name);
+      }
+    },
+
+    selectRoom(id) {
+      set((s) => ({ activeRoomId: id, unread: { ...s.unread, [id]: 0 } }));
+      if (!get().loaded[id]) relay?.send({ type: "open_room", room_id: id });
+    },
+
+    createRoom: (name) => request((request_id) => ({ type: "create_room", request_id, name })),
+    joinRoom: (code) => request((request_id) => ({ type: "join_room", request_id, invite_code: code })),
+
+    leaveRoom(id) {
+      relay?.send({ type: "leave_room", room_id: id });
+    },
+
+    sendMessage(roomId, content, aiRequested, profileId) {
+      const id = crypto.randomUUID();
+      if (aiRequested && profileId) pendingAi.set(id, profileId);
+      const ok = !!relay?.send({ type: "send_message", room_id: roomId, id, content, ai_requested: aiRequested });
+      if (!ok) {
+        pendingAi.delete(id);
+        get().toast("Not connected to the server");
+      }
+      return ok;
+    },
+
+    regenerate(ai, profileId) {
+      const anchor = get().messages[ai.room_id]?.find((m) => m.id === ai.anchor_id);
+      if (!anchor) {
+        get().toast("The message this reply answers is no longer loaded");
+        return;
+      }
+      startAi(ai.room_id, anchor, profileId);
+    },
+
+    stopAi(id) {
+      void backend.stopGeneration(id);
+    },
+
+    setRoomPrompt(roomId, prompt) {
+      relay?.send({ type: "set_room_prompt", room_id: roomId, system_prompt: prompt });
+    },
+
+    chooseProfile(roomId, profileId) {
+      set((s) =>
+        s.client
+          ? { client: { ...s.client, last_profile_by_room: { ...s.client.last_profile_by_room, [roomId]: profileId } } }
+          : {},
+      );
+      void backend.setLastProfile(roomId, profileId);
+    },
+
+    toast(text, kind = "error") {
+      const id = ++toastSeq;
+      set((s) => ({ toasts: [...s.toasts, { id, text, kind }] }));
+      window.setTimeout(() => get().dismissToast(id), 5000);
+    },
+
+    dismissToast(id) {
+      set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) }));
+    },
+  };
+});

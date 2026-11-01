@@ -1,0 +1,138 @@
+# Multichat — design plan
+
+Group chat where every AI reply is generated with the API profile of the human whose
+message triggered it. The relay server never sees keys or endpoints.
+
+```
+┌──────────── client A (Tauri) ────────────┐        ┌──── relay (axum) ────┐
+│ webview (React)  ── invoke/Channel ──► Rust│◄─ws──►│ rooms, members,      │◄─ws─► client B
+│  WS to relay                   LLM calls ─┼──►LLM │ messages (SQLite)    │
+└──────────────────────────────────────────┘        └──────────────────────┘
+```
+
+* The webview owns the WebSocket to the relay.
+* The Rust side owns profiles, the OS keychain and **all** LLM HTTP calls. It streams
+  batched deltas (~100 ms) back to the webview over a `tauri::ipc::Channel`; the webview
+  forwards them to the relay as `ai_delta`.
+
+## Data models
+
+### Server (SQLite)
+
+```sql
+users    (id TEXT PK, display_name TEXT, updated_at INTEGER)
+rooms    (id TEXT PK, name TEXT, invite_code TEXT UNIQUE, system_prompt TEXT,
+          created_by TEXT, created_at INTEGER)
+members  (room_id TEXT, user_id TEXT, joined_at INTEGER, PRIMARY KEY(room_id, user_id))
+messages (seq INTEGER PK AUTOINCREMENT,      -- global ordering
+          id TEXT UNIQUE,                    -- client-generated UUID
+          room_id TEXT, kind TEXT,           -- 'human' | 'ai'
+          author_id TEXT, author_name TEXT,  -- human: author. ai: triggering user
+          content TEXT,
+          ai_requested INTEGER,              -- human: did it ask for an AI reply
+          anchor_id TEXT,                    -- ai: triggering human message id
+          model TEXT,                        -- ai: model name (never base URL / key)
+          status TEXT,                       -- 'complete'|'streaming'|'error'|'interrupted'
+          error TEXT, created_at INTEGER)
+```
+
+On startup any leftover `streaming` rows become `interrupted`.
+Partial text of in-flight streams is kept in memory so late joiners see it.
+
+### Client (local, per instance)
+
+`<app config dir>/<instance>/config.json` (instance = `MULTICHAT_INSTANCE` env var,
+default `default`, so several clients can run on one machine):
+
+```jsonc
+{
+  "user_id": "uuid", "display_name": "Alice",
+  "server_url": "ws://127.0.0.1:8787/ws",
+  "last_profile_by_room": { "<room_id>": "<profile_id>" },
+  "profiles": [{
+    "id": "uuid", "label": "Claude", "provider": "anthropic" | "openai",
+    "base_url": "https://api.anthropic.com", "model": "claude-opus-5-5",
+    "max_context_tokens": 100000, "temperature": null
+  }]
+}
+```
+
+API keys: OS keychain via `keyring`, service `multichat-bot`, account `profile:<id>`.
+
+## WebSocket protocol
+
+JSON text frames, `{"type": "...", ...}` (snake_case). One socket per client carries
+all rooms. The first client frame must be `hello`.
+
+### Client → server
+
+| type | fields | notes |
+|---|---|---|
+| `hello` | `user_id, display_name` | also used to rename |
+| `create_room` | `request_id, name` | → `room_joined` |
+| `join_room` | `request_id, invite_code` | → `room_joined` |
+| `leave_room` | `room_id` | |
+| `open_room` | `room_id` | → `room_history` |
+| `send_message` | `room_id, id, content, ai_requested` | human message |
+| `ai_start` | `room_id, id, anchor_id, model` | anchor = human msg in room |
+| `ai_delta` | `room_id, id, delta` | only from the stream's owner connection |
+| `ai_complete` | `room_id, id, content` | full final text, persisted |
+| `ai_error` | `room_id, id, error` | short, sanitized reason |
+| `set_room_prompt` | `room_id, system_prompt` | any member |
+
+### Server → client
+
+| type | fields |
+|---|---|
+| `welcome` | `user_id, rooms: RoomInfo[]` |
+| `room_joined` | `request_id?, room: RoomInfo` |
+| `room_left` | `room_id` |
+| `room_history` | `room_id, messages: Message[]` |
+| `message` | `room_id, message: Message` (human, or AI on `ai_start` with status `streaming`) |
+| `ai_delta` | `room_id, id, delta` |
+| `ai_complete` | `room_id, id, content` |
+| `ai_error` | `room_id, id, error` |
+| `ai_interrupted` | `room_id, id, content` (partial) |
+| `member_joined` / `member_updated` | `room_id, member: Member` |
+| `member_left` | `room_id, user_id` |
+| `presence` | `room_id, user_id, online` |
+| `room_updated` | `room_id, system_prompt, updated_by` |
+| `error` | `request_id?, message` |
+
+`RoomInfo = {id, name, invite_code, system_prompt, members: Member[]}`
+`Member = {user_id, display_name, online}`
+
+### AI reply lifecycle
+
+```
+sender client                  relay                         others
+send_message ───────────────►  persist, broadcast `message` ──►
+ai_start ───────────────────►  insert streaming row, broadcast `message`(streaming)
+   (Rust streams provider, flushes every ~100ms)
+ai_delta × n ───────────────►  append in-memory buffer, broadcast ──►
+ai_complete ────────────────►  persist final text, broadcast ──►
+   or ai_error ─────────────►  persist status=error, broadcast ──►
+socket closes mid-stream  ──►  status=interrupted (partial kept), broadcast ai_interrupted
+```
+
+## Context building (Rust, `app/src-tauri/src/context.rs`)
+
+1. History = room messages in `seq` order up to and including the anchor; human messages
+   (incl. human-only) and *complete* AI messages.
+2. Human → `user` `"[Name]: text"`; AI → `assistant` (whoever generated it).
+3. System prompt = group-chat preamble + optional room prompt.
+4. Trim oldest until `estimate(system) + Σ estimate(msg) + output_reserve ≤ max_context`
+   (estimate ≈ chars/4 + 4). The anchor message is always kept.
+5. Drop leading `assistant` messages, merge consecutive same-role messages.
+
+## Provider trait
+
+```rust
+#[async_trait]
+trait Provider { async fn stream_chat(&self, req: &ChatRequest) -> Result<DeltaStream, ProviderError>; }
+```
+
+Implementations: `OpenAiCompatible` (`POST {base}/chat/completions`, SSE) and
+`Anthropic` (`POST {base}/v1/messages`, `anthropic-version: 2026-10-21`, SSE; no sampling
+params since that version rejects them). Errors are sanitized: key, base URL and host are
+redacted and the text is truncated.

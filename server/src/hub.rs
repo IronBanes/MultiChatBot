@@ -1,0 +1,488 @@
+//! Connection registry, room fan-out and the message handlers.
+
+use crate::db::{self, Db, NewMessage};
+use crate::protocol::{ClientMsg, Member, RoomInfo, ServerMsg};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc::UnboundedSender;
+
+const MAX_NAME: usize = 40;
+const MAX_ROOM_NAME: usize = 80;
+const MAX_CONTENT: usize = 200_000;
+const MAX_PROMPT: usize = 8_000;
+const MAX_ERROR: usize = 300;
+const HISTORY_LIMIT: i64 = 1000;
+
+pub type ConnId = u64;
+
+struct Conn {
+    user_id: Option<String>,
+    display_name: String,
+    tx: UnboundedSender<String>,
+    rooms: HashSet<String>,
+}
+
+/// An AI reply that is currently being streamed by one connection.
+struct Stream {
+    room_id: String,
+    conn_id: ConnId,
+    content: String,
+}
+
+#[derive(Default)]
+struct Hub {
+    next_id: ConnId,
+    conns: HashMap<ConnId, Conn>,
+    streams: HashMap<String, Stream>,
+}
+
+impl Hub {
+    fn is_online(&self, user_id: &str, room_id: &str) -> bool {
+        self.conns
+            .values()
+            .any(|c| c.user_id.as_deref() == Some(user_id) && c.rooms.contains(room_id))
+    }
+
+    fn send(&self, conn_id: ConnId, msg: &ServerMsg) {
+        if let Some(c) = self.conns.get(&conn_id) {
+            let _ = c.tx.send(serde_json::to_string(msg).expect("serializable"));
+        }
+    }
+
+    fn broadcast(&self, room_id: &str, msg: &ServerMsg) {
+        let text = serde_json::to_string(msg).expect("serializable");
+        for c in self.conns.values().filter(|c| c.rooms.contains(room_id)) {
+            let _ = c.tx.send(text.clone());
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct State {
+    pub db: Db,
+    hub: Arc<Mutex<Hub>>,
+}
+
+fn clip(s: &str, max: usize) -> String {
+    s.trim().chars().take(max).collect()
+}
+
+fn err(request_id: Option<String>, message: impl Into<String>) -> ServerMsg {
+    ServerMsg::Error { request_id, message: message.into() }
+}
+
+impl State {
+    pub fn new(db: Db) -> Self {
+        Self { db, hub: Arc::new(Mutex::new(Hub::default())) }
+    }
+
+    fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
+        self.hub.lock().expect("hub mutex poisoned")
+    }
+
+    pub fn register(&self, tx: UnboundedSender<String>) -> ConnId {
+        let mut hub = self.hub();
+        hub.next_id += 1;
+        let id = hub.next_id;
+        hub.conns.insert(
+            id,
+            Conn { user_id: None, display_name: String::new(), tx, rooms: HashSet::new() },
+        );
+        id
+    }
+
+    pub fn send(&self, conn: ConnId, msg: ServerMsg) {
+        self.hub().send(conn, &msg);
+    }
+
+    fn broadcast(&self, room_id: &str, msg: ServerMsg) {
+        self.hub().broadcast(room_id, &msg);
+    }
+
+    /// (user_id, display_name) once `hello` has been received.
+    fn identity(&self, conn: ConnId) -> Option<(String, String)> {
+        let hub = self.hub();
+        let c = hub.conns.get(&conn)?;
+        Some((c.user_id.clone()?, c.display_name.clone()))
+    }
+
+    fn in_room(&self, conn: ConnId, room_id: &str) -> bool {
+        self.hub().conns.get(&conn).is_some_and(|c| c.rooms.contains(room_id))
+    }
+
+    async fn room_info(&self, room_id: &str) -> sqlx::Result<Option<RoomInfo>> {
+        let Some(row) = db::room(&self.db, room_id).await? else { return Ok(None) };
+        let hub = self.hub();
+        let members = row
+            .members
+            .into_iter()
+            .map(|(user_id, display_name)| Member {
+                online: hub.is_online(&user_id, room_id),
+                user_id,
+                display_name,
+            })
+            .collect();
+        Ok(Some(RoomInfo {
+            id: row.id,
+            name: row.name,
+            invite_code: row.invite_code,
+            system_prompt: row.system_prompt,
+            members,
+        }))
+    }
+
+    /// Subscribes every connection of `user_id` to `room_id` and announces presence.
+    fn subscribe_user(&self, user_id: &str, room_id: &str) {
+        let mut hub = self.hub();
+        let was_online = hub.is_online(user_id, room_id);
+        for c in hub.conns.values_mut().filter(|c| c.user_id.as_deref() == Some(user_id)) {
+            c.rooms.insert(room_id.to_string());
+        }
+        if !was_online {
+            let msg = ServerMsg::Presence {
+                room_id: room_id.into(),
+                user_id: user_id.into(),
+                online: true,
+            };
+            hub.broadcast(room_id, &msg);
+        }
+    }
+
+    pub async fn handle(&self, conn: ConnId, msg: ClientMsg) {
+        if let Err(e) = self.dispatch(conn, msg).await {
+            tracing::error!("handler error: {e}");
+            self.send(conn, err(None, "Internal server error"));
+        }
+    }
+
+    async fn dispatch(&self, conn: ConnId, msg: ClientMsg) -> sqlx::Result<()> {
+        if let ClientMsg::Hello { user_id, display_name } = msg {
+            return self.hello(conn, user_id, display_name).await;
+        }
+        let Some((user_id, display_name)) = self.identity(conn) else {
+            self.send(conn, err(None, "Send hello first"));
+            return Ok(());
+        };
+
+        match msg {
+            ClientMsg::Hello { .. } => unreachable!(),
+
+            ClientMsg::CreateRoom { request_id, name } => {
+                let name = clip(&name, MAX_ROOM_NAME);
+                if name.is_empty() {
+                    self.send(conn, err(Some(request_id), "Room name is required"));
+                    return Ok(());
+                }
+                let room_id = db::create_room(&self.db, &name, &user_id).await?;
+                self.subscribe_user(&user_id, &room_id);
+                if let Some(room) = self.room_info(&room_id).await? {
+                    self.send(conn, ServerMsg::RoomJoined { request_id: Some(request_id), room });
+                }
+            }
+
+            ClientMsg::JoinRoom { request_id, invite_code } => {
+                let code = invite_code.trim().to_uppercase();
+                let Some(room_id) = db::room_id_by_code(&self.db, &code).await? else {
+                    self.send(conn, err(Some(request_id), "No room with that invite code"));
+                    return Ok(());
+                };
+                let added = db::add_member(&self.db, &room_id, &user_id).await?;
+                if added {
+                    self.broadcast(
+                        &room_id,
+                        ServerMsg::MemberJoined {
+                            room_id: room_id.clone(),
+                            member: Member {
+                                user_id: user_id.clone(),
+                                display_name: display_name.clone(),
+                                online: true,
+                            },
+                        },
+                    );
+                }
+                self.subscribe_user(&user_id, &room_id);
+                if let Some(room) = self.room_info(&room_id).await? {
+                    self.send(conn, ServerMsg::RoomJoined { request_id: Some(request_id), room });
+                }
+            }
+
+            ClientMsg::LeaveRoom { room_id } => {
+                if !self.in_room(conn, &room_id) {
+                    return Ok(());
+                }
+                db::remove_member(&self.db, &room_id, &user_id).await?;
+                let mut hub = self.hub();
+                let mine: Vec<ConnId> = hub
+                    .conns
+                    .iter()
+                    .filter(|(_, c)| c.user_id.as_deref() == Some(user_id.as_str()))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in &mine {
+                    hub.send(*id, &ServerMsg::RoomLeft { room_id: room_id.clone() });
+                    if let Some(c) = hub.conns.get_mut(id) {
+                        c.rooms.remove(&room_id);
+                    }
+                }
+                hub.broadcast(
+                    &room_id,
+                    &ServerMsg::MemberLeft { room_id: room_id.clone(), user_id: user_id.clone() },
+                );
+            }
+
+            ClientMsg::OpenRoom { room_id } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(None, "Not a member of that room"));
+                    return Ok(());
+                }
+                let mut messages = db::recent_messages(&self.db, &room_id, HISTORY_LIMIT).await?;
+                {
+                    // Late joiners get the partial text of in-flight streams.
+                    let hub = self.hub();
+                    for m in messages.iter_mut().filter(|m| m.status == "streaming") {
+                        if let Some(s) = hub.streams.get(&m.id) {
+                            m.content = s.content.clone();
+                        }
+                    }
+                }
+                self.send(conn, ServerMsg::RoomHistory { room_id, messages });
+            }
+
+            ClientMsg::SendMessage { room_id, id, content, ai_requested } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(None, "Not a member of that room"));
+                    return Ok(());
+                }
+                if uuid::Uuid::parse_str(&id).is_err() {
+                    self.send(conn, err(None, "Invalid message id"));
+                    return Ok(());
+                }
+                if content.trim().is_empty() || content.len() > MAX_CONTENT {
+                    self.send(conn, err(None, "Message is empty or too long"));
+                    return Ok(());
+                }
+                let res = db::insert_message(
+                    &self.db,
+                    NewMessage {
+                        id: &id,
+                        room_id: &room_id,
+                        kind: "human",
+                        author_id: &user_id,
+                        author_name: &display_name,
+                        content: &content,
+                        ai_requested,
+                        anchor_id: None,
+                        model: None,
+                        status: "complete",
+                    },
+                )
+                .await;
+                match res {
+                    Ok(message) => self.broadcast(&room_id, ServerMsg::Message { room_id: room_id.clone(), message }),
+                    Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                        self.send(conn, err(None, "Duplicate message id"));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            ClientMsg::AiStart { room_id, id, anchor_id, model } => {
+                if !self.in_room(conn, &room_id) || uuid::Uuid::parse_str(&id).is_err() {
+                    self.send(conn, err(None, "Cannot start AI reply"));
+                    return Ok(());
+                }
+                let anchor = db::message(&self.db, &anchor_id).await?;
+                if !anchor.is_some_and(|a| a.room_id == room_id && a.kind == "human") {
+                    self.send(conn, err(None, "AI reply must be anchored to a human message in the room"));
+                    return Ok(());
+                }
+                let model = clip(&model, 120);
+                let res = db::insert_message(
+                    &self.db,
+                    NewMessage {
+                        id: &id,
+                        room_id: &room_id,
+                        kind: "ai",
+                        author_id: &user_id,
+                        author_name: &display_name,
+                        content: "",
+                        ai_requested: false,
+                        anchor_id: Some(&anchor_id),
+                        model: Some(&model),
+                        status: "streaming",
+                    },
+                )
+                .await;
+                let message = match res {
+                    Ok(m) => m,
+                    Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+                        self.send(conn, err(None, "Duplicate message id"));
+                        return Ok(());
+                    }
+                    Err(e) => return Err(e),
+                };
+                let mut hub = self.hub();
+                hub.streams.insert(
+                    id,
+                    Stream { room_id: room_id.clone(), conn_id: conn, content: String::new() },
+                );
+                hub.broadcast(&room_id, &ServerMsg::Message { room_id: room_id.clone(), message });
+            }
+
+            ClientMsg::AiDelta { room_id, id, delta } => {
+                let mut hub = self.hub();
+                let Some(s) = hub.streams.get_mut(&id) else { return Ok(()) };
+                if s.conn_id != conn || s.room_id != room_id || s.content.len() + delta.len() > MAX_CONTENT {
+                    return Ok(());
+                }
+                s.content.push_str(&delta);
+                hub.broadcast(&room_id, &ServerMsg::AiDelta { room_id: room_id.clone(), id, delta });
+            }
+
+            ClientMsg::AiComplete { room_id, id, content } => {
+                if !self.take_stream(conn, &room_id, &id) {
+                    return Ok(());
+                }
+                let content: String = content.chars().take(MAX_CONTENT).collect();
+                db::finish_ai(&self.db, &id, &content, "complete", None).await?;
+                self.broadcast(&room_id, ServerMsg::AiComplete { room_id: room_id.clone(), id, content });
+            }
+
+            ClientMsg::AiError { room_id, id, error } => {
+                let partial = {
+                    let hub = self.hub();
+                    hub.streams.get(&id).map(|s| s.content.clone()).unwrap_or_default()
+                };
+                if !self.take_stream(conn, &room_id, &id) {
+                    return Ok(());
+                }
+                let error = clip(&error, MAX_ERROR);
+                db::finish_ai(&self.db, &id, &partial, "error", Some(&error)).await?;
+                self.broadcast(&room_id, ServerMsg::AiError { room_id: room_id.clone(), id, error });
+            }
+
+            ClientMsg::SetRoomPrompt { room_id, system_prompt } => {
+                if !self.in_room(conn, &room_id) {
+                    return Ok(());
+                }
+                let prompt: String = system_prompt.trim().chars().take(MAX_PROMPT).collect();
+                db::set_room_prompt(&self.db, &room_id, &prompt).await?;
+                self.broadcast(
+                    &room_id,
+                    ServerMsg::RoomUpdated { room_id: room_id.clone(), system_prompt: prompt, updated_by: user_id },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes a stream if `conn` owns it. Returns false if it does not.
+    fn take_stream(&self, conn: ConnId, room_id: &str, id: &str) -> bool {
+        let mut hub = self.hub();
+        match hub.streams.get(id) {
+            Some(s) if s.conn_id == conn && s.room_id == room_id => {
+                hub.streams.remove(id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    async fn hello(&self, conn: ConnId, user_id: String, display_name: String) -> sqlx::Result<()> {
+        let display_name = clip(&display_name, MAX_NAME);
+        if uuid::Uuid::parse_str(&user_id).is_err() || display_name.is_empty() {
+            self.send(conn, err(None, "hello needs a UUID user_id and a display name"));
+            return Ok(());
+        }
+        if let Some((existing, _)) = self.identity(conn) {
+            if existing != user_id {
+                self.send(conn, err(None, "Cannot change user on an open connection"));
+                return Ok(());
+            }
+        }
+        let prev_name = db::upsert_user(&self.db, &user_id, &display_name).await?;
+        let room_ids = db::user_room_ids(&self.db, &user_id).await?;
+
+        let newly_online: Vec<String> = {
+            let mut hub = self.hub();
+            let newly: Vec<String> =
+                room_ids.iter().filter(|r| !hub.is_online(&user_id, r)).cloned().collect();
+            if let Some(c) = hub.conns.get_mut(&conn) {
+                c.user_id = Some(user_id.clone());
+                c.display_name = display_name.clone();
+                c.rooms = room_ids.iter().cloned().collect();
+            }
+            // Keep the name current on this user's other connections too.
+            for c in hub.conns.values_mut().filter(|c| c.user_id.as_deref() == Some(user_id.as_str())) {
+                c.display_name = display_name.clone();
+            }
+            newly
+        };
+
+        let renamed = prev_name.is_some_and(|p| p != display_name);
+        {
+            let hub = self.hub();
+            for room_id in &room_ids {
+                if renamed {
+                    let member = Member {
+                        user_id: user_id.clone(),
+                        display_name: display_name.clone(),
+                        online: true,
+                    };
+                    hub.broadcast(room_id, &ServerMsg::MemberUpdated { room_id: room_id.clone(), member });
+                }
+                if newly_online.contains(room_id) {
+                    let msg = ServerMsg::Presence {
+                        room_id: room_id.clone(),
+                        user_id: user_id.clone(),
+                        online: true,
+                    };
+                    hub.broadcast(room_id, &msg);
+                }
+            }
+        }
+
+        let mut rooms = Vec::with_capacity(room_ids.len());
+        for id in &room_ids {
+            if let Some(info) = self.room_info(id).await? {
+                rooms.push(info);
+            }
+        }
+        self.send(conn, ServerMsg::Welcome { user_id, rooms });
+        Ok(())
+    }
+
+    pub async fn disconnect(&self, conn: ConnId) {
+        let (orphaned, user_id, rooms) = {
+            let mut hub = self.hub();
+            let Some(c) = hub.conns.remove(&conn) else { return };
+            let ids: Vec<String> =
+                hub.streams.iter().filter(|(_, s)| s.conn_id == conn).map(|(id, _)| id.clone()).collect();
+            let orphaned: Vec<(String, Stream)> =
+                ids.into_iter().filter_map(|id| hub.streams.remove(&id).map(|s| (id, s))).collect();
+            (orphaned, c.user_id, c.rooms)
+        };
+
+        for (id, s) in orphaned {
+            if let Err(e) = db::finish_ai(&self.db, &id, &s.content, "interrupted", None).await {
+                tracing::error!("failed to mark {id} interrupted: {e}");
+            }
+            self.broadcast(
+                &s.room_id,
+                ServerMsg::AiInterrupted { room_id: s.room_id.clone(), id, content: s.content },
+            );
+        }
+
+        if let Some(user_id) = user_id {
+            let hub = self.hub();
+            for room_id in rooms.iter().filter(|r| !hub.is_online(&user_id, r)) {
+                let msg = ServerMsg::Presence {
+                    room_id: room_id.clone(),
+                    user_id: user_id.clone(),
+                    online: false,
+                };
+                hub.broadcast(room_id, &msg);
+            }
+        }
+    }
+}

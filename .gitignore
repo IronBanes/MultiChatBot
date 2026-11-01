@@ -1,0 +1,11 @@
+# Rust
+target/
+# Node / Vite
+node_modules/
+app/dist/
+# Tauri generated schemas
+app/src-tauri/gen/
+# Local relay databases
+*.db
+*.db-shm
+*.db-wal
