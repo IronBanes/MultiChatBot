@@ -26,13 +26,19 @@ const NOT_REGISTERED = "connection not found";
 const REGISTER_RETRIES = 20;
 const REGISTER_RETRY_MS = 25;
 
-async function sendWhenRegistered(ws: WebSocket, frame: Parameters<WebSocket["send"]>[0]) {
+/** Thrown for frames queued on a connection that has since been replaced. */
+class StaleConnection extends Error {}
+
+async function sendWhenRegistered(ws: WebSocket, frame: Parameters<WebSocket["send"]>[0], isCurrent: () => boolean) {
   for (let attempt = 0; ; attempt++) {
+    if (!isCurrent()) throw new StaleConnection();
     try {
       await ws.send(frame);
       return;
     } catch (e) {
-      if (attempt >= REGISTER_RETRIES || !String(e).toLowerCase().includes(NOT_REGISTERED)) throw e;
+      // After a drop the plugin also reports "connection not found"; only retry while
+      // this is still the live connection (i.e. the writer just isn't registered yet).
+      if (attempt >= REGISTER_RETRIES || !isCurrent() || !String(e).toLowerCase().includes(NOT_REGISTERED)) throw e;
       await new Promise((r) => setTimeout(r, REGISTER_RETRY_MS));
     }
   }
@@ -46,7 +52,8 @@ export class Relay {
   private pingTimer: number | undefined;
   private lastHeard = 0;
   private closed = false;
-  /** Sends go through one queue so frames reach the relay in the order they were sent. */
+  /** Sends go through one queue per connection so frames reach the relay in the order
+   *  they were sent; a new connection starts with an empty queue. */
   private queue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -72,6 +79,7 @@ export class Relay {
       return;
     }
     this.ws = ws;
+    this.queue = Promise.resolve();
     this.retry = 0;
     this.lastHeard = Date.now();
     ws.addListener((m) => this.onFrame(gen, m));
@@ -108,7 +116,8 @@ export class Relay {
         return;
       }
       const ws = this.ws;
-      this.queue = this.queue.then(() => sendWhenRegistered(ws, { type: "Ping", data: [] })).catch(() => this.dropped(gen));
+      const isCurrent = () => gen === this.generation;
+      this.queue = this.queue.then(() => sendWhenRegistered(ws, { type: "Ping", data: [] }, isCurrent)).catch(() => this.dropped(gen));
     }, PING_EVERY);
   }
 
@@ -150,7 +159,8 @@ export class Relay {
     if (!ws) return null;
     const gen = this.generation;
     const text = JSON.stringify(msg);
-    const written = this.queue.then(() => sendWhenRegistered(ws, text)).then(
+    const isCurrent = () => gen === this.generation;
+    const written = this.queue.then(() => sendWhenRegistered(ws, text, isCurrent)).then(
       () => true,
       () => {
         this.dropped(gen);

@@ -3,8 +3,9 @@
 use std::net::IpAddr;
 
 /// True if `url`'s host is on this device or the local network: localhost, `.local`
-/// (mDNS) names, and loopback, private, link-local or Tailscale (100.64.0.0/10)
-/// addresses. Traffic to these hosts doesn't cross the public internet unencrypted.
+/// (mDNS) names, and loopback, private (RFC 1918 / IPv6 ULA) or link-local addresses.
+/// Shared address space (100.64.0.0/10) is deliberately excluded: Tailscale uses it,
+/// but so do carrier networks, so an address there doesn't prove the traffic is private.
 /// Only enforced on mobile, but compiled and tested everywhere.
 #[cfg_attr(desktop, allow(dead_code))]
 pub fn is_local_host(url: &str) -> bool {
@@ -16,8 +17,7 @@ pub fn is_local_host(url: &str) -> bool {
     }
     match host.parse::<IpAddr>() {
         Ok(IpAddr::V4(ip)) => {
-            let [a, b, ..] = ip.octets();
-            ip.is_loopback() || ip.is_private() || ip.is_link_local() || (a == 100 && (64..128).contains(&b))
+            ip.is_loopback() || ip.is_private() || ip.is_link_local()
         }
         Ok(IpAddr::V6(ip)) => {
             let first = ip.segments()[0];
@@ -39,7 +39,6 @@ mod tests {
             "ws://192.168.1.20:8787/ws",
             "ws://10.0.0.5/ws",
             "ws://172.20.1.1/ws",
-            "ws://100.101.102.103:8787/ws",
             "ws://my-pc.local:8787/ws",
             "ws://[::1]:8787/ws",
             "ws://[fd12::1]/ws",
@@ -51,6 +50,7 @@ mod tests {
             "ws://example.com/ws",
             "ws://8.8.8.8/ws",
             "ws://172.32.0.1/ws",
+            "ws://100.101.102.103:8787/ws", // shared address space (Tailscale or a carrier)
             "ws://100.128.0.1/ws",
             "ws://[2001:db8::1]/ws",
             "not a url",

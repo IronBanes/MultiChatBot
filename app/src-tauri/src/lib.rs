@@ -132,7 +132,7 @@ fn set_identity(state: State<'_, AppState>, display_name: String, server_url: St
     // across the internet. LAN relays may stay on plain ws://.
     #[cfg(mobile)]
     if url.starts_with("ws://") && !net::is_local_host(url) {
-        return Err("Use wss:// for relays outside your local network (for example through a cloudflared or Tailscale tunnel).".into());
+        return Err("Use wss:// for relays outside your local network (for example a cloudflared tunnel or `tailscale serve`).".into());
     }
     state.update(|c| {
         c.display_name = name;

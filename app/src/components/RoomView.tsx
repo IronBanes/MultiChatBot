@@ -513,8 +513,11 @@ function Composer({
     const sent = text;
     sending.current = true;
     try {
-      // Only clear the box once the message really went out; keep anything typed meanwhile.
-      if (await sendMessage(room.id, sent, ai, ai ? profileId : null)) setText((t) => (t === sent ? "" : t));
+      // Only clear the box once the message really went out. Text typed after the sent
+      // part is kept; if the sent part itself was edited meanwhile, keep everything.
+      if (await sendMessage(room.id, sent, ai, ai ? profileId : null)) {
+        setText((t) => (t.startsWith(sent) ? t.slice(sent.length).trimStart() : t));
+      }
     } finally {
       sending.current = false;
     }
