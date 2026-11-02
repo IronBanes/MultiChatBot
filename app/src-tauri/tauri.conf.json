@@ -34,7 +34,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "ios": {
+    "iOS": {
       "minimumSystemVersion": "15.0"
     }
   }
