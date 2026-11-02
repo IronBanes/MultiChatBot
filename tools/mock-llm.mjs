@@ -58,10 +58,16 @@ function reply(model, msgs) {
 const chunks = (text) => text.match(/\S+\s*|\s+/g) ?? [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function pickTool(tools, isAnthropic) {
+/** Uses the tool named in the message ("use tool draw"), else one ending in echo. */
+function pickTool(tools, isAnthropic, said) {
   const names = tools.map((t) => (isAnthropic ? t.name : t.function?.name));
-  const name = names.find((n) => /echo/.test(n)) ?? names[0];
-  return { name, args: /echo/.test(name) ? { text: "hello from the mock model" } : {} };
+  const short = (n) => n.split("__").pop();
+  const mentioned = (n) => said.toLowerCase().split(/\W+/).includes(short(n).toLowerCase());
+  const named = said.match(/(\w+) tool/i)?.[1]?.toLowerCase();
+  const name = names.find((n) => short(n).toLowerCase() === named) ?? names.find(mentioned) ?? names.find((n) => /echo/.test(n)) ?? names[0];
+  const seconds = Number(said.match(/(\d+)\s*s(ec|econds)?/)?.[1] ?? 3);
+  const args = { echo: { text: "hello from the mock model" }, draw: { color: "#10b981" }, render: { color: "#f97316" }, wait: { seconds } }[short(name)] ?? {};
+  return { name, args };
 }
 
 http
@@ -133,7 +139,7 @@ http
       }
       send({ type: "content_block_stop", index: i++ }, "content_block_stop");
       if (wantsTool) {
-        const { name, args } = pickTool(tools, true);
+        const { name, args } = pickTool(tools, true, lastHumanText(msgs));
         send({ type: "content_block_start", index: i, content_block: { type: "tool_use", id: "toolu_mock1", name, input: {} } }, "content_block_start");
         const raw = JSON.stringify(args);
         for (const part of [raw.slice(0, 5), raw.slice(5)]) {
@@ -153,7 +159,7 @@ http
         await sleep(delay);
       }
       if (wantsTool) {
-        const { name, args } = pickTool(tools, false);
+        const { name, args } = pickTool(tools, false, lastHumanText(msgs));
         const raw = JSON.stringify(args);
         send({ id: "c", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_mock1", type: "function", function: { name, arguments: raw.slice(0, 5) } }] } }] });
         send({ id: "c", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: raw.slice(5) } }] } }] });

@@ -25,6 +25,7 @@ async-stream = "0.3"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 rmcp = { version = "3.8", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+base64 = "0.22"
 
 [profile.release]
 codegen-units = 1

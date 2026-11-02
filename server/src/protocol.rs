@@ -50,6 +50,17 @@ pub enum ClientMsg {
         id: String,
         activity: ToolActivity,
     },
+    /// An image a tool produced; the relay stores it and shares only its metadata.
+    AiAttachment {
+        room_id: String,
+        id: String,
+        attachment: Attachment,
+        /// Base64-encoded image bytes.
+        data: String,
+    },
+    GetAttachment {
+        attachment_id: String,
+    },
     AiComplete {
         room_id: String,
         id: String,
@@ -102,6 +113,16 @@ pub enum ServerMsg {
         room_id: String,
         id: String,
         activity: ToolActivity,
+    },
+    AiAttachment {
+        room_id: String,
+        id: String,
+        attachment: Attachment,
+    },
+    Attachment {
+        attachment_id: String,
+        mime: String,
+        data: String,
     },
     AiComplete {
         room_id: String,
@@ -173,6 +194,21 @@ pub struct ToolActivity {
     pub status: String,
 }
 
+/// Metadata of an image attached to an AI reply. The bytes are fetched
+/// separately with `get_attachment`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attachment {
+    pub attachment_id: String,
+    pub mime: String,
+    /// The tool call that produced it, if any.
+    #[serde(default)]
+    pub call_id: Option<String>,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Message {
     pub id: String,
@@ -185,6 +221,8 @@ pub struct Message {
     pub reasoning: String,
     #[sqlx(json)]
     pub tools: Vec<ToolActivity>,
+    #[sqlx(json)]
+    pub attachments: Vec<Attachment>,
     pub ai_requested: bool,
     pub anchor_id: Option<String>,
     pub model: Option<String>,

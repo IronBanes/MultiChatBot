@@ -90,6 +90,10 @@ alice.send({ type: "ai_start", room_id: room.id, id: aiA, anchor_id: trigger, mo
 alice.send({ type: "ai_reasoning", room_id: room.id, id: aiA, delta: "Squares have four equal sides." });
 alice.send({ type: "ai_tool", room_id: room.id, id: aiA, activity: { call_id: "c1", server: "Files", tool: "read", status: "running" } });
 alice.send({ type: "ai_tool", room_id: room.id, id: aiA, activity: { call_id: "c1", server: "Files", tool: "read", status: "done" } });
+const attId = uuid();
+const pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYPj/HwAEAQH/7dJ4ZwAAAABJRU5ErkJggg==";
+alice.send({ type: "ai_attachment", room_id: room.id, id: aiA, attachment: { attachment_id: attId, mime: "image/png", call_id: "c1", width: 1, height: 1 }, data: pngB64 });
+alice.send({ type: "ai_attachment", room_id: room.id, id: aiA, attachment: { attachment_id: uuid(), mime: "text/html", call_id: "c1" }, data: "PGI+" });
 alice.send({ type: "ai_delta", room_id: room.id, id: aiA, delta: "Here is " });
 // Concurrent reply from Bob's profile anchored to the same message (regenerate).
 const aiB = uuid();
@@ -106,6 +110,13 @@ ok(reasoning.delta === "Squares have four equal sides.", "reasoning relayed");
 await bob.wait(type("ai_tool", (m) => m.id === aiA && m.activity.status === "running"), "ai_tool running");
 await bob.wait(type("ai_tool", (m) => m.id === aiA && m.activity.status === "done"), "ai_tool done");
 ok(true, "tool activity relayed (names and status only)");
+const att = await bob.wait(type("ai_attachment", (m) => m.id === aiA), "ai_attachment");
+ok(att.attachment.attachment_id === attId && att.data === undefined, "image attachment announced without its bytes");
+await alice.wait(type("error", (m) => /Image rejected/.test(m.message)), "non-image rejected");
+ok(true, "non-image attachment rejected");
+bob.send({ type: "get_attachment", attachment_id: attId });
+const fetched = await bob.wait(type("attachment", (m) => m.attachment_id === attId), "attachment data");
+ok(fetched.data === pngB64 && fetched.mime === "image/png", "image bytes fetched on demand by a room member");
 const deltas = [];
 deltas.push((await bob.wait(type("ai_delta", (m) => m.id === aiA), "delta 1")).delta);
 deltas.push((await bob.wait(type("ai_delta", (m) => m.id === aiA), "delta 2")).delta);
@@ -149,6 +160,7 @@ ok(
 const finalA = hist.messages.find((m) => m.id === aiA);
 ok(finalA.content === "Here is a square.", "final AI text persisted");
 ok(finalA.reasoning === "Squares have four equal sides." && finalA.tools.length === 1 && finalA.tools[0].status === "done", "reasoning and tool activity persisted");
+ok(finalA.attachments.length === 1 && finalA.attachments[0].attachment_id === attId, "attachment metadata persisted");
 
 alice.close();
 bob2.close();

@@ -17,8 +17,12 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_RESULT_CHARS: usize = 20_000;
+/// Images taken from one tool result.
+const MAX_IMAGES: usize = 4;
+/// Image files a tool mentions are only picked up if they're this fresh and small.
+const IMAGE_FILE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
+const IMAGE_FILE_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 type Client = RunningService<RoleClient, ()>;
 
@@ -32,6 +36,19 @@ struct Connection {
 #[derive(Default)]
 pub struct McpManager {
     conns: Mutex<HashMap<String, Arc<Connection>>>,
+}
+
+/// An image produced by a tool call, base64-encoded.
+#[derive(Debug, Clone)]
+pub struct ToolImage {
+    pub mime: String,
+    pub data: String,
+}
+
+pub struct ToolOutput {
+    pub text: String,
+    pub is_error: bool,
+    pub images: Vec<ToolImage>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -193,44 +210,111 @@ impl McpManager {
         (tools, errors)
     }
 
-    /// Runs a tool. Returns (text result, is_error).
-    pub async fn call(&self, server: &McpServer, secrets: &McpSecrets, tool: &str, args: serde_json::Value) -> (String, bool) {
+    /// Runs a tool. Images are collected only if the server is set to share them:
+    /// image content blocks, plus fresh image files the result text points to
+    /// (how ComfyUI-style servers report their outputs).
+    pub async fn call(&self, server: &McpServer, secrets: &McpSecrets, tool: &str, args: serde_json::Value) -> ToolOutput {
+        let fail = |text: String| ToolOutput { text, is_error: true, images: Vec::new() };
         let conn = match self.get(server, secrets).await {
             Ok(c) => c,
-            Err(e) => return (e, true),
+            Err(e) => return fail(e),
         };
         let mut params = CallToolRequestParams::new(tool.to_string());
         if let serde_json::Value::Object(map) = args {
             params = params.with_arguments(map);
         }
-        let res = match tokio::time::timeout(CALL_TIMEOUT, conn.client.call_tool(params)).await {
-            Err(_) => return ("Tool call timed out".into(), true),
-            Ok(Err(e)) => return (format!("Tool call failed: {e}"), true),
+        let timeout = Duration::from_secs(u64::from(server.timeout_secs.clamp(5, 3600)));
+        let res = match tokio::time::timeout(timeout, conn.client.call_tool(params)).await {
+            Err(_) => return fail(format!("Tool call timed out after {}s", timeout.as_secs())),
+            Ok(Err(e)) => return fail(format!("Tool call failed: {e}")),
             Ok(Ok(r)) => r,
         };
-        let mut parts: Vec<String> = res
-            .content
-            .iter()
-            .map(|c| match c {
-                ContentBlock::Text(t) => t.text.clone(),
-                ContentBlock::Image(_) => "[image omitted]".into(),
-                ContentBlock::Audio(_) => "[audio omitted]".into(),
-                ContentBlock::Resource(r) => serde_json::to_string(r).unwrap_or_default(),
-                ContentBlock::ResourceLink(r) => serde_json::to_string(r).unwrap_or_default(),
-                _ => "[unsupported content omitted]".into(),
-            })
-            .collect();
+        let mut images = Vec::new();
+        let mut parts: Vec<String> = Vec::new();
+        for c in &res.content {
+            match c {
+                ContentBlock::Text(t) => parts.push(t.text.clone()),
+                ContentBlock::Image(img) => {
+                    if server.share_images && images.len() < MAX_IMAGES {
+                        images.push(ToolImage { mime: img.mime_type.clone(), data: img.data.clone() });
+                        parts.push("[image shared with the room]".into());
+                    } else {
+                        parts.push("[image omitted]".into());
+                    }
+                }
+                ContentBlock::Audio(_) => parts.push("[audio omitted]".into()),
+                ContentBlock::Resource(r) => parts.push(serde_json::to_string(r).unwrap_or_default()),
+                ContentBlock::ResourceLink(r) => parts.push(serde_json::to_string(r).unwrap_or_default()),
+                _ => parts.push("[unsupported content omitted]".into()),
+            }
+        }
         if parts.is_empty() {
             if let Some(s) = &res.structured_content {
                 parts.push(s.to_string());
             }
         }
         let mut text = parts.join("\n");
+        if server.share_images && images.len() < MAX_IMAGES {
+            let mut scan = text.clone();
+            if let Some(s) = &res.structured_content {
+                scan.push('\n');
+                scan.push_str(&s.to_string());
+            }
+            for path in image_paths(&scan) {
+                if images.len() >= MAX_IMAGES {
+                    break;
+                }
+                if let Some(img) = read_fresh_image(&path).await {
+                    if !images.iter().any(|i| i.data == img.data) {
+                        images.push(img);
+                    }
+                }
+            }
+        }
         if text.chars().count() > MAX_RESULT_CHARS {
             text = text.chars().take(MAX_RESULT_CHARS).collect::<String>() + "\n[truncated]";
         }
-        (text, res.is_error.unwrap_or(false))
+        ToolOutput { text, is_error: res.is_error.unwrap_or(false), images }
     }
+}
+
+fn image_mime(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    [(".png", "image/png"), (".jpg", "image/jpeg"), (".jpeg", "image/jpeg"), (".webp", "image/webp"), (".gif", "image/gif")]
+        .into_iter()
+        .find(|(ext, _)| lower.ends_with(ext))
+        .map(|(_, m)| m)
+}
+
+/// Absolute paths to image files mentioned in a tool result (also inside JSON strings,
+/// where Windows backslashes arrive doubled).
+fn image_paths(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // The first split keeps quoted paths that contain spaces; the second finds bare ones in prose.
+    let quoted = ['"', '\'', '\n', '`', '<', '>'];
+    let bare = ['"', '\'', '\n', '`', '<', '>', '(', ')', ' ', ','];
+    let pieces = text.split(|c: char| quoted.contains(&c)).chain(text.split(|c: char| bare.contains(&c)));
+    for raw in pieces {
+        let cand = raw.trim().trim_end_matches(['.', ';', ':']).replace("\\\\", "\\");
+        let b = cand.as_bytes();
+        let absolute = cand.starts_with('/') || (b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'));
+        if absolute && image_mime(&cand).is_some() && !out.contains(&cand) {
+            out.push(cand);
+        }
+    }
+    out
+}
+
+async fn read_fresh_image(path: &str) -> Option<ToolImage> {
+    use base64::Engine;
+    let mime = image_mime(path)?;
+    let meta = tokio::fs::metadata(path).await.ok()?;
+    let fresh = meta.modified().ok()?.elapsed().map(|age| age <= IMAGE_FILE_MAX_AGE).unwrap_or(true);
+    if !meta.is_file() || !fresh || meta.len() > IMAGE_FILE_MAX_BYTES {
+        return None;
+    }
+    let bytes = tokio::fs::read(path).await.ok()?;
+    Some(ToolImage { mime: mime.to_string(), data: base64::engine::general_purpose::STANDARD.encode(bytes) })
 }
 
 #[cfg(test)]
@@ -247,5 +331,15 @@ mod tests {
         assert_ne!(a, b);
         let long = qualified_name(&"s".repeat(80), &"t".repeat(80), &HashMap::new());
         assert!(long.len() <= 64);
+    }
+
+    #[test]
+    fn finds_image_paths_in_text_and_json() {
+        let text = r#"Saved to C:\out\ComfyUI_0001_.png and {"files":["C:\\My Renders\\a.webp","/tmp/render.webp"]}. Also notes.txt and C:/x/y.JPG."#;
+        let paths = image_paths(text);
+        for want in [r"C:\out\ComfyUI_0001_.png", r"C:\My Renders\a.webp", "/tmp/render.webp", "C:/x/y.JPG"] {
+            assert!(paths.iter().any(|p| p == want), "missing {want} in {paths:?}");
+        }
+        assert!(!paths.iter().any(|p| p.contains("notes")));
     }
 }

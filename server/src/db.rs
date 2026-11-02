@@ -1,6 +1,6 @@
 //! SQLite persistence for users, rooms, members and messages.
 
-use crate::protocol::{Message, ToolActivity};
+use crate::protocol::{Attachment, Message, ToolActivity};
 use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     reasoning TEXT NOT NULL DEFAULT '',
     tools TEXT NOT NULL DEFAULT '[]',
+    attachments TEXT NOT NULL DEFAULT '[]',
     ai_requested INTEGER NOT NULL DEFAULT 0,
     anchor_id TEXT,
     model TEXT,
@@ -45,6 +46,14 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_room_seq ON messages(room_id, seq);
+CREATE TABLE IF NOT EXISTS attachments (
+    id TEXT PRIMARY KEY,
+    message_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    data TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
 "#;
 
 pub async fn connect(path: &str) -> anyhow::Result<Db> {
@@ -58,6 +67,7 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
     for ddl in [
         "ALTER TABLE messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
     ] {
         if let Err(e) = sqlx::query(ddl).execute(&pool).await {
             if !e.to_string().contains("duplicate column") {
@@ -209,7 +219,7 @@ pub async fn set_room_prompt(db: &Db, room_id: &str, prompt: &str) -> sqlx::Resu
     Ok(())
 }
 
-const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, reasoning, tools, ai_requested, \
+const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, reasoning, tools, attachments, ai_requested, \
                             anchor_id, model, status, error, created_at";
 
 pub async fn recent_messages(db: &Db, room_id: &str, limit: i64) -> sqlx::Result<Vec<Message>> {
@@ -269,19 +279,44 @@ pub struct AiResult<'a> {
     pub content: &'a str,
     pub reasoning: &'a str,
     pub tools: &'a [ToolActivity],
+    pub attachments: &'a [Attachment],
     pub status: &'a str,
     pub error: Option<&'a str>,
 }
 
 pub async fn finish_ai(db: &Db, id: &str, r: AiResult<'_>) -> sqlx::Result<()> {
-    sqlx::query("UPDATE messages SET content = ?, reasoning = ?, tools = ?, status = ?, error = ? WHERE id = ?")
+    sqlx::query(
+        "UPDATE messages SET content = ?, reasoning = ?, tools = ?, attachments = ?, status = ?, error = ? WHERE id = ?",
+    )
         .bind(r.content)
         .bind(r.reasoning)
         .bind(serde_json::to_string(r.tools).unwrap_or_else(|_| "[]".into()))
+        .bind(serde_json::to_string(r.attachments).unwrap_or_else(|_| "[]".into()))
         .bind(r.status)
         .bind(r.error)
         .bind(id)
         .execute(db)
         .await?;
     Ok(())
+}
+
+pub async fn insert_attachment(db: &Db, a: &Attachment, message_id: &str, room_id: &str, data: &str) -> sqlx::Result<()> {
+    sqlx::query("INSERT INTO attachments (id, message_id, room_id, mime, data, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+        .bind(&a.attachment_id)
+        .bind(message_id)
+        .bind(room_id)
+        .bind(&a.mime)
+        .bind(data)
+        .bind(now_ms())
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// (room_id, mime, base64 data)
+pub async fn attachment(db: &Db, id: &str) -> sqlx::Result<Option<(String, String, String)>> {
+    sqlx::query_as("SELECT room_id, mime, data FROM attachments WHERE id = ?")
+        .bind(id)
+        .fetch_optional(db)
+        .await
 }

@@ -2,7 +2,7 @@
 
 use crate::db::{self, Db, NewMessage};
 use crate::db::AiResult;
-use crate::protocol::{ClientMsg, Member, RoomInfo, ServerMsg, ToolActivity};
+use crate::protocol::{Attachment, ClientMsg, Member, RoomInfo, ServerMsg, ToolActivity};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
@@ -14,6 +14,10 @@ const MAX_PROMPT: usize = 8_000;
 const MAX_ERROR: usize = 300;
 const HISTORY_LIMIT: i64 = 1000;
 const MAX_TOOL_CALLS: usize = 100;
+const MAX_ATTACHMENTS: usize = 8;
+/// Base64 length cap (~4.5 MB of image); clients downscale before sending.
+const MAX_ATTACHMENT_B64: usize = 6_000_000;
+const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 pub type ConnId = u64;
 
@@ -31,6 +35,7 @@ struct Stream {
     content: String,
     reasoning: String,
     tools: Vec<ToolActivity>,
+    attachments: Vec<Attachment>,
 }
 
 #[derive(Default)]
@@ -248,6 +253,7 @@ impl State {
                             m.content = s.content.clone();
                             m.reasoning = s.reasoning.clone();
                             m.tools = s.tools.clone();
+                            m.attachments = s.attachments.clone();
                         }
                     }
                 }
@@ -336,6 +342,7 @@ impl State {
                         content: String::new(),
                         reasoning: String::new(),
                         tools: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 );
                 hub.broadcast(&room_id, &ServerMsg::Message { room_id: room_id.clone(), message });
@@ -387,6 +394,42 @@ impl State {
                 hub.broadcast(&room_id, &ServerMsg::AiTool { room_id: room_id.clone(), id, activity });
             }
 
+            ClientMsg::AiAttachment { room_id, id, attachment, data } => {
+                let ok_shape = uuid::Uuid::parse_str(&attachment.attachment_id).is_ok()
+                    && IMAGE_MIMES.contains(&attachment.mime.as_str())
+                    && !data.is_empty()
+                    && data.len() <= MAX_ATTACHMENT_B64
+                    && data.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=');
+                let owned = {
+                    let hub = self.hub();
+                    hub.streams.get(&id).is_some_and(|s| {
+                        s.conn_id == conn && s.room_id == room_id && s.attachments.len() < MAX_ATTACHMENTS
+                    })
+                };
+                if !ok_shape || !owned {
+                    self.send(conn, err(None, "Image rejected (unsupported type, too large, or too many)"));
+                    return Ok(());
+                }
+                let attachment = Attachment {
+                    call_id: attachment.call_id.map(|c| clip(&c, 100)),
+                    ..attachment
+                };
+                db::insert_attachment(&self.db, &attachment, &id, &room_id, &data).await?;
+                let mut hub = self.hub();
+                let Some(s) = hub.streams.get_mut(&id) else { return Ok(()) };
+                s.attachments.push(attachment.clone());
+                hub.broadcast(&room_id, &ServerMsg::AiAttachment { room_id: room_id.clone(), id, attachment });
+            }
+
+            ClientMsg::GetAttachment { attachment_id } => {
+                let Some((room_id, mime, data)) = db::attachment(&self.db, &attachment_id).await? else {
+                    return Ok(());
+                };
+                if self.in_room(conn, &room_id) {
+                    self.send(conn, ServerMsg::Attachment { attachment_id, mime, data });
+                }
+            }
+
             ClientMsg::AiComplete { room_id, id, content } => {
                 let Some(stream) = self.take_stream(conn, &room_id, &id) else { return Ok(()) };
                 let content: String = content.chars().take(MAX_CONTENT).collect();
@@ -394,6 +437,7 @@ impl State {
                     content: &content,
                     reasoning: &stream.reasoning,
                     tools: &stream.tools,
+                    attachments: &stream.attachments,
                     status: "complete",
                     error: None,
                 };
@@ -408,6 +452,7 @@ impl State {
                     content: &stream.content,
                     reasoning: &stream.reasoning,
                     tools: &stream.tools,
+                    attachments: &stream.attachments,
                     status: "error",
                     error: Some(&error),
                 };
@@ -518,7 +563,14 @@ impl State {
             if let Err(e) = db::finish_ai(
                 &self.db,
                 &id,
-                AiResult { content: &s.content, reasoning: &s.reasoning, tools: &s.tools, status: "interrupted", error: None },
+                AiResult {
+                    content: &s.content,
+                    reasoning: &s.reasoning,
+                    tools: &s.tools,
+                    attachments: &s.attachments,
+                    status: "interrupted",
+                    error: None,
+                },
             )
             .await {
                 tracing::error!("failed to mark {id} interrupted: {e}");

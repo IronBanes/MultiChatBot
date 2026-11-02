@@ -2,6 +2,7 @@
 
 import { create } from "zustand";
 import { backend, errorText } from "./lib/backend";
+import { prepareImage } from "./lib/images";
 import { Relay, type ConnStatus } from "./lib/relay";
 import type { ClientState, HistoryItem, McpMode, Message, RoomInfo, ServerMsg, ToolStatus } from "./lib/types";
 
@@ -31,6 +32,8 @@ interface ChatState {
   myGenerations: Record<string, true>;
   /** AI message id → call id → details, for replies this client generates. */
   localTools: Record<string, Record<string, LocalTool>>;
+  /** attachment id → data URL ("" while loading). */
+  images: Record<string, string>;
   toasts: Toast[];
 
   init(): Promise<void>;
@@ -47,6 +50,7 @@ interface ChatState {
   chooseProfile(roomId: string, profileId: string): void;
   setRoomMcpMode(roomId: string, serverId: string, mode: McpMode): void;
   answerToolCall(id: string, callId: string, approved: boolean): void;
+  loadImage(attachmentId: string): void;
   toast(text: string, kind?: Toast["kind"]): void;
   dismissToast(id: number): void;
 }
@@ -132,6 +136,11 @@ export const useChat = create<ChatState>((set, get) => {
       return;
     }
     set((st) => ({ myGenerations: { ...st.myGenerations, [id]: true } }));
+    // Images are compressed before relaying; the reply only ends after they're sent.
+    let uploads: Promise<void> = Promise.resolve();
+    const afterUploads = (f: () => void) => {
+      uploads = uploads.then(f, f);
+    };
     const finish = () =>
       set((st) => {
         const { [id]: _, ...rest } = st.myGenerations;
@@ -153,14 +162,33 @@ export const useChat = create<ChatState>((set, get) => {
             const local: LocalTool = { status: ev.status, args: ev.args ?? prev?.args ?? null, detail: ev.detail ?? prev?.detail ?? null };
             return { localTools: { ...st.localTools, [id]: { ...st.localTools[id], [ev.call_id]: local } } };
           });
+        } else if (ev.event === "image") {
+          const callId = ev.call_id;
+          const { mime, data } = ev;
+          uploads = uploads.then(async () => {
+            try {
+              const img = await prepareImage(mime, data);
+              const attachment = { attachment_id: crypto.randomUUID(), mime: img.mime, call_id: callId, width: img.width, height: img.height };
+              set((st) => ({ images: { ...st.images, [attachment.attachment_id]: `data:${img.mime};base64,${img.data}` } }));
+              relay?.send({ type: "ai_attachment", room_id: roomId, id, attachment, data: img.data });
+            } catch (e) {
+              get().toast(`Couldn't share an image: ${errorText(e)}`);
+            }
+          });
         } else if (ev.event === "notice") {
           get().toast(ev.message, "info");
         } else if (ev.event === "done") {
-          relay?.send({ type: "ai_complete", room_id: roomId, id, content: ev.content });
-          finish();
+          const content = ev.content;
+          afterUploads(() => {
+            relay?.send({ type: "ai_complete", room_id: roomId, id, content });
+            finish();
+          });
         } else {
-          relay?.send({ type: "ai_error", room_id: roomId, id, error: ev.message });
-          finish();
+          const error = ev.message;
+          afterUploads(() => {
+            relay?.send({ type: "ai_error", room_id: roomId, id, error });
+            finish();
+          });
         }
       })
       .catch((e) => {
@@ -264,6 +292,21 @@ export const useChat = create<ChatState>((set, get) => {
           },
         }));
         break;
+      case "ai_attachment":
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [msg.room_id]: patchMessage(s.messages[msg.room_id], msg.id, (m) =>
+              m.attachments.some((a) => a.attachment_id === msg.attachment.attachment_id)
+                ? m
+                : { ...m, attachments: [...m.attachments, msg.attachment] },
+            )!,
+          },
+        }));
+        break;
+      case "attachment":
+        set((s) => ({ images: { ...s.images, [msg.attachment_id]: `data:${msg.mime};base64,${msg.data}` } }));
+        break;
       case "ai_complete":
       case "ai_error":
       case "ai_interrupted":
@@ -328,6 +371,7 @@ export const useChat = create<ChatState>((set, get) => {
     activeRoomId: null,
     myGenerations: {},
     localTools: {},
+    images: {},
     toasts: [],
 
     async init() {
@@ -412,6 +456,13 @@ export const useChat = create<ChatState>((set, get) => {
 
     answerToolCall(id, callId, approved) {
       backend.resolveToolCall(id, callId, approved).catch((e) => get().toast(errorText(e)));
+    },
+
+    loadImage(attachmentId) {
+      if (attachmentId in get().images) return;
+      if (relay?.send({ type: "get_attachment", attachment_id: attachmentId })) {
+        set((s) => ({ images: { ...s.images, [attachmentId]: "" } }));
+      }
     },
 
     toast(text, kind = "error") {

@@ -450,7 +450,7 @@ interface SecretRow {
 let rowSeq = 0;
 
 function blankServer(): McpServer {
-  return { id: "", name: "", transport: "stdio", command: "npx", args: [], url: "", default_mode: "ask" };
+  return { id: "", name: "", transport: "stdio", command: "npx", args: [], url: "", default_mode: "ask", share_images: false, timeout_secs: 120 };
 }
 
 function SecretRows({
@@ -616,6 +616,34 @@ function McpEditor({ initial, onDone }: { initial: McpServerView | null; onDone:
         <Segmented value={s.default_mode} onChange={(default_mode) => upd({ default_mode })} options={MODE_OPTIONS} />
       </Field>
 
+      <div className="grid gap-3 sm:grid-cols-2">
+        <label className="flex items-start gap-3 rounded-xl border border-zinc-200 p-3 dark:border-zinc-800">
+          <input
+            type="checkbox"
+            className="mt-1 h-4 w-4 accent-indigo-600"
+            checked={s.share_images}
+            onChange={(e) => upd({ share_images: e.target.checked })}
+          />
+          <span>
+            <span className="block text-sm font-medium">Share images with the room</span>
+            <span className="block text-xs text-zinc-500">
+              Images the server returns, and fresh image files it points to (like ComfyUI renders or Blender screenshots), appear in the
+              chat for everyone.
+            </span>
+          </span>
+        </label>
+        <Field label="Tool timeout (seconds)" hint="Raise it for slow tools such as image generation (e.g. 600).">
+          <input
+            className={inputCls}
+            type="number"
+            min={5}
+            max={3600}
+            value={s.timeout_secs}
+            onChange={(e) => upd({ timeout_secs: Math.max(0, Number(e.target.value) || 0) })}
+          />
+        </Field>
+      </div>
+
       {error && <ResultBox ok={false}>{error}</ResultBox>}
       {tools && (
         <ResultBox ok>
@@ -669,7 +697,7 @@ function McpPanel() {
     <div className="space-y-3">
       <p className="text-sm text-zinc-500">
         MCP servers give the AI tools, like reading files or searching the web. They run on this computer and are only used for replies
-        generated with your profiles. The room sees which tool ran, not its inputs or results.
+        generated with your profiles. The room sees which tool ran, not its inputs or results, unless you let a server share its images.
       </p>
       {client.mcp_servers.length === 0 && (
         <div className="rounded-xl border border-dashed border-zinc-300 p-4 text-center text-sm text-zinc-500 dark:border-zinc-700">
@@ -686,7 +714,10 @@ function McpPanel() {
             <div className="truncate font-mono text-xs text-zinc-500">
               {s.transport === "stdio" ? [s.command, ...s.args].join(" ") : s.url.replace(/\?.*$/, "")}
             </div>
-            <div className="text-xs text-zinc-500">Default in chats: {MODE_OPTIONS.find((m) => m.value === s.default_mode)?.label}</div>
+            <div className="text-xs text-zinc-500">
+              Default in chats: {MODE_OPTIONS.find((m) => m.value === s.default_mode)?.label} · timeout {s.timeout_secs}s
+              {s.share_images ? " · shares images" : ""}
+            </div>
           </div>
           <Button variant="ghost" onClick={() => setEditing(s)}>
             Edit

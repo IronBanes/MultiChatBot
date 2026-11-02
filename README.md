@@ -203,6 +203,32 @@ Tools only run for replies generated with **your** profile, on **your** computer
 sees which tool ran and whether it succeeded, never its arguments or results. You can
 click a tool chip on your own replies to see those details.
 
+Two per-server settings matter for creative tools:
+
+- **Share images with the room** (off by default). Images a tool returns, and fresh image
+  files it points to (saved in the last 15 minutes, up to 25 MB), are shown in the chat
+  for everyone. They're scaled to at most 1600px and stored by the relay. Turn this on for
+  ComfyUI, Blender or Unity screenshots; leave it off for servers that can see private files.
+- **Tool timeout** (120 s by default, up to 3600 s). Raise it for slow tools such as image
+  generation or renders.
+
+### Example setups
+
+These match common setups; use the paths from your own machine (for example, from your
+Claude Desktop or Claude Code MCP config).
+
+| Server | Type | Command / URL | Arguments (one per line) | Env vars | Suggested |
+|---|---|---|---|---|---|
+| ComfyUI (`comfy-mcp`) | Local command | `…\Python314\Scripts\comfy-mcp.exe` | — | `COMFY_BIN` = path to `comfy.exe`, `COMFY_LOCAL_URL` = `http://127.0.0.1:8188` | Share images on, timeout 600 |
+| Unity (built into the Unity CLI) | Local command | `…\Unity\bin\unity.exe` | `mcp`, `--project-path`, `<project folder>` | — | Timeout 300 |
+| Unity (MCP for Unity, stdio) | Local command | `…\Scripts\uvx.exe` | `--from`, `mcpforunityserver==10.0.0`, `mcp-for-unity`, `--transport`, `stdio` | — | Timeout 300 |
+| Unity (MCP for Unity, HTTP) | Remote URL | `http://127.0.0.1:8080/mcp` | — | — | Timeout 300 |
+| Blender (`blender-mcp`) | Local command | `uvx` | `blender-mcp` | — | Share images on, timeout 300 |
+
+ComfyUI must be running, Unity needs the project open (or the CLI to open it), and
+Blender needs its MCP add-on enabled with Blender running. Each runs on the computer of
+whoever sends the message, so your friends need their own setups to use them.
+
 To add a provider, implement the `Provider` trait in `app/src-tauri/src/providers/` and
 add a `ProviderKind` variant.
 
