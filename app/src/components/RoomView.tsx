@@ -115,10 +115,21 @@ function ToolCall({
 
 const PREVIEW_MAX = 360;
 
-/** Preview width that keeps both sides within PREVIEW_MAX px, whatever the aspect ratio. */
-function previewWidth(a: Attachment): number {
-  if (!a.width || !a.height) return PREVIEW_MAX;
-  return Math.max(24, Math.min(a.width, PREVIEW_MAX, (PREVIEW_MAX * a.width) / a.height));
+/** Smallest clickable preview side; the image inside still keeps its proportions. */
+const PREVIEW_MIN = 24;
+
+/**
+ * Explicit preview box size: the image scaled to fit within PREVIEW_MAX px on both
+ * sides. Height is never derived from the clamped width, so extreme portrait ratios
+ * (e.g. 1x8192) can't produce a huge box.
+ */
+function previewSize(a: Attachment): { width: number; height: number } {
+  if (!a.width || !a.height) return { width: PREVIEW_MAX, height: (PREVIEW_MAX * 3) / 4 };
+  const scale = Math.min(1, PREVIEW_MAX / a.width, PREVIEW_MAX / a.height);
+  return {
+    width: Math.max(PREVIEW_MIN, Math.round(a.width * scale)),
+    height: Math.max(PREVIEW_MIN, Math.round(a.height * scale)),
+  };
 }
 
 /** An image a tool produced, fetched from the relay on first view. */
@@ -128,12 +139,11 @@ function AttachmentImage({ a, onOpen }: { a: Attachment; onOpen: (src: string) =
   useEffect(() => {
     if (src === undefined) loadImage(a.attachment_id);
   }, [src, a.attachment_id, loadImage]);
-  const ratio = a.width && a.height ? `${a.width} / ${a.height}` : "4 / 3";
   return (
     <button
       onClick={() => src && onOpen(src)}
       className="block max-w-full overflow-hidden rounded-lg border border-zinc-200 bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-800"
-      style={{ aspectRatio: ratio, width: previewWidth(a) }}
+      style={previewSize(a)}
       title="Open full size"
     >
       {src ? (
