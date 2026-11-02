@@ -12,6 +12,7 @@ import type {
   SecretEdit,
 } from "../lib/types";
 import { useChat } from "../store";
+import { confirmAction } from "./Confirm";
 import { PALETTES, useAppearance, type Mode } from "../theme";
 import { Button, Field, Icon, inputCls, Modal, Segmented } from "./ui";
 
@@ -394,7 +395,7 @@ function ProfilesPanel() {
   }
 
   const remove = async (p: ProfileView) => {
-    if (!window.confirm(`Delete profile "${p.label}" and its stored key?`)) return;
+    if (!(await confirmAction("Delete profile", `Delete "${p.label}" and its stored API key?`, "Delete"))) return;
     await backend.deleteProfile(p.id);
     await refreshClient();
   };
@@ -449,8 +450,19 @@ interface SecretRow {
 
 let rowSeq = 0;
 
-function blankServer(): McpServer {
-  return { id: "", name: "", transport: "stdio", command: "npx", args: [], url: "", default_mode: "ask", share_images: false, timeout_secs: 120 };
+function blankServer(mobile: boolean): McpServer {
+  return {
+    id: "",
+    name: "",
+    // Mobile OSes can't spawn local commands, so Remote URL is the only type there.
+    transport: mobile ? "http" : "stdio",
+    command: mobile ? "" : "npx",
+    args: [],
+    url: "",
+    default_mode: "ask",
+    share_images: false,
+    timeout_secs: 120,
+  };
 }
 
 function SecretRows({
@@ -506,7 +518,8 @@ function SecretRows({
 
 function McpEditor({ initial, onDone }: { initial: McpServerView | null; onDone: () => void }) {
   const refreshClient = useChat((s) => s.refreshClient);
-  const [s, setS] = useState<McpServer>(initial ?? blankServer());
+  const mobile = useChat((s) => s.client!.platform !== "desktop");
+  const [s, setS] = useState<McpServer>(initial ?? blankServer(mobile));
   const [argsText, setArgsText] = useState((initial?.args ?? []).join("\n"));
   const [rows, setRows] = useState<SecretRow[]>(() => [
     ...(initial?.env_names ?? []).map((name) => ({ key: ++rowSeq, kind: "env" as const, name, value: null })),
@@ -570,7 +583,8 @@ function McpEditor({ initial, onDone }: { initial: McpServerView | null; onDone:
             value={s.transport}
             onChange={(transport) => upd({ transport })}
             options={[
-              { value: "stdio", label: "Local command" },
+              // Local command servers spawn a process; desktop only.
+              ...(mobile ? [] : [{ value: "stdio" as McpServer["transport"], label: "Local command" }]),
               { value: "http", label: "Remote URL" },
             ]}
           />
@@ -578,6 +592,11 @@ function McpEditor({ initial, onDone }: { initial: McpServerView | null; onDone:
       </div>
 
       {s.transport === "stdio" ? (
+        mobile ? (
+          <ResultBox ok={false}>
+            Local command (stdio) servers run on the desktop app only. On this device, add the server as a Remote URL instead.
+          </ResultBox>
+        ) : (
         <>
           <Field label="Command" hint="The program that starts the server, e.g. npx, uvx, node, python or a full path.">
             <input className={`${inputCls} font-mono`} value={s.command} spellCheck={false} onChange={(e) => upd({ command: e.target.value })} />
@@ -601,6 +620,7 @@ function McpEditor({ initial, onDone }: { initial: McpServerView | null; onDone:
             <SecretRows rows={rows} kind="env" onChange={setRows} />
           </div>
         </>
+        )
       ) : (
         <>
           <Field label="URL" hint="A Streamable HTTP MCP endpoint, e.g. https://example.com/mcp">
@@ -690,7 +710,7 @@ function McpPanel() {
   }
 
   const remove = async (s: McpServerView) => {
-    if (!window.confirm(`Remove MCP server "${s.name}" and its stored secrets?`)) return;
+    if (!(await confirmAction("Remove MCP server", `Remove "${s.name}" and its stored secrets?`, "Remove"))) return;
     await backend.deleteMcpServer(s.id);
     await refreshClient();
   };
@@ -698,9 +718,16 @@ function McpPanel() {
   return (
     <div className="space-y-3">
       <p className="text-sm text-zinc-500">
-        MCP servers give the AI tools, like reading files or searching the web. They run on this computer and are only used for replies
-        generated with your profiles. The room sees which tool ran, not its inputs or results, unless you let a server share its images.
+        MCP servers give the AI tools, like reading files or searching the web. Local command servers run on this device; Remote URL
+        servers run at their own address, and the tool calls are sent there. Either way they're only used for replies generated with your
+        profiles. The room sees which tool ran, not its inputs or results, unless you let a server share its images.
       </p>
+      {client.platform !== "desktop" && (
+        <p className="text-sm text-zinc-500">
+          On phones only <span className="font-medium">Remote URL</span> (HTTP) servers are available — local command servers run in the
+          desktop app.
+        </p>
+      )}
       {client.mcp_servers.length === 0 && (
         <div className="rounded-xl border border-dashed border-zinc-300 p-4 text-center text-sm text-zinc-500 dark:border-zinc-700">
           No MCP servers yet.

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { errorText } from "./lib/backend";
 import { useChat } from "./store";
 import { applyTheme } from "./theme";
+import { ConfirmHost } from "./components/Confirm";
 import { RoomView } from "./components/RoomView";
 import { SettingsDialog, type SettingsTab } from "./components/Settings";
 import { useWidth } from "./lib/useWidth";
@@ -58,7 +59,7 @@ function EmptyState({ onOpenNav }: { onOpenNav?: () => void }) {
       {onOpenNav && (
         <button
           onClick={onOpenNav}
-          className="absolute top-2 left-2 rounded-lg p-2 text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
+          className="absolute top-[calc(env(safe-area-inset-top)+0.5rem)] left-2 rounded-lg p-2 text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
           aria-label="Rooms"
         >
           <Icon name="menu" />
@@ -111,11 +112,11 @@ export default function App() {
   if (!client.display_name) return <Onboarding />;
 
   return (
-    <div className="flex h-full overflow-hidden">
+    <div className="flex h-full overflow-hidden pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
       {!compactNav && <Sidebar onSettings={() => setSettings("general")} />}
       {compactNav && navOpen && (
         <div className="fixed inset-0 z-30 flex bg-black/30" onMouseDown={() => setNavOpen(false)}>
-          <div className="h-full bg-white shadow-2xl dark:bg-zinc-950" onMouseDown={(e) => e.stopPropagation()}>
+          <div className="h-full bg-white pl-[env(safe-area-inset-left)] shadow-2xl dark:bg-zinc-950" onMouseDown={(e) => e.stopPropagation()}>
             <Sidebar
               onSettings={() => {
                 setNavOpen(false);
@@ -133,7 +134,8 @@ export default function App() {
         )}
       </main>
       {settings && <SettingsDialog tab={settings} onClose={() => setSettings(null)} />}
-      <div className="pointer-events-none fixed right-4 bottom-4 z-50 flex flex-col gap-2">
+      <ConfirmHost />
+      <div className="pointer-events-none fixed right-[max(1rem,env(safe-area-inset-right))] bottom-[max(1rem,env(safe-area-inset-bottom))] z-50 flex flex-col gap-2">
         {toasts.map((t) => (
           <button
             key={t.id}

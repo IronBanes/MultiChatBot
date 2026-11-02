@@ -3,6 +3,7 @@ import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
 import type { Attachment, McpMode, Message, RoomInfo, ToolActivity } from "../lib/types";
 import { useChat, type LocalTool } from "../store";
+import { confirmAction } from "./Confirm";
 import { Markdown } from "./Markdown";
 import { MODE_OPTIONS, type SettingsTab } from "./Settings";
 import { Avatar, Button, Icon, Logo, Modal, Segmented } from "./ui";
@@ -298,7 +299,7 @@ const MessageItem = memo(function MessageItem({
             </div>
           )}
         </div>
-        <div className="mt-1 flex h-6 flex-wrap gap-1 text-xs text-zinc-500 opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
+        <div className="mt-1 flex h-6 flex-wrap gap-1 text-xs text-zinc-500 opacity-0 transition group-hover:opacity-100 [@media(hover:none)]:opacity-100 focus-within:opacity-100">
           {mine && generating && (
             <button onClick={() => stopAi(m.id)} className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
               <Icon name="stop" size={12} /> Stop
@@ -486,6 +487,7 @@ function Composer({
   onOpenSettings: (tab: SettingsTab) => void;
 }) {
   const profiles = useChat((s) => s.client!.profiles);
+  const platform = useChat((s) => s.client!.platform);
   const status = useChat((s) => s.status);
   const sendMessage = useChat((s) => s.sendMessage);
   const chooseProfile = useChat((s) => s.chooseProfile);
@@ -505,13 +507,21 @@ function Composer({
     el.style.height = Math.min(el.scrollHeight, 220) + "px";
   }, [text]);
 
-  const send = () => {
-    if (!text.trim() || status !== "online") return;
-    if (sendMessage(room.id, text, ai, ai ? profileId : null)) setText("");
+  const sending = useRef(false);
+  const send = async () => {
+    if (!text.trim() || status !== "online" || sending.current) return;
+    const sent = text;
+    sending.current = true;
+    try {
+      // Only clear the box once the message really went out; keep anything typed meanwhile.
+      if (await sendMessage(room.id, sent, ai, ai ? profileId : null)) setText((t) => (t === sent ? "" : t));
+    } finally {
+      sending.current = false;
+    }
   };
 
   return (
-    <div className="border-t border-zinc-200 px-3 pt-3 pb-3 sm:px-4 sm:pb-4 dark:border-zinc-800">
+    <div className="border-t border-zinc-200 px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-4 sm:pb-[max(1rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
       <div className="mx-auto max-w-4xl rounded-2xl border border-zinc-300 bg-white shadow-sm transition focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-500/20 dark:border-zinc-700 dark:bg-zinc-900">
         <textarea
           ref={ta}
@@ -561,7 +571,9 @@ function Composer({
           )}
           <ToolsMenu room={room} onOpenSettings={onOpenSettings} />
           <div className="flex-1" />
-          <span className="hidden text-[11px] text-zinc-400 lg:inline">Shift+Enter for newline</span>
+          {platform === "desktop" && (
+            <span className="hidden text-[11px] text-zinc-400 lg:inline">Shift+Enter for newline</span>
+          )}
           <button
             onClick={send}
             disabled={!text.trim() || status !== "online"}
@@ -617,7 +629,9 @@ function MemberList({ room, overlay, onClose }: { room: RoomInfo; overlay: boole
   if (!overlay) return panel;
   return (
     <div className="fixed inset-0 z-30 flex justify-end bg-black/30" onMouseDown={onClose}>
-      <div onMouseDown={(e) => e.stopPropagation()}>{panel}</div>
+      <div className="h-full bg-white pr-[env(safe-area-inset-right)] dark:bg-zinc-950" onMouseDown={(e) => e.stopPropagation()}>
+        {panel}
+      </div>
     </div>
   );
 }
@@ -695,7 +709,7 @@ export function RoomView({
   return (
     <div className="flex min-w-0 flex-1">
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex items-center gap-1 border-b border-zinc-200 px-2 py-2 sm:gap-2 sm:px-4 dark:border-zinc-800">
+        <header className="flex items-center gap-1 border-b border-zinc-200 px-2 pb-2 pt-[calc(env(safe-area-inset-top)+0.5rem)] sm:gap-2 sm:px-4 dark:border-zinc-800">
           {onOpenNav && (
             <button onClick={onOpenNav} className="rounded-lg p-2 text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800" aria-label="Rooms">
               <Icon name="menu" />
@@ -730,7 +744,9 @@ export function RoomView({
             variant="ghost"
             className="!px-2"
             title="Leave room"
-            onClick={() => window.confirm(`Leave #${room.name}?`) && leaveRoom(room.id)}
+            onClick={async () => {
+              if (await confirmAction("Leave room", `Leave #${room.name}? You can rejoin with its invite code.`, "Leave")) leaveRoom(room.id);
+            }}
           >
             <Icon name="door" size={17} />
           </Button>

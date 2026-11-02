@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Merged by Tauri into the generated Info.plist when building for iOS
+  (see bundle > ios in tauri.conf.json).
+-->
+<plist version="1.0">
+<dict>
+    <!-- Reaching a relay on the LAN (ws://192.168.x.x:8787/ws) triggers iOS's
+         local-network permission prompt; explain why. -->
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Multichat connects to your chat relay server, which may run on your local network (for example a PC or Mac on the same Wi-Fi).</string>
+
+    <!-- App Transport Security: allow cleartext http/ws to local-network hosts
+         (LAN relay, and the Vite dev server during `tauri ios dev` on a device).
+         Public-internet hosts still require https/wss. -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+
+    <!-- Full-screen launch without a custom storyboard; the system provides
+         the launch screen background. -->
+    <key>UILaunchScreen</key>
+    <dict/>
+
+    <!-- App only uses standard HTTPS/TLS; skips the export-compliance question
+         when submitting to TestFlight/App Store. -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
+</dict>
+</plist>

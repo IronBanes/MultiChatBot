@@ -141,7 +141,9 @@ impl Default for Config {
 }
 
 /// Name of this client instance. Set `MULTICHAT_INSTANCE` to run several clients
-/// (each with its own identity and profiles) on one machine.
+/// (each with its own identity and profiles) on one machine. Desktop only: mobile
+/// apps have no environment variables and always use the default instance.
+#[cfg(desktop)]
 pub fn instance_name() -> String {
     let raw = std::env::var("MULTICHAT_INSTANCE").unwrap_or_default();
     let clean: String = raw
@@ -150,6 +152,11 @@ pub fn instance_name() -> String {
         .take(32)
         .collect();
     if clean.is_empty() { "default".into() } else { clean }
+}
+
+#[cfg(mobile)]
+pub fn instance_name() -> String {
+    "default".into()
 }
 
 pub fn config_path(base: &Path) -> PathBuf {

@@ -153,11 +153,15 @@ export interface ProfileView extends Profile {
   has_key: boolean;
 }
 
+/** Which kind of device this client runs on. Mobile cannot run stdio MCP servers. */
+export type Platform = "desktop" | "ios" | "android";
+
 export interface ClientState {
   instance: string;
   user_id: string;
   display_name: string;
   server_url: string;
+  platform: Platform;
   last_profile_by_room: Record<string, string>;
   profiles: ProfileView[];
   mcp_servers: McpServerView[];
