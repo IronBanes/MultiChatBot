@@ -113,6 +113,14 @@ function ToolCall({
   );
 }
 
+const PREVIEW_MAX = 360;
+
+/** Preview width that keeps both sides within PREVIEW_MAX px, whatever the aspect ratio. */
+function previewWidth(a: Attachment): number {
+  if (!a.width || !a.height) return PREVIEW_MAX;
+  return Math.max(24, Math.min(a.width, PREVIEW_MAX, (PREVIEW_MAX * a.width) / a.height));
+}
+
 /** An image a tool produced, fetched from the relay on first view. */
 function AttachmentImage({ a, onOpen }: { a: Attachment; onOpen: (src: string) => void }) {
   const src = useChat((s) => s.images[a.attachment_id]);
@@ -125,7 +133,7 @@ function AttachmentImage({ a, onOpen }: { a: Attachment; onOpen: (src: string) =
     <button
       onClick={() => src && onOpen(src)}
       className="block max-w-full overflow-hidden rounded-lg border border-zinc-200 bg-zinc-100 dark:border-zinc-800 dark:bg-zinc-800"
-      style={{ aspectRatio: ratio, width: Math.min(a.width ?? 360, 360) }}
+      style={{ aspectRatio: ratio, width: previewWidth(a) }}
       title="Open full size"
     >
       {src ? (

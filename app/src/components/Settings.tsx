@@ -523,7 +523,9 @@ function McpEditor({ initial, onDone }: { initial: McpServerView | null; onDone:
   };
 
   const current = (): [McpServer, SecretEdit[]] => {
-    const server = { ...s, args: argsText.split("\n").map((a) => a.trim()).filter(Boolean) };
+    // The field isn't clamped while typing; the backend needs a whole number in range.
+    const timeout_secs = Math.min(3600, Math.max(5, Math.round(s.timeout_secs) || 120));
+    const server = { ...s, timeout_secs, args: argsText.split("\n").map((a) => a.trim()).filter(Boolean) };
     const relevant = rows.filter((r) => r.kind === (s.transport === "stdio" ? "env" : "header"));
     return [server, relevant.map((r) => ({ kind: r.kind, name: r.name, value: r.value }))];
   };

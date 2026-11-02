@@ -3,6 +3,8 @@
 
 const MAX_SIDE = 1600;
 const QUALITY = 0.88;
+/** Largest GIF (base64 length) sent unchanged; well under the relay's 6,000,000 cap. */
+const MAX_GIF_B64 = 1_500_000;
 
 export interface PreparedImage {
   mime: string;
@@ -35,7 +37,9 @@ export async function prepareImage(mime: string, data: string): Promise<Prepared
   const height = Math.max(1, Math.round(bitmap.height * scale));
 
   // Small images and GIFs (which would lose their animation) are sent as they are.
-  if (mime === "image/gif" || (scale === 1 && data.length < 600_000)) {
+  // A large GIF is re-encoded as a still WebP rather than risk the relay's size limits.
+  const keepGif = mime === "image/gif" && data.length <= MAX_GIF_B64;
+  if (keepGif || (mime !== "image/gif" && scale === 1 && data.length < 600_000)) {
     bitmap.close();
     return { mime, data, width, height };
   }

@@ -17,6 +17,8 @@ const MAX_TOOL_CALLS: usize = 100;
 const MAX_ATTACHMENTS: usize = 8;
 /// Base64 length cap (~4.5 MB of image); clients downscale before sending.
 const MAX_ATTACHMENT_B64: usize = 6_000_000;
+/// Reported image dimensions outside 1..=this are rejected as bogus metadata.
+const MAX_IMAGE_SIDE: u32 = 16_384;
 const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 pub type ConnId = u64;
@@ -399,7 +401,10 @@ impl State {
                     && IMAGE_MIMES.contains(&attachment.mime.as_str())
                     && !data.is_empty()
                     && data.len() <= MAX_ATTACHMENT_B64
-                    && data.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=');
+                    && data.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+                    && [attachment.width, attachment.height]
+                        .iter()
+                        .all(|d| d.is_none_or(|d| (1..=MAX_IMAGE_SIDE).contains(&d)));
                 let owned = {
                     let hub = self.hub();
                     hub.streams.get(&id).is_some_and(|s| {
