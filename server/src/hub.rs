@@ -255,7 +255,6 @@ impl State {
                             m.content = s.content.clone();
                             m.reasoning = s.reasoning.clone();
                             m.tools = s.tools.clone();
-                            m.attachments = s.attachments.clone();
                         }
                     }
                 }
@@ -442,7 +441,6 @@ impl State {
                     content: &content,
                     reasoning: &stream.reasoning,
                     tools: &stream.tools,
-                    attachments: &stream.attachments,
                     status: "complete",
                     error: None,
                 };
@@ -457,7 +455,6 @@ impl State {
                     content: &stream.content,
                     reasoning: &stream.reasoning,
                     tools: &stream.tools,
-                    attachments: &stream.attachments,
                     status: "error",
                     error: Some(&error),
                 };
@@ -572,7 +569,6 @@ impl State {
                     content: &s.content,
                     reasoning: &s.reasoning,
                     tools: &s.tools,
-                    attachments: &s.attachments,
                     status: "interrupted",
                     error: None,
                 },

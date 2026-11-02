@@ -31,15 +31,16 @@ messages (seq INTEGER PK AUTOINCREMENT,      -- global ordering
           content TEXT,
           reasoning TEXT,                    -- ai: streamed reasoning, if any
           tools TEXT,                        -- ai: JSON [{call_id, server, tool, status}]
-          attachments TEXT,                  -- ai: JSON [{attachment_id, mime, call_id, width, height}]
           ai_requested INTEGER,              -- human: did it ask for an AI reply
           anchor_id TEXT,                    -- ai: triggering human message id
           model TEXT,                        -- ai: model name (never base URL / key)
           status TEXT,                       -- 'complete'|'streaming'|'error'|'interrupted'
           error TEXT, created_at INTEGER)
 attachments (id TEXT PK, message_id TEXT, room_id TEXT, mime TEXT,
+             call_id TEXT, width INTEGER, height INTEGER,
              data TEXT,                      -- base64 image
-             created_at INTEGER)
+             created_at INTEGER)        -- source of truth for a reply's images,
+                                        -- written at upload so they survive disconnects
 ```
 
 On startup any leftover `streaming` rows become `interrupted`.

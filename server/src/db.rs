@@ -3,6 +3,7 @@
 use crate::protocol::{Attachment, Message, ToolActivity};
 use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
+use std::collections::HashMap;
 use std::str::FromStr;
 
 pub type Db = SqlitePool;
@@ -37,7 +38,6 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     reasoning TEXT NOT NULL DEFAULT '',
     tools TEXT NOT NULL DEFAULT '[]',
-    attachments TEXT NOT NULL DEFAULT '[]',
     ai_requested INTEGER NOT NULL DEFAULT 0,
     anchor_id TEXT,
     model TEXT,
@@ -46,14 +46,20 @@ CREATE TABLE IF NOT EXISTS messages (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_room_seq ON messages(room_id, seq);
+-- Source of truth for a reply's images: a row is the image *and* its listing on
+-- the message, so an image stored mid-stream survives disconnects and restarts.
 CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,
     message_id TEXT NOT NULL,
     room_id TEXT NOT NULL,
     mime TEXT NOT NULL,
+    call_id TEXT,
+    width INTEGER,
+    height INTEGER,
     data TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS attachments_message ON attachments(message_id);
 "#;
 
 pub async fn connect(path: &str) -> anyhow::Result<Db> {
@@ -67,7 +73,9 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
     for ddl in [
         "ALTER TABLE messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'",
-        "ALTER TABLE messages ADD COLUMN attachments TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE attachments ADD COLUMN call_id TEXT",
+        "ALTER TABLE attachments ADD COLUMN width INTEGER",
+        "ALTER TABLE attachments ADD COLUMN height INTEGER",
     ] {
         if let Err(e) = sqlx::query(ddl).execute(&pool).await {
             if !e.to_string().contains("duplicate column") {
@@ -219,25 +227,66 @@ pub async fn set_room_prompt(db: &Db, room_id: &str, prompt: &str) -> sqlx::Resu
     Ok(())
 }
 
-const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, reasoning, tools, attachments, ai_requested, \
+// `attachments` is filled in from the attachments table by `with_attachments`.
+const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, reasoning, tools, '[]' AS attachments, ai_requested, \
                             anchor_id, model, status, error, created_at";
 
 pub async fn recent_messages(db: &Db, room_id: &str, limit: i64) -> sqlx::Result<Vec<Message>> {
-    sqlx::query_as(&format!(
+    let messages = sqlx::query_as(&format!(
         "SELECT * FROM (SELECT {MESSAGE_COLS} FROM messages WHERE room_id = ?
          ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
     ))
     .bind(room_id)
     .bind(limit)
     .fetch_all(db)
-    .await
+    .await?;
+    with_attachments(db, messages).await
 }
 
 pub async fn message(db: &Db, id: &str) -> sqlx::Result<Option<Message>> {
-    sqlx::query_as(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id = ?"))
+    let m: Option<Message> = sqlx::query_as(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id = ?"))
         .bind(id)
         .fetch_optional(db)
-        .await
+        .await?;
+    Ok(match m {
+        Some(m) => with_attachments(db, vec![m]).await?.pop(),
+        None => None,
+    })
+}
+
+type AttachmentRow = (String, String, String, Option<String>, Option<i64>, Option<i64>);
+
+/// Lists each AI message's stored images, in upload order.
+async fn with_attachments(db: &Db, mut messages: Vec<Message>) -> sqlx::Result<Vec<Message>> {
+    let ids: Vec<&str> = messages.iter().filter(|m| m.kind == "ai").map(|m| m.id.as_str()).collect();
+    if ids.is_empty() {
+        return Ok(messages);
+    }
+    let sql = format!(
+        "SELECT id, message_id, mime, call_id, width, height FROM attachments
+         WHERE message_id IN ({}) ORDER BY created_at, rowid",
+        vec!["?"; ids.len()].join(", ")
+    );
+    let mut query = sqlx::query_as::<_, AttachmentRow>(&sql);
+    for id in &ids {
+        query = query.bind(*id);
+    }
+    let mut by_message: HashMap<String, Vec<Attachment>> = HashMap::new();
+    for (attachment_id, message_id, mime, call_id, width, height) in query.fetch_all(db).await? {
+        by_message.entry(message_id).or_default().push(Attachment {
+            attachment_id,
+            mime,
+            call_id,
+            width: width.and_then(|w| u32::try_from(w).ok()),
+            height: height.and_then(|h| u32::try_from(h).ok()),
+        });
+    }
+    for m in &mut messages {
+        if let Some(list) = by_message.remove(&m.id) {
+            m.attachments = list;
+        }
+    }
+    Ok(messages)
 }
 
 pub struct NewMessage<'a> {
@@ -279,19 +328,17 @@ pub struct AiResult<'a> {
     pub content: &'a str,
     pub reasoning: &'a str,
     pub tools: &'a [ToolActivity],
-    pub attachments: &'a [Attachment],
     pub status: &'a str,
     pub error: Option<&'a str>,
 }
 
 pub async fn finish_ai(db: &Db, id: &str, r: AiResult<'_>) -> sqlx::Result<()> {
     sqlx::query(
-        "UPDATE messages SET content = ?, reasoning = ?, tools = ?, attachments = ?, status = ?, error = ? WHERE id = ?",
+        "UPDATE messages SET content = ?, reasoning = ?, tools = ?, status = ?, error = ? WHERE id = ?",
     )
         .bind(r.content)
         .bind(r.reasoning)
         .bind(serde_json::to_string(r.tools).unwrap_or_else(|_| "[]".into()))
-        .bind(serde_json::to_string(r.attachments).unwrap_or_else(|_| "[]".into()))
         .bind(r.status)
         .bind(r.error)
         .bind(id)
@@ -301,11 +348,17 @@ pub async fn finish_ai(db: &Db, id: &str, r: AiResult<'_>) -> sqlx::Result<()> {
 }
 
 pub async fn insert_attachment(db: &Db, a: &Attachment, message_id: &str, room_id: &str, data: &str) -> sqlx::Result<()> {
-    sqlx::query("INSERT INTO attachments (id, message_id, room_id, mime, data, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    sqlx::query(
+        "INSERT INTO attachments (id, message_id, room_id, mime, call_id, width, height, data, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
         .bind(&a.attachment_id)
         .bind(message_id)
         .bind(room_id)
         .bind(&a.mime)
+        .bind(&a.call_id)
+        .bind(a.width)
+        .bind(a.height)
         .bind(data)
         .bind(now_ms())
         .execute(db)

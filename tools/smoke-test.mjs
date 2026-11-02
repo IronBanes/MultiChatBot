@@ -124,7 +124,9 @@ ok(deltas.join("") === "Here is a square.", "Bob received Alice's deltas in orde
 await bob.wait(type("ai_complete", (m) => m.id === aiA), "ai_complete");
 ok(true, "ai_complete relayed");
 
-// Bob disconnects mid-stream -> interrupted.
+// Bob uploads an image and disconnects mid-stream -> interrupted, image kept.
+const bobAtt = uuid();
+bob.send({ type: "ai_attachment", room_id: room.id, id: aiB, attachment: { attachment_id: bobAtt, mime: "image/png", call_id: "b1", width: 1, height: 1 }, data: pngB64 });
 bob.close();
 const intr = await alice.wait(type("ai_interrupted", (m) => m.id === aiB), "ai_interrupted");
 ok(intr.content === "Bob's ", "Bob's in-flight reply marked interrupted with partial text");
@@ -161,6 +163,8 @@ const finalA = hist.messages.find((m) => m.id === aiA);
 ok(finalA.content === "Here is a square.", "final AI text persisted");
 ok(finalA.reasoning === "Squares have four equal sides." && finalA.tools.length === 1 && finalA.tools[0].status === "done", "reasoning and tool activity persisted");
 ok(finalA.attachments.length === 1 && finalA.attachments[0].attachment_id === attId, "attachment metadata persisted");
+const finalB = hist.messages.find((m) => m.id === aiB);
+ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded just before a disconnect stays in history");
 
 alice.close();
 bob2.close();
