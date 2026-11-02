@@ -10,9 +10,10 @@ Alice: Let's generate a square.          → AI · via Alice · gpt-4o-mini
 Bob:   What if it had rounded edges?     → AI · via Bob · claude-opus-5-5   (sees the whole history)
 ```
 
-**API keys never leave your machine.** They live in your OS keychain. The Rust side of
-the desktop app makes every LLM call and then broadcasts the resulting text to the room
-through the relay. The relay server never sees keys or endpoints.
+**API keys stay with you.** They're stored in your OS keychain and only sent to your own
+AI provider when the app calls it. The Rust side of the app makes every LLM call and then
+broadcasts the resulting text to the room through the relay. The relay server never sees
+keys or endpoints.
 
 ## Layout
 
@@ -160,8 +161,9 @@ cd app/src-tauri && cargo test              # context building, trimming, error 
 ## iOS
 
 The same `app/` builds for iOS as a second Tauri target: the React frontend runs in a
-WKWebView and the Rust backend still makes every LLM call, so **API keys never leave the
-phone** — they live in the iOS Keychain, under the same `multichat-bot` service.
+WKWebView and the Rust backend still makes every LLM call. **API keys are stored in the
+iOS Keychain** (under the same `multichat-bot` service) and are only sent to your own AI
+provider, never to the chat relay.
 
 What works on iOS: everything the desktop app does, except **local command (stdio) MCP
 servers**, which iOS cannot support because it forbids spawning child processes. Remote
@@ -319,8 +321,8 @@ message, generated with your own model.
 
 - Message content is rendered as Markdown with raw HTML disabled. `javascript:` links
   are neutralized, links open in the system browser, and remote images are never loaded.
-- MCP tool arguments and results never leave your machine; the relay only stores tool
-  names and statuses. Use **Ask** mode for servers that can change files or send data.
+- MCP tool arguments and results are never sent to the relay (only to the MCP server
+  itself); the relay only stores tool names and statuses. Use **Ask** mode for servers that can change files or send data.
 - The HTML, SVG and CSS preview runs in an `<iframe sandbox="">`, so scripts, forms and
   same-origin access are all disabled.
 - Error text from providers has the key, the base URL and the host, plus anything that

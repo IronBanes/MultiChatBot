@@ -9,18 +9,22 @@ on:
       export-method:
         description: "Xcode export method for the signed device build"
         required: false
-        default: development
+        default: debugging
         type: choice
         options:
-          - development
-          - ad-hoc
-          - app-store
+          - debugging
+          - release-testing
+          - app-store-connect
   push:
     tags: ["v*"]
   pull_request:
     paths:
       - "app/**"
       - ".github/workflows/ios.yml"
+
+# Builds only read the repo; nothing here needs write access.
+permissions:
+  contents: read
 
 concurrency:
   group: ios-${{ github.ref }}
@@ -66,7 +70,7 @@ jobs:
 
       - name: Build the iOS Simulator app (no signing)
         working-directory: app
-        run: npm run tauri -- ios build --ci --target aarch64-apple-ios-sim
+        run: npm run tauri -- ios build --ci --target aarch64-sim
 
       - name: Upload simulator .app
         uses: actions/upload-artifact@v4
@@ -139,7 +143,7 @@ jobs:
           export APPLE_DEVELOPMENT_TEAM="${{ secrets.APPLE_DEVELOPMENT_TEAM }}"
           # Optional team: unset (rather than empty) when the secret is absent.
           [ -n "$APPLE_DEVELOPMENT_TEAM" ] || unset APPLE_DEVELOPMENT_TEAM
-          npm run tauri -- ios build --ci --target aarch64-apple-ios --export-method "${{ inputs.export-method || 'development' }}"
+          npm run tauri -- ios build --ci --target aarch64 --export-method "${{ inputs.export-method || 'debugging' }}"
 
       - name: Upload device .ipa
         if: steps.check.outputs.available == 'true'

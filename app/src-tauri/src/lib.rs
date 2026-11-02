@@ -5,6 +5,7 @@ mod config;
 mod context;
 mod generate;
 mod mcp;
+mod net;
 mod providers;
 mod secrets;
 
@@ -126,6 +127,12 @@ fn set_identity(state: State<'_, AppState>, display_name: String, server_url: St
     let url = server_url.trim();
     if !(url.starts_with("ws://") || url.starts_with("wss://")) {
         return Err("Server URL must start with ws:// or wss://".into());
+    }
+    // A phone is often on someone else's network; don't send chats unencrypted
+    // across the internet. LAN relays may stay on plain ws://.
+    #[cfg(mobile)]
+    if url.starts_with("ws://") && !net::is_local_host(url) {
+        return Err("Use wss:// for relays outside your local network (for example through a cloudflared or Tailscale tunnel).".into());
     }
     state.update(|c| {
         c.display_name = name;

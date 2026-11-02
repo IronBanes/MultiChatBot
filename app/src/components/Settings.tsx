@@ -718,8 +718,9 @@ function McpPanel() {
   return (
     <div className="space-y-3">
       <p className="text-sm text-zinc-500">
-        MCP servers give the AI tools, like reading files or searching the web. They run on this device and are only used for replies
-        generated with your profiles. The room sees which tool ran, not its inputs or results, unless you let a server share its images.
+        MCP servers give the AI tools, like reading files or searching the web. Local command servers run on this device; Remote URL
+        servers run at their own address, and the tool calls are sent there. Either way they're only used for replies generated with your
+        profiles. The room sees which tool ran, not its inputs or results, unless you let a server share its images.
       </p>
       {client.platform !== "desktop" && (
         <p className="text-sm text-zinc-500">

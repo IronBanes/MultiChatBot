@@ -20,6 +20,24 @@ interface Handlers {
 const PING_EVERY = 20_000;
 const PONG_TIMEOUT = 10_000;
 
+/** `WebSocket.connect` resolves before the plugin registers the connection's writer,
+ *  so the first sends can fail with this error; they're retried briefly. */
+const NOT_REGISTERED = "connection not found";
+const REGISTER_RETRIES = 20;
+const REGISTER_RETRY_MS = 25;
+
+async function sendWhenRegistered(ws: WebSocket, frame: Parameters<WebSocket["send"]>[0]) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await ws.send(frame);
+      return;
+    } catch (e) {
+      if (attempt >= REGISTER_RETRIES || !String(e).toLowerCase().includes(NOT_REGISTERED)) throw e;
+      await new Promise((r) => setTimeout(r, REGISTER_RETRY_MS));
+    }
+  }
+}
+
 export class Relay {
   private ws: WebSocket | null = null;
   private generation = 0;
@@ -90,7 +108,7 @@ export class Relay {
         return;
       }
       const ws = this.ws;
-      this.queue = this.queue.then(() => ws.send({ type: "Ping", data: [] })).catch(() => this.dropped(gen));
+      this.queue = this.queue.then(() => sendWhenRegistered(ws, { type: "Ping", data: [] })).catch(() => this.dropped(gen));
     }, PING_EVERY);
   }
 
@@ -117,14 +135,30 @@ export class Relay {
     return this.ws !== null;
   }
 
-  /** Returns false if the socket is not open (the frame is dropped). */
+  /** Queues a frame. Returns false if the socket is not open (the frame is dropped). */
   send(msg: ClientMsg): boolean {
+    return this.enqueue(msg) !== null;
+  }
+
+  /** Like `send`, but resolves only once the frame was actually written (false if it wasn't). */
+  sendConfirmed(msg: ClientMsg): Promise<boolean> {
+    return this.enqueue(msg) ?? Promise.resolve(false);
+  }
+
+  private enqueue(msg: ClientMsg): Promise<boolean> | null {
     const ws = this.ws;
-    if (!ws) return false;
+    if (!ws) return null;
     const gen = this.generation;
     const text = JSON.stringify(msg);
-    this.queue = this.queue.then(() => ws.send(text)).catch(() => this.dropped(gen));
-    return true;
+    const written = this.queue.then(() => sendWhenRegistered(ws, text)).then(
+      () => true,
+      () => {
+        this.dropped(gen);
+        return false;
+      },
+    );
+    this.queue = written.then(() => {});
+    return written;
   }
 
   rename(display_name: string) {

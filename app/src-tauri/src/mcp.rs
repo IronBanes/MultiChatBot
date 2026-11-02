@@ -134,6 +134,11 @@ async fn connect(server: &McpServer, secrets: &McpSecrets) -> Result<Connection,
             if !(server.url.starts_with("http://") || server.url.starts_with("https://")) {
                 return Err("URL must start with http:// or https://".into());
             }
+            // Headers usually carry tokens; on a phone, don't send them over plain HTTP.
+            #[cfg(mobile)]
+            if server.url.starts_with("http://") && !secrets.headers.is_empty() {
+                return Err("HTTPS is required for MCP servers with headers (they often hold tokens).".into());
+            }
             let mut headers = HashMap::new();
             for (k, v) in &secrets.headers {
                 let name = reqwest::header::HeaderName::from_bytes(k.as_bytes()).map_err(|_| format!("Invalid header name `{k}`"))?;

@@ -112,11 +112,11 @@ export default function App() {
   if (!client.display_name) return <Onboarding />;
 
   return (
-    <div className="flex h-full overflow-hidden">
+    <div className="flex h-full overflow-hidden pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
       {!compactNav && <Sidebar onSettings={() => setSettings("general")} />}
       {compactNav && navOpen && (
         <div className="fixed inset-0 z-30 flex bg-black/30" onMouseDown={() => setNavOpen(false)}>
-          <div className="h-full bg-white shadow-2xl dark:bg-zinc-950" onMouseDown={(e) => e.stopPropagation()}>
+          <div className="h-full bg-white pl-[env(safe-area-inset-left)] shadow-2xl dark:bg-zinc-950" onMouseDown={(e) => e.stopPropagation()}>
             <Sidebar
               onSettings={() => {
                 setNavOpen(false);
@@ -135,7 +135,7 @@ export default function App() {
       </main>
       {settings && <SettingsDialog tab={settings} onClose={() => setSettings(null)} />}
       <ConfirmHost />
-      <div className="pointer-events-none fixed right-4 bottom-[max(1rem,env(safe-area-inset-bottom))] z-50 flex flex-col gap-2">
+      <div className="pointer-events-none fixed right-[max(1rem,env(safe-area-inset-right))] bottom-[max(1rem,env(safe-area-inset-bottom))] z-50 flex flex-col gap-2">
         {toasts.map((t) => (
           <button
             key={t.id}

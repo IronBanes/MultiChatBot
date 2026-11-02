@@ -507,9 +507,17 @@ function Composer({
     el.style.height = Math.min(el.scrollHeight, 220) + "px";
   }, [text]);
 
-  const send = () => {
-    if (!text.trim() || status !== "online") return;
-    if (sendMessage(room.id, text, ai, ai ? profileId : null)) setText("");
+  const sending = useRef(false);
+  const send = async () => {
+    if (!text.trim() || status !== "online" || sending.current) return;
+    const sent = text;
+    sending.current = true;
+    try {
+      // Only clear the box once the message really went out; keep anything typed meanwhile.
+      if (await sendMessage(room.id, sent, ai, ai ? profileId : null)) setText((t) => (t === sent ? "" : t));
+    } finally {
+      sending.current = false;
+    }
   };
 
   return (
@@ -621,7 +629,9 @@ function MemberList({ room, overlay, onClose }: { room: RoomInfo; overlay: boole
   if (!overlay) return panel;
   return (
     <div className="fixed inset-0 z-30 flex justify-end bg-black/30" onMouseDown={onClose}>
-      <div onMouseDown={(e) => e.stopPropagation()}>{panel}</div>
+      <div className="h-full bg-white pr-[env(safe-area-inset-right)] dark:bg-zinc-950" onMouseDown={(e) => e.stopPropagation()}>
+        {panel}
+      </div>
     </div>
   );
 }

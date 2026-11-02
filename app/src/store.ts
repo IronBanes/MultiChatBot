@@ -43,7 +43,8 @@ interface ChatState {
   createRoom(name: string): Promise<RoomInfo>;
   joinRoom(code: string): Promise<RoomInfo>;
   leaveRoom(id: string): void;
-  sendMessage(roomId: string, content: string, aiRequested: boolean, profileId: string | null): boolean;
+  /** Resolves true once the message was actually written to the relay. */
+  sendMessage(roomId: string, content: string, aiRequested: boolean, profileId: string | null): Promise<boolean>;
   regenerate(ai: Message, profileId: string): void;
   stopAi(id: string): void;
   setRoomPrompt(roomId: string, prompt: string): void;
@@ -433,13 +434,15 @@ export const useChat = create<ChatState>((set, get) => {
       relay?.send({ type: "leave_room", room_id: id });
     },
 
-    sendMessage(roomId, content, aiRequested, profileId) {
+    async sendMessage(roomId, content, aiRequested, profileId) {
       const id = crypto.randomUUID();
       if (aiRequested && profileId) pendingAi.set(id, profileId);
-      const ok = !!relay?.send({ type: "send_message", room_id: roomId, id, content, ai_requested: aiRequested });
+      const ok = relay
+        ? await relay.sendConfirmed({ type: "send_message", room_id: roomId, id, content, ai_requested: aiRequested })
+        : false;
       if (!ok) {
         pendingAi.delete(id);
-        get().toast("Not connected to the server");
+        get().toast("Message not sent: you're not connected to the server. Your text is still in the box.");
       }
       return ok;
     },
