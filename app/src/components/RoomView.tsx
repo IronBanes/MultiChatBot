@@ -755,7 +755,9 @@ export function RoomView({
           </Button>
         </header>
         <MessageList room={room} myProfileId={profileId} />
-        <Composer room={room} profileId={profileId} onOpenSettings={onOpenSettings} />
+        {/* Keyed by room: each room gets a fresh draft, and a send that finishes after
+            switching rooms can't edit the new room's text. */}
+        <Composer key={room.id} room={room} profileId={profileId} onOpenSettings={onOpenSettings} />
       </div>
       {inlineMembers && membersPref && <MemberList room={room} overlay={false} onClose={() => setMembersPref(false)} />}
       {!inlineMembers && membersOverlay && <MemberList room={room} overlay onClose={() => setMembersOverlay(false)} />}
