@@ -1,0 +1,150 @@
+# Builds the Multichat iOS app on a macOS runner, so development machines
+# (Windows/Linux) never need Xcode. Job 1 needs no Apple account at all;
+# job 2 signs a real-device .ipa when the repo has signing secrets.
+name: iOS build
+
+on:
+  workflow_dispatch:
+    inputs:
+      export-method:
+        description: "Xcode export method for the signed device build"
+        required: false
+        default: development
+        type: choice
+        options:
+          - development
+          - ad-hoc
+          - app-store
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/ios.yml"
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Unsigned simulator build: proves the whole app (Rust backend with iOS
+  # feature gates + React frontend) cross-compiles for iOS. No secrets needed.
+  build-simulator:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "app/src-tauri -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+
+      # gen/apple (the Xcode project) is not committed; generate it on the runner.
+      # On a local Mac this step is what `npm run tauri ios init` does once.
+      - name: Generate the Xcode project
+        working-directory: app
+        run: npm run tauri -- ios init --ci
+
+      # The generated project ships Tauri's default icon; replace it with ours.
+      - name: Generate app icons
+        working-directory: app
+        run: npm run tauri -- icon ../branding/logo.svg
+
+      - name: Build the iOS Simulator app (no signing)
+        working-directory: app
+        run: npm run tauri -- ios build --ci --target aarch64-apple-ios-sim
+
+      - name: Upload simulator .app
+        uses: actions/upload-artifact@v4
+        with:
+          name: multichat-ios-simulator
+          path: app/src-tauri/gen/apple/build/**/*.app
+          if-no-files-found: error
+
+  # Signed device build. Needs these repo secrets (base64 where noted):
+  #   IOS_CERTIFICATE          - the .p12 signing certificate, base64-encoded
+  #   IOS_CERTIFICATE_PASSWORD - the .p12 password
+  #   IOS_MOBILE_PROVISION     - the .mobileprovision profile, base64-encoded
+  # Optional:
+  #   APPLE_DEVELOPMENT_TEAM   - 10-digit team id, overrides bundle > ios > developmentTeam
+  # The Tauri CLI reads these directly; no custom keychain scripting is needed.
+  build-device:
+    runs-on: macos-latest
+    needs: build-simulator
+    # Signed builds only make sense on manual runs and release tags.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "app/src-tauri -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+
+      - name: Generate the Xcode project
+        working-directory: app
+        run: npm run tauri -- ios init --ci
+
+      # The generated project ships Tauri's default icon; replace it with ours.
+      - name: Generate app icons
+        working-directory: app
+        run: npm run tauri -- icon ../branding/logo.svg
+
+      - name: Check signing secrets
+        id: check
+        run: |
+          if [ -n "${{ secrets.IOS_CERTIFICATE }}" ] && [ -n "${{ secrets.IOS_MOBILE_PROVISION }}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Skipped device build::IOS_CERTIFICATE / IOS_CERTIFICATE_PASSWORD / IOS_MOBILE_PROVISION secrets are not configured; skipping the signed build. The unsigned simulator build from build-simulator still ran."
+          fi
+
+      - name: Build the signed device .ipa
+        if: steps.check.outputs.available == 'true'
+        working-directory: app
+        env:
+          IOS_CERTIFICATE: ${{ secrets.IOS_CERTIFICATE }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_MOBILE_PROVISION: ${{ secrets.IOS_MOBILE_PROVISION }}
+        run: |
+          export APPLE_DEVELOPMENT_TEAM="${{ secrets.APPLE_DEVELOPMENT_TEAM }}"
+          # Optional team: unset (rather than empty) when the secret is absent.
+          [ -n "$APPLE_DEVELOPMENT_TEAM" ] || unset APPLE_DEVELOPMENT_TEAM
+          npm run tauri -- ios build --ci --target aarch64-apple-ios --export-method "${{ inputs.export-method || 'development' }}"
+
+      - name: Upload device .ipa
+        if: steps.check.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: multichat-ios-device
+          path: app/src-tauri/gen/apple/build/**/*.ipa
+          if-no-files-found: error

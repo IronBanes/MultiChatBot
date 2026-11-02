@@ -74,7 +74,7 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
 
   return (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900/60">
-      <div className="flex items-center gap-2 px-4 pt-4 pb-3">
+      <div className="flex items-center gap-2 px-4 pt-[calc(env(safe-area-inset-top)+1rem)] pb-3">
         <Logo size={32} />
         <div className="min-w-0 flex-1">
           <div className="font-semibold leading-tight">Multichat</div>
@@ -131,7 +131,7 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
         })}
       </nav>
 
-      <div className="flex items-center gap-2 border-t border-zinc-200 p-3 dark:border-zinc-800">
+      <div className="flex items-center gap-2 border-t border-zinc-200 px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
         <Avatar userId={client.user_id} name={client.display_name} size={30} />
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-medium">{client.display_name}</div>

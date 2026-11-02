@@ -83,10 +83,22 @@ struct ClientState {
     user_id: String,
     display_name: String,
     server_url: String,
+    platform: &'static str,
     last_profile_by_room: HashMap<String, String>,
     profiles: Vec<ProfileView>,
     mcp_servers: Vec<McpServerView>,
     mcp_modes_by_room: HashMap<String, HashMap<String, McpMode>>,
+}
+
+/// "desktop", "ios" or "android" — lets the UI adapt (mobile hides stdio MCP servers).
+fn platform() -> &'static str {
+    if cfg!(target_os = "ios") {
+        "ios"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else {
+        "desktop"
+    }
 }
 
 #[tauri::command]
@@ -97,6 +109,7 @@ fn get_state(state: State<'_, AppState>) -> Result<ClientState, String> {
         user_id: cfg.user_id,
         display_name: cfg.display_name,
         server_url: cfg.server_url,
+        platform: platform(),
         last_profile_by_room: cfg.last_profile_by_room,
         profiles: cfg.profiles.into_iter().map(view).collect(),
         mcp_servers: cfg.mcp_servers.into_iter().map(mcp_view).collect(),
@@ -279,6 +292,15 @@ fn validate_mcp(s: &McpServer) -> Result<(), String> {
     if s.name.trim().is_empty() {
         return Err("Name is required".into());
     }
+    // Mobile OSes cannot spawn the local commands stdio servers need.
+    #[cfg(mobile)]
+    {
+        if matches!(s.transport, McpTransport::Stdio) {
+            return Err(
+                "Local command (stdio) MCP servers run on the desktop app only. Add the server as a Remote URL instead.".into(),
+            );
+        }
+    }
     match s.transport {
         McpTransport::Stdio if s.command.trim().is_empty() => Err("Command is required".into()),
         McpTransport::Http if !(s.url.starts_with("http://") || s.url.starts_with("https://")) => {
@@ -448,6 +470,7 @@ fn stop_generation(state: State<'_, AppState>, id: String) -> Result<(), String>
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_websocket::init())
         .setup(|app| {
             let base = app.path().app_config_dir()?;
             let config_path = config::config_path(&base);
@@ -456,10 +479,15 @@ pub fn run() {
                 .connect_timeout(Duration::from_secs(15))
                 .read_timeout(Duration::from_secs(180))
                 .build()?;
-            if let Some(w) = app.get_webview_window("main") {
-                let instance = config::instance_name();
-                let title = if instance == "default" { "Multichat".to_string() } else { format!("Multichat — {instance}") };
-                let _ = w.set_title(&title);
+            // Window titles are a desktop concept (window management APIs don't
+            // exist on mobile).
+            #[cfg(desktop)]
+            {
+                if let Some(w) = app.get_webview_window("main") {
+                    let instance = config::instance_name();
+                    let title = if instance == "default" { "Multichat".to_string() } else { format!("Multichat — {instance}") };
+                    let _ = w.set_title(&title);
+                }
             }
             app.manage(AppState {
                 config_path,

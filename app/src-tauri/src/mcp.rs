@@ -1,6 +1,6 @@
-//! MCP client side: connects to the user's MCP servers (stdio or Streamable HTTP),
-//! lists their tools and runs tool calls. Everything runs on this machine; the
-//! relay only ever sees tool names and statuses.
+//! MCP client side: connects to the user's MCP servers (stdio on desktop, or
+//! Streamable HTTP on every platform), lists their tools and runs tool calls.
+//! Everything runs on this machine; the relay only ever sees tool names and statuses.
 
 use crate::config::{McpMode, McpServer, McpTransport};
 use crate::providers::ToolSpec;
@@ -8,7 +8,9 @@ use crate::secrets::McpSecrets;
 use rmcp::model::{CallToolRequestParams, ContentBlock, Tool};
 use rmcp::service::RunningService;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
+use rmcp::transport::StreamableHttpClientTransport;
+#[cfg(desktop)]
+use rmcp::transport::TokioChildProcess;
 use rmcp::{RoleClient, ServiceExt};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -87,6 +89,9 @@ fn qualified_name(server: &str, tool: &str, taken: &HashMap<String, ()>) -> Stri
     name
 }
 
+/// Builds the child process for a stdio server. Desktop only: iOS and Android
+/// cannot spawn child processes.
+#[cfg(desktop)]
 fn stdio_command(server: &McpServer, secrets: &McpSecrets) -> tokio::process::Command {
     // On Windows, `npx`, `uvx` etc. are .cmd shims that only a shell can resolve.
     #[cfg(windows)]
@@ -107,6 +112,8 @@ fn stdio_command(server: &McpServer, secrets: &McpSecrets) -> tokio::process::Co
 
 async fn connect(server: &McpServer, secrets: &McpSecrets) -> Result<Connection, String> {
     let client: Client = match server.transport {
+        // stdio servers spawn a local command, which mobile OSes forbid.
+        #[cfg(desktop)]
         McpTransport::Stdio => {
             if server.command.trim().is_empty() {
                 return Err("No command set".into());
@@ -116,6 +123,12 @@ async fn connect(server: &McpServer, secrets: &McpSecrets) -> Result<Connection,
                 .spawn()
                 .map_err(|e| format!("Could not start `{}`: {e}", server.command))?;
             ().serve(transport).await.map_err(|e| format!("MCP handshake failed: {e}"))?
+        }
+        #[cfg(mobile)]
+        McpTransport::Stdio => {
+            return Err(
+                "Local command (stdio) MCP servers run on the desktop app only. Add the server as a Remote URL instead.".into(),
+            );
         }
         McpTransport::Http => {
             if !(server.url.starts_with("http://") || server.url.starts_with("https://")) {

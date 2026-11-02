@@ -20,7 +20,10 @@ export function Modal({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4 backdrop-blur-sm" onMouseDown={onClose}>
+    <div
+      className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 px-4 pb-4 pt-[max(1rem,env(safe-area-inset-top))] backdrop-blur-sm"
+      onMouseDown={onClose}
+    >
       <div
         className={`flex max-h-[90vh] w-full flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-800 dark:bg-zinc-900 ${wide ? "max-w-3xl" : "max-w-md"}`}
         onMouseDown={(e) => e.stopPropagation()}

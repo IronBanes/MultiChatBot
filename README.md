@@ -19,7 +19,7 @@ through the relay. The relay server never sees keys or endpoints.
 | Path | What |
 |---|---|
 | `server/` | Relay: Rust, axum, tokio, WebSockets, SQLite (sqlx). Syncs rooms, members, presence and messages. |
-| `app/` | Desktop client: Tauri v2, React, TypeScript, Vite, Tailwind. |
+| `app/` | Desktop and iOS client: Tauri v2, React, TypeScript, Vite, Tailwind. |
 | `app/src-tauri/` | Rust backend: profiles, keychain, providers, context building, streaming. |
 | `docs/PLAN.md` | WebSocket protocol, data models and context-building rules. |
 | `tools/smoke-test.mjs` | Two scripted clients that exercise the relay protocol end to end. |
@@ -153,9 +153,64 @@ server, add one in **Settings → MCP servers** with command `node` and the full
 
 ```bash
 cd server && cargo run                      # in one terminal
-node tools/smoke-test.mjs                   # relay protocol test with two clients
+node tools/smoke-test.mjs                    # relay protocol test with two clients
 cd app/src-tauri && cargo test              # context building, trimming, error sanitizing
 ```
+
+## iOS
+
+The same `app/` builds for iOS as a second Tauri target: the React frontend runs in a
+WKWebView and the Rust backend still makes every LLM call, so **API keys never leave the
+phone** — they live in the iOS Keychain, under the same `multichat-bot` service.
+
+What works on iOS: everything the desktop app does, except **local command (stdio) MCP
+servers**, which iOS cannot support because it forbids spawning child processes. Remote
+URL (Streamable HTTP) MCP servers work fully, including **Ask** approvals and tool image
+sharing; the settings UI simply hides the Local command option. Run your stdio servers on
+your desktop and HTTP servers on either.
+
+iOS builds require macOS with Xcode — a Windows or Linux machine cannot produce them. There
+are two supported paths:
+
+### Building on a Mac
+
+```bash
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+cd app
+npm run tauri ios init          # once: generates src-tauri/gen/apple (Xcode project)
+npm run tauri icon ../branding/logo.svg   # once, after init: puts the app icon in the Xcode project
+npm run tauri ios dev           # run in the iOS Simulator
+npm run tauri ios build         # .ipa for a real device
+```
+
+- **Simulator**: run the relay on any machine as `MULTICHAT_ADDR=0.0.0.0:8787 cargo run`
+  (in `server/`), then join `ws://<that machine's LAN IP>:8787/ws` from the app. The
+  simulator uses your Mac's network, so a LAN IP (or `127.0.0.1` from the same Mac) works.
+- **Real device**: free Apple account works for development — open
+  `app/src-tauri/gen/apple` in Xcode, set your personal team as the signing identity, and
+  run on a USB-connected iPhone. Free-account installs expire after 7 days and need a
+  re-install; a paid Apple Developer account ($99/yr) unlocks TestFlight and App Store
+  distribution.
+- **Local network prompt**: the first time the app connects to a LAN relay (e.g.
+  `ws://192.168.x.x:8787/ws`), iOS asks for local-network permission once — that's the
+  `NSLocalNetworkUsageDescription` in `src-tauri/Info.ios.plist`.
+- **`ws://` and `wss://`**: the relay connection is opened by the app's Rust side
+  (`tauri-plugin-websocket`), not the webview, so iOS's block on insecure connections from
+  secure pages doesn't apply and a `ws://` relay on your LAN works. For friends over the
+  internet, keep using the `wss://` tunnels (cloudflared/Tailscale) described above.
+
+### Building with GitHub Actions (no Mac needed)
+
+`.github/workflows/ios.yml` builds the app on a GitHub-hosted macOS runner:
+
+- **build-simulator** — unsigned simulator `.app`, needs **no secrets and no Apple
+  account**; it exists to prove every push compiles for iOS. Install the artifact with
+  `xcrun simctl install booted <app>` on a Mac.
+- **build-device** — signed `.ipa`, runs on manual dispatch or `v*` tags when the repo has
+  these secrets: `IOS_CERTIFICATE` (base64 `.p12`), `IOS_CERTIFICATE_PASSWORD` and
+  `IOS_MOBILE_PROVISION` (base64). Without them the job prints a notice and skips, leaving
+  the simulator build as the artifact. Side-load the `.ipa` via Xcode → Devices, or upload
+  it to TestFlight with Transporter once you have a paid account.
 
 ## Profiles
 
@@ -187,8 +242,10 @@ id, display name, server URL and the last-used profile for each room.
 
 Add MCP servers in **Settings → MCP servers**: a **local command** (stdio, e.g. `npx -y
 @modelcontextprotocol/server-filesystem <folder>`) or a **remote URL** (Streamable HTTP).
-Env vars and headers, which often hold tokens, are stored in the OS keychain.
-**Test & list tools** connects and shows what the server offers.
+Local command servers are **desktop-only** — iOS forbids spawning child processes, so on a
+phone only remote URL servers can be added. Env vars and headers, which often hold tokens,
+are stored in the OS keychain. **Test & list tools** connects and shows what the server
+offers.
 
 Each server has a mode for each chat, set from the **Tools** button in the composer:
 
@@ -268,6 +325,8 @@ message, generated with your own model.
   same-origin access are all disabled.
 - Error text from providers has the key, the base URL and the host, plus anything that
   looks like a key or URL, removed before it is shown or broadcast.
+- On iOS the same guarantees hold: keys live in the iOS Keychain and every LLM/MCP call is
+  made by the Rust backend inside the app, never by the relay.
 - v1 has no accounts. Anyone with an invite code can join that room, and a user id is
   just a locally generated UUID. Run the relay only where you trust the network, or put
   it behind TLS (`wss://`) and a reverse proxy.
