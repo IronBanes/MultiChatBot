@@ -1,6 +1,6 @@
 // Small shared UI primitives.
 
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useId, type ReactNode } from "react";
 import { initials, memberColor } from "../lib/colors";
 
 export function Modal({
@@ -157,5 +157,26 @@ export function Segmented<T extends string>({
         </button>
       ))}
     </div>
+  );
+}
+
+/** The Multichat "Orbit" mark (branding/logo.svg): members circling one shared AI. */
+export function Logo({ size = 32, className = "" }: { size?: number; className?: string }) {
+  const id = useId();
+  return (
+    <svg width={size} height={size} viewBox="0 0 128 128" className={`shrink-0 ${className}`} role="img" aria-label="Multichat">
+      <defs>
+        <linearGradient id={id} x1="0" y1="0" x2="1" y2="1">
+          <stop offset="0" stopColor="#6366f1" />
+          <stop offset="1" stopColor="#d946ef" />
+        </linearGradient>
+      </defs>
+      <rect width="128" height="128" rx="28" fill={`url(#${id})`} />
+      <circle cx="64" cy="64" r="34" fill="none" stroke="#fff" strokeOpacity=".4" strokeWidth="3" />
+      <path d="M64 42Q66.8 61.2 86 64Q66.8 66.8 64 86Q61.2 66.8 42 64Q61.2 61.2 64 42Z" fill="#fff" />
+      <circle cx="64" cy="30" r="8" fill="#fbbf24" stroke="#fff" strokeWidth="3" />
+      <circle cx="93.4" cy="81" r="8" fill="#34d399" stroke="#fff" strokeWidth="3" />
+      <circle cx="34.6" cy="81" r="8" fill="#38bdf8" stroke="#fff" strokeWidth="3" />
+    </svg>
   );
 }

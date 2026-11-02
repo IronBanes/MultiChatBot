@@ -5,7 +5,7 @@ import type { McpMode, Message, RoomInfo, ToolActivity } from "../lib/types";
 import { useChat, type LocalTool } from "../store";
 import { Markdown } from "./Markdown";
 import { MODE_OPTIONS, type SettingsTab } from "./Settings";
-import { Avatar, Button, Icon, Modal, Segmented } from "./ui";
+import { Avatar, Button, Icon, Logo, Modal, Segmented } from "./ui";
 
 function time(ms: number) {
   return new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -296,9 +296,7 @@ function MessageList({ room, myProfileId }: { room: RoomInfo; myProfileId: strin
         {!loaded && list.length === 0 && <div className="p-8 text-center text-sm text-zinc-400">Loading history…</div>}
         {loaded && list.length === 0 && (
           <div className="mx-auto mt-16 max-w-sm px-6 text-center">
-            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white">
-              <Icon name="sparkle" />
-            </div>
+            <Logo size={48} className="mx-auto mb-3" />
             <h3 className="font-semibold">Say hi to #{room.name}</h3>
             <p className="mt-1 text-sm text-zinc-500">
               Every message you send gets an AI reply generated with <em>your</em> profile. Share the invite code{" "}

@@ -6,7 +6,7 @@ import { RoomView } from "./components/RoomView";
 import { SettingsDialog, type SettingsTab } from "./components/Settings";
 import { useWidth } from "./lib/useWidth";
 import { RoomDialog, Sidebar } from "./components/Sidebar";
-import { Button, Field, Icon, inputCls } from "./components/ui";
+import { Button, Field, Icon, inputCls, Logo } from "./components/ui";
 
 function Onboarding() {
   const client = useChat((s) => s.client)!;
@@ -27,9 +27,7 @@ function Onboarding() {
   return (
     <div className="flex h-full items-center justify-center bg-gradient-to-br from-indigo-50 via-white to-fuchsia-50 p-6 dark:from-zinc-950 dark:via-zinc-950 dark:to-indigo-950/40">
       <form onSubmit={submit} className="w-full max-w-sm space-y-5 rounded-2xl border border-zinc-200 bg-white p-7 shadow-xl dark:border-zinc-800 dark:bg-zinc-900">
-        <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white">
-          <Icon name="sparkle" />
-        </div>
+        <Logo size={48} />
         <div>
           <h1 className="text-xl font-semibold">Welcome to Multichat</h1>
           <p className="mt-1 text-sm text-zinc-500">Group chats where everyone brings their own AI. Pick a name to get started.</p>

@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { errorText } from "../lib/backend";
 import { useChat } from "../store";
-import { Avatar, Button, Field, Icon, inputCls, Modal } from "./ui";
+import { Avatar, Button, Field, Icon, inputCls, Logo, Modal } from "./ui";
 
 export function RoomDialog({ mode, onClose }: { mode: "create" | "join"; onClose: () => void }) {
   const createRoom = useChat((s) => s.createRoom);
@@ -75,9 +75,7 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
   return (
     <aside className="flex h-full w-64 shrink-0 flex-col border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900/60">
       <div className="flex items-center gap-2 px-4 pt-4 pb-3">
-        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white">
-          <Icon name="sparkle" size={16} />
-        </div>
+        <Logo size={32} />
         <div className="min-w-0 flex-1">
           <div className="font-semibold leading-tight">Multichat</div>
           <div className="flex items-center gap-1.5 text-xs text-zinc-500">
