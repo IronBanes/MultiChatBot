@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, AxumState(state): AxumState<State>) -> impl IntoResponse {
-    ws.max_message_size(1 << 20).on_upgrade(move |socket| client_loop(socket, state))
+    ws.max_message_size(8 << 20).on_upgrade(move |socket| client_loop(socket, state))
 }
 
 async fn client_loop(socket: WebSocket, state: State) {

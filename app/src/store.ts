@@ -2,8 +2,9 @@
 
 import { create } from "zustand";
 import { backend, errorText } from "./lib/backend";
+import { prepareImage } from "./lib/images";
 import { Relay, type ConnStatus } from "./lib/relay";
-import type { ClientState, HistoryItem, McpMode, Message, RoomInfo, ServerMsg, ToolStatus } from "./lib/types";
+import type { Attachment, ClientState, HistoryItem, McpMode, Message, RoomInfo, ServerMsg, ToolStatus } from "./lib/types";
 
 /** Tool call details only the sender sees (arguments and a result preview). */
 export interface LocalTool {
@@ -31,6 +32,8 @@ interface ChatState {
   myGenerations: Record<string, true>;
   /** AI message id → call id → details, for replies this client generates. */
   localTools: Record<string, Record<string, LocalTool>>;
+  /** attachment id → data URL ("" while loading). */
+  images: Record<string, string>;
   toasts: Toast[];
 
   init(): Promise<void>;
@@ -47,6 +50,7 @@ interface ChatState {
   chooseProfile(roomId: string, profileId: string): void;
   setRoomMcpMode(roomId: string, serverId: string, mode: McpMode): void;
   answerToolCall(id: string, callId: string, approved: boolean): void;
+  loadImage(attachmentId: string): void;
   toast(text: string, kind?: Toast["kind"]): void;
   dismissToast(id: number): void;
 }
@@ -54,6 +58,19 @@ interface ChatState {
 let relay: Relay | null = null;
 /** Human message id → profile id, waiting for the server echo before the AI call starts. */
 const pendingAi = new Map<string, string>();
+/** Images announced for a reply this client hasn't loaded yet (e.g. while joining). */
+const unclaimedAttachments = new Map<string, Attachment[]>();
+
+/** Adds attachments not already on the message, plus any waiting for it. */
+function withAttachments(m: Message, extra: Attachment[] = []): Message {
+  const waiting = unclaimedAttachments.get(m.id) ?? [];
+  unclaimedAttachments.delete(m.id);
+  const add = [...extra, ...waiting].filter(
+    (a, i, all) => !m.attachments.some((b) => b.attachment_id === a.attachment_id) && all.findIndex((b) => b.attachment_id === a.attachment_id) === i,
+  );
+  return add.length ? { ...m, attachments: [...m.attachments, ...add] } : m;
+}
+
 const pendingRequests = new Map<string, { resolve: (r: RoomInfo) => void; reject: (e: Error) => void }>();
 let toastSeq = 0;
 
@@ -132,6 +149,11 @@ export const useChat = create<ChatState>((set, get) => {
       return;
     }
     set((st) => ({ myGenerations: { ...st.myGenerations, [id]: true } }));
+    // Images are compressed before relaying; the reply only ends after they're sent.
+    let uploads: Promise<void> = Promise.resolve();
+    const afterUploads = (f: () => void) => {
+      uploads = uploads.then(f, f);
+    };
     const finish = () =>
       set((st) => {
         const { [id]: _, ...rest } = st.myGenerations;
@@ -153,14 +175,33 @@ export const useChat = create<ChatState>((set, get) => {
             const local: LocalTool = { status: ev.status, args: ev.args ?? prev?.args ?? null, detail: ev.detail ?? prev?.detail ?? null };
             return { localTools: { ...st.localTools, [id]: { ...st.localTools[id], [ev.call_id]: local } } };
           });
+        } else if (ev.event === "image") {
+          const callId = ev.call_id;
+          const { mime, data } = ev;
+          uploads = uploads.then(async () => {
+            try {
+              const img = await prepareImage(mime, data);
+              const attachment = { attachment_id: crypto.randomUUID(), mime: img.mime, call_id: callId, width: img.width, height: img.height };
+              set((st) => ({ images: { ...st.images, [attachment.attachment_id]: `data:${img.mime};base64,${img.data}` } }));
+              relay?.send({ type: "ai_attachment", room_id: roomId, id, attachment, data: img.data });
+            } catch (e) {
+              get().toast(`Couldn't share an image: ${errorText(e)}`);
+            }
+          });
         } else if (ev.event === "notice") {
           get().toast(ev.message, "info");
         } else if (ev.event === "done") {
-          relay?.send({ type: "ai_complete", room_id: roomId, id, content: ev.content });
-          finish();
+          const content = ev.content;
+          afterUploads(() => {
+            relay?.send({ type: "ai_complete", room_id: roomId, id, content });
+            finish();
+          });
         } else {
-          relay?.send({ type: "ai_error", room_id: roomId, id, error: ev.message });
-          finish();
+          const error = ev.message;
+          afterUploads(() => {
+            relay?.send({ type: "ai_error", room_id: roomId, id, error });
+            finish();
+          });
         }
       })
       .catch((e) => {
@@ -177,7 +218,10 @@ export const useChat = create<ChatState>((set, get) => {
         const order = msg.rooms.map((r) => r.id);
         let active = get().activeRoomId;
         if (!active || !rooms[active]) active = order[0] ?? null;
-        set({ rooms, roomOrder: order, loaded: {}, activeRoomId: active });
+        // Image fetches still pending when the connection dropped never got an answer;
+        // forget them so the images request again on this connection.
+        const images = Object.fromEntries(Object.entries(get().images).filter(([, src]) => src));
+        set({ rooms, roomOrder: order, loaded: {}, activeRoomId: active, images });
         if (active) relay?.send({ type: "open_room", room_id: active });
         break;
       }
@@ -206,17 +250,21 @@ export const useChat = create<ChatState>((set, get) => {
         break;
       case "room_history":
         set((s) => {
-          // Keep anything live that arrived after the history snapshot.
+          // Keep anything live that arrived after the history snapshot, including images
+          // announced while the snapshot was being read.
+          const current = s.messages[msg.room_id] ?? [];
           const maxSeq = msg.messages.length ? msg.messages[msg.messages.length - 1].seq : -1;
-          const newer = (s.messages[msg.room_id] ?? []).filter((m) => m.seq > maxSeq);
+          const newer = current.filter((m) => m.seq > maxSeq);
+          const live = new Map(current.map((m) => [m.id, m]));
+          const merged = msg.messages.map((m) => withAttachments(m, live.get(m.id)?.attachments));
           return {
-            messages: { ...s.messages, [msg.room_id]: [...msg.messages, ...newer] },
+            messages: { ...s.messages, [msg.room_id]: [...merged, ...newer] },
             loaded: { ...s.loaded, [msg.room_id]: true },
           };
         });
         break;
       case "message": {
-        const m = msg.message;
+        const m = withAttachments(msg.message);
         const mine = m.author_id === get().client?.user_id;
         set((s) => ({
           messages: { ...s.messages, [m.room_id]: upsert(s.messages[m.room_id], m) },
@@ -263,6 +311,26 @@ export const useChat = create<ChatState>((set, get) => {
             })!,
           },
         }));
+        break;
+      case "ai_attachment":
+        if (!get().messages[msg.room_id]?.some((m) => m.id === msg.id)) {
+          // The reply isn't loaded yet; attach the image when it arrives.
+          unclaimedAttachments.set(msg.id, [...(unclaimedAttachments.get(msg.id) ?? []), msg.attachment]);
+          break;
+        }
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [msg.room_id]: patchMessage(s.messages[msg.room_id], msg.id, (m) =>
+              m.attachments.some((a) => a.attachment_id === msg.attachment.attachment_id)
+                ? m
+                : { ...m, attachments: [...m.attachments, msg.attachment] },
+            )!,
+          },
+        }));
+        break;
+      case "attachment":
+        set((s) => ({ images: { ...s.images, [msg.attachment_id]: `data:${msg.mime};base64,${msg.data}` } }));
         break;
       case "ai_complete":
       case "ai_error":
@@ -328,6 +396,7 @@ export const useChat = create<ChatState>((set, get) => {
     activeRoomId: null,
     myGenerations: {},
     localTools: {},
+    images: {},
     toasts: [],
 
     async init() {
@@ -412,6 +481,13 @@ export const useChat = create<ChatState>((set, get) => {
 
     answerToolCall(id, callId, approved) {
       backend.resolveToolCall(id, callId, approved).catch((e) => get().toast(errorText(e)));
+    },
+
+    loadImage(attachmentId) {
+      if (attachmentId in get().images) return;
+      if (relay?.send({ type: "get_attachment", attachment_id: attachmentId })) {
+        set((s) => ({ images: { ...s.images, [attachmentId]: "" } }));
+      }
     },
 
     toast(text, kind = "error") {

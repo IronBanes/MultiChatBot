@@ -2,7 +2,7 @@
 
 use crate::db::{self, Db, NewMessage};
 use crate::db::AiResult;
-use crate::protocol::{ClientMsg, Member, RoomInfo, ServerMsg, ToolActivity};
+use crate::protocol::{Attachment, ClientMsg, Member, RoomInfo, ServerMsg, ToolActivity};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
@@ -14,6 +14,12 @@ const MAX_PROMPT: usize = 8_000;
 const MAX_ERROR: usize = 300;
 const HISTORY_LIMIT: i64 = 1000;
 const MAX_TOOL_CALLS: usize = 100;
+const MAX_ATTACHMENTS: usize = 8;
+/// Base64 length cap (~4.5 MB of image); clients downscale before sending.
+const MAX_ATTACHMENT_B64: usize = 6_000_000;
+/// Reported image dimensions outside 1..=this are rejected as bogus metadata.
+const MAX_IMAGE_SIDE: u32 = 16_384;
+const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 pub type ConnId = u64;
 
@@ -31,6 +37,7 @@ struct Stream {
     content: String,
     reasoning: String,
     tools: Vec<ToolActivity>,
+    attachments: Vec<Attachment>,
 }
 
 #[derive(Default)]
@@ -336,6 +343,7 @@ impl State {
                         content: String::new(),
                         reasoning: String::new(),
                         tools: Vec::new(),
+                        attachments: Vec::new(),
                     },
                 );
                 hub.broadcast(&room_id, &ServerMsg::Message { room_id: room_id.clone(), message });
@@ -385,6 +393,45 @@ impl State {
                     return Ok(());
                 }
                 hub.broadcast(&room_id, &ServerMsg::AiTool { room_id: room_id.clone(), id, activity });
+            }
+
+            ClientMsg::AiAttachment { room_id, id, attachment, data } => {
+                let ok_shape = uuid::Uuid::parse_str(&attachment.attachment_id).is_ok()
+                    && IMAGE_MIMES.contains(&attachment.mime.as_str())
+                    && !data.is_empty()
+                    && data.len() <= MAX_ATTACHMENT_B64
+                    && data.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+                    && [attachment.width, attachment.height]
+                        .iter()
+                        .all(|d| d.is_none_or(|d| (1..=MAX_IMAGE_SIDE).contains(&d)));
+                let owned = {
+                    let hub = self.hub();
+                    hub.streams.get(&id).is_some_and(|s| {
+                        s.conn_id == conn && s.room_id == room_id && s.attachments.len() < MAX_ATTACHMENTS
+                    })
+                };
+                if !ok_shape || !owned {
+                    self.send(conn, err(None, "Image rejected (unsupported type, too large, or too many)"));
+                    return Ok(());
+                }
+                let attachment = Attachment {
+                    call_id: attachment.call_id.map(|c| clip(&c, 100)),
+                    ..attachment
+                };
+                db::insert_attachment(&self.db, &attachment, &id, &room_id, &data).await?;
+                let mut hub = self.hub();
+                let Some(s) = hub.streams.get_mut(&id) else { return Ok(()) };
+                s.attachments.push(attachment.clone());
+                hub.broadcast(&room_id, &ServerMsg::AiAttachment { room_id: room_id.clone(), id, attachment });
+            }
+
+            ClientMsg::GetAttachment { attachment_id } => {
+                let Some((room_id, mime, data)) = db::attachment(&self.db, &attachment_id).await? else {
+                    return Ok(());
+                };
+                if self.in_room(conn, &room_id) {
+                    self.send(conn, ServerMsg::Attachment { attachment_id, mime, data });
+                }
             }
 
             ClientMsg::AiComplete { room_id, id, content } => {
@@ -518,7 +565,13 @@ impl State {
             if let Err(e) = db::finish_ai(
                 &self.db,
                 &id,
-                AiResult { content: &s.content, reasoning: &s.reasoning, tools: &s.tools, status: "interrupted", error: None },
+                AiResult {
+                    content: &s.content,
+                    reasoning: &s.reasoning,
+                    tools: &s.tools,
+                    status: "interrupted",
+                    error: None,
+                },
             )
             .await {
                 tracing::error!("failed to mark {id} interrupted: {e}");

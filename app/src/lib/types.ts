@@ -24,6 +24,15 @@ export interface ToolActivity {
   status: ToolStatus;
 }
 
+/** An image attached to an AI reply; the bytes are fetched with `get_attachment`. */
+export interface Attachment {
+  attachment_id: string;
+  mime: string;
+  call_id: string | null;
+  width: number | null;
+  height: number | null;
+}
+
 export type MessageStatus = "complete" | "streaming" | "error" | "interrupted";
 
 export interface Message {
@@ -37,6 +46,7 @@ export interface Message {
   content: string;
   reasoning: string;
   tools: ToolActivity[];
+  attachments: Attachment[];
   ai_requested: boolean;
   anchor_id: string | null;
   model: string | null;
@@ -56,6 +66,8 @@ export type ClientMsg =
   | { type: "ai_delta"; room_id: string; id: string; delta: string }
   | { type: "ai_reasoning"; room_id: string; id: string; delta: string }
   | { type: "ai_tool"; room_id: string; id: string; activity: ToolActivity }
+  | { type: "ai_attachment"; room_id: string; id: string; attachment: Attachment; data: string }
+  | { type: "get_attachment"; attachment_id: string }
   | { type: "ai_complete"; room_id: string; id: string; content: string }
   | { type: "ai_error"; room_id: string; id: string; error: string }
   | { type: "set_room_prompt"; room_id: string; system_prompt: string };
@@ -69,6 +81,8 @@ export type ServerMsg =
   | { type: "ai_delta"; room_id: string; id: string; delta: string }
   | { type: "ai_reasoning"; room_id: string; id: string; delta: string }
   | { type: "ai_tool"; room_id: string; id: string; activity: ToolActivity }
+  | { type: "ai_attachment"; room_id: string; id: string; attachment: Attachment }
+  | { type: "attachment"; attachment_id: string; mime: string; data: string }
   | { type: "ai_complete"; room_id: string; id: string; content: string }
   | { type: "ai_error"; room_id: string; id: string; error: string }
   | { type: "ai_interrupted"; room_id: string; id: string; content: string }
@@ -113,6 +127,8 @@ export interface McpServer {
   args: string[];
   url: string;
   default_mode: McpMode;
+  share_images: boolean;
+  timeout_secs: number;
 }
 
 /** As returned by the backend: secret names only, never values. */
@@ -167,6 +183,7 @@ export type GenEvent =
       args: string | null;
       detail: string | null;
     }
+  | { event: "image"; call_id: string; mime: string; data: string }
   | { event: "notice"; message: string }
   | { event: "done"; content: string; stopped: boolean }
   | { event: "error"; message: string; partial: string };

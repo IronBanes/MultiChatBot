@@ -36,6 +36,8 @@ pub enum GenEvent {
     Reasoning { text: String },
     /// Tool activity. `args` and `detail` are for the sender's eyes only.
     Tool { call_id: String, server: String, tool: String, status: ToolStatus, args: Option<String>, detail: Option<String> },
+    /// An image a tool produced, to share with the room (base64).
+    Image { call_id: String, mime: String, data: String },
     /// Something the sender should know that doesn't fail the reply.
     Notice { message: String },
     Done { content: String, stopped: bool },
@@ -184,13 +186,16 @@ pub async fn run(job: Job) {
                 }
 
                 send(ToolStatus::Running, Some(args), None);
-                let (text, is_error) = tokio::select! {
+                let out = tokio::select! {
                     _ = &mut stop => return Ok(Outcome::Stopped),
                     r = mcp.call(server, secrets, &tool.tool, call.arguments.clone()) => r,
                 };
-                let preview: String = text.chars().take(600).collect();
-                send(if is_error { ToolStatus::Error } else { ToolStatus::Done }, None, Some(preview));
-                results.push(ToolResult { call_id: call.id.clone(), content: text, is_error });
+                let preview: String = out.text.chars().take(600).collect();
+                for img in out.images {
+                    let _ = events.send(GenEvent::Image { call_id: call.id.clone(), mime: img.mime, data: img.data });
+                }
+                send(if out.is_error { ToolStatus::Error } else { ToolStatus::Done }, None, Some(preview));
+                results.push(ToolResult { call_id: call.id.clone(), content: out.text, is_error: out.is_error });
             }
 
             req.continuation.push(assistant);

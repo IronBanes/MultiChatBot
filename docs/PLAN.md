@@ -36,6 +36,11 @@ messages (seq INTEGER PK AUTOINCREMENT,      -- global ordering
           model TEXT,                        -- ai: model name (never base URL / key)
           status TEXT,                       -- 'complete'|'streaming'|'error'|'interrupted'
           error TEXT, created_at INTEGER)
+attachments (id TEXT PK, message_id TEXT, room_id TEXT, mime TEXT,
+             call_id TEXT, width INTEGER, height INTEGER,
+             data TEXT,                      -- base64 image
+             created_at INTEGER)        -- source of truth for a reply's images,
+                                        -- written at upload so they survive disconnects
 ```
 
 On startup any leftover `streaming` rows become `interrupted`.
@@ -80,7 +85,9 @@ all rooms. The first client frame must be `hello`.
 | `ai_delta` | `room_id, id, delta` | only from the stream's owner connection |
 | `ai_reasoning` | `room_id, id, delta` | reasoning text, same rules as `ai_delta` |
 | `ai_tool` | `room_id, id, activity: {call_id, server, tool, status}` | MCP tool status; no arguments or results |
-| `ai_complete` | `room_id, id, content` | full final text, persisted with reasoning and tool activity |
+| `ai_attachment` | `room_id, id, attachment: {attachment_id, mime, call_id, width, height}, data` | tool image (base64, ≤ ~4.5 MB, png/jpeg/webp/gif), max 8 per reply |
+| `get_attachment` | `attachment_id` | → `attachment`; only for members of the image's room |
+| `ai_complete` | `room_id, id, content` | full final text, persisted with reasoning, tool activity and attachments |
 | `ai_error` | `room_id, id, error` | short, sanitized reason |
 | `set_room_prompt` | `room_id, system_prompt` | any member |
 
@@ -96,6 +103,8 @@ all rooms. The first client frame must be `hello`.
 | `ai_delta` | `room_id, id, delta` |
 | `ai_reasoning` | `room_id, id, delta` |
 | `ai_tool` | `room_id, id, activity` |
+| `ai_attachment` | `room_id, id, attachment` (metadata only) |
+| `attachment` | `attachment_id, mime, data` |
 | `ai_complete` | `room_id, id, content` |
 | `ai_error` | `room_id, id, error` |
 | `ai_interrupted` | `room_id, id, content` (partial) |

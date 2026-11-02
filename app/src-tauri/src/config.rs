@@ -77,6 +77,16 @@ pub struct McpServer {
     /// Mode used in rooms where the user hasn't picked one.
     #[serde(default)]
     pub default_mode: McpMode,
+    /// Share images this server returns (e.g. renders) with the room.
+    #[serde(default)]
+    pub share_images: bool,
+    /// How long one tool call may run before it's abandoned.
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u32,
+}
+
+fn default_timeout() -> u32 {
+    120
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
