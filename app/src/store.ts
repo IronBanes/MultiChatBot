@@ -205,7 +205,10 @@ export const useChat = create<ChatState>((set, get) => {
         const order = msg.rooms.map((r) => r.id);
         let active = get().activeRoomId;
         if (!active || !rooms[active]) active = order[0] ?? null;
-        set({ rooms, roomOrder: order, loaded: {}, activeRoomId: active });
+        // Image fetches still pending when the connection dropped never got an answer;
+        // forget them so the images request again on this connection.
+        const images = Object.fromEntries(Object.entries(get().images).filter(([, src]) => src));
+        set({ rooms, roomOrder: order, loaded: {}, activeRoomId: active, images });
         if (active) relay?.send({ type: "open_room", room_id: active });
         break;
       }
@@ -234,11 +237,20 @@ export const useChat = create<ChatState>((set, get) => {
         break;
       case "room_history":
         set((s) => {
-          // Keep anything live that arrived after the history snapshot.
+          // Keep anything live that arrived after the history snapshot, including images
+          // announced while the snapshot was being read.
+          const current = s.messages[msg.room_id] ?? [];
           const maxSeq = msg.messages.length ? msg.messages[msg.messages.length - 1].seq : -1;
-          const newer = (s.messages[msg.room_id] ?? []).filter((m) => m.seq > maxSeq);
+          const newer = current.filter((m) => m.seq > maxSeq);
+          const live = new Map(current.map((m) => [m.id, m]));
+          const merged = msg.messages.map((m) => {
+            const extra = (live.get(m.id)?.attachments ?? []).filter(
+              (a) => !m.attachments.some((b) => b.attachment_id === a.attachment_id),
+            );
+            return extra.length ? { ...m, attachments: [...m.attachments, ...extra] } : m;
+          });
           return {
-            messages: { ...s.messages, [msg.room_id]: [...msg.messages, ...newer] },
+            messages: { ...s.messages, [msg.room_id]: [...merged, ...newer] },
             loaded: { ...s.loaded, [msg.room_id]: true },
           };
         });

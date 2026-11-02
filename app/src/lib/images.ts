@@ -37,8 +37,8 @@ export async function prepareImage(mime: string, data: string): Promise<Prepared
   const height = Math.max(1, Math.round(bitmap.height * scale));
 
   // Small images and GIFs (which would lose their animation) are sent as they are.
-  // A large GIF is re-encoded as a still WebP rather than risk the relay's size limits.
-  const keepGif = mime === "image/gif" && data.length <= MAX_GIF_B64;
+  // A GIF that is too large (in bytes or pixels) is re-encoded as a still WebP instead.
+  const keepGif = mime === "image/gif" && scale === 1 && data.length <= MAX_GIF_B64;
   if (keepGif || (mime !== "image/gif" && scale === 1 && data.length < 600_000)) {
     bitmap.close();
     return { mime, data, width, height };
