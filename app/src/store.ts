@@ -4,7 +4,7 @@ import { create } from "zustand";
 import { backend, errorText } from "./lib/backend";
 import { prepareImage } from "./lib/images";
 import { Relay, type ConnStatus } from "./lib/relay";
-import type { ClientState, HistoryItem, McpMode, Message, RoomInfo, ServerMsg, ToolStatus } from "./lib/types";
+import type { Attachment, ClientState, HistoryItem, McpMode, Message, RoomInfo, ServerMsg, ToolStatus } from "./lib/types";
 
 /** Tool call details only the sender sees (arguments and a result preview). */
 export interface LocalTool {
@@ -58,6 +58,19 @@ interface ChatState {
 let relay: Relay | null = null;
 /** Human message id → profile id, waiting for the server echo before the AI call starts. */
 const pendingAi = new Map<string, string>();
+/** Images announced for a reply this client hasn't loaded yet (e.g. while joining). */
+const unclaimedAttachments = new Map<string, Attachment[]>();
+
+/** Adds attachments not already on the message, plus any waiting for it. */
+function withAttachments(m: Message, extra: Attachment[] = []): Message {
+  const waiting = unclaimedAttachments.get(m.id) ?? [];
+  unclaimedAttachments.delete(m.id);
+  const add = [...extra, ...waiting].filter(
+    (a, i, all) => !m.attachments.some((b) => b.attachment_id === a.attachment_id) && all.findIndex((b) => b.attachment_id === a.attachment_id) === i,
+  );
+  return add.length ? { ...m, attachments: [...m.attachments, ...add] } : m;
+}
+
 const pendingRequests = new Map<string, { resolve: (r: RoomInfo) => void; reject: (e: Error) => void }>();
 let toastSeq = 0;
 
@@ -243,12 +256,7 @@ export const useChat = create<ChatState>((set, get) => {
           const maxSeq = msg.messages.length ? msg.messages[msg.messages.length - 1].seq : -1;
           const newer = current.filter((m) => m.seq > maxSeq);
           const live = new Map(current.map((m) => [m.id, m]));
-          const merged = msg.messages.map((m) => {
-            const extra = (live.get(m.id)?.attachments ?? []).filter(
-              (a) => !m.attachments.some((b) => b.attachment_id === a.attachment_id),
-            );
-            return extra.length ? { ...m, attachments: [...m.attachments, ...extra] } : m;
-          });
+          const merged = msg.messages.map((m) => withAttachments(m, live.get(m.id)?.attachments));
           return {
             messages: { ...s.messages, [msg.room_id]: [...merged, ...newer] },
             loaded: { ...s.loaded, [msg.room_id]: true },
@@ -256,7 +264,7 @@ export const useChat = create<ChatState>((set, get) => {
         });
         break;
       case "message": {
-        const m = msg.message;
+        const m = withAttachments(msg.message);
         const mine = m.author_id === get().client?.user_id;
         set((s) => ({
           messages: { ...s.messages, [m.room_id]: upsert(s.messages[m.room_id], m) },
@@ -305,6 +313,11 @@ export const useChat = create<ChatState>((set, get) => {
         }));
         break;
       case "ai_attachment":
+        if (!get().messages[msg.room_id]?.some((m) => m.id === msg.id)) {
+          // The reply isn't loaded yet; attach the image when it arrives.
+          unclaimedAttachments.set(msg.id, [...(unclaimedAttachments.get(msg.id) ?? []), msg.attachment]);
+          break;
+        }
         set((s) => ({
           messages: {
             ...s.messages,
