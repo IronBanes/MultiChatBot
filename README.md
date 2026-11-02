@@ -199,7 +199,9 @@ npm run tauri ios build         # .ipa for a real device
 - **`ws://` and `wss://`**: the relay connection is opened by the app's Rust side
   (`tauri-plugin-websocket`), not the webview, so iOS's block on insecure connections from
   secure pages doesn't apply and a `ws://` relay on your LAN works. For friends over the
-  internet, keep using the `wss://` tunnels (cloudflared/Tailscale) described above.
+  internet, keep using the `wss://` tunnels (cloudflared/Tailscale) described above. On
+  the phone, plain `ws://` is only accepted for local-network addresses (including
+  `.local` names); Tailscale addresses need `wss://`, for example via `tailscale serve`.
 
 ### Building with GitHub Actions (no Mac needed)
 

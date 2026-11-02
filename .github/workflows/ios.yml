@@ -84,7 +84,7 @@ jobs:
   #   IOS_CERTIFICATE_PASSWORD - the .p12 password
   #   IOS_MOBILE_PROVISION     - the .mobileprovision profile, base64-encoded
   # Optional:
-  #   APPLE_DEVELOPMENT_TEAM   - 10-digit team id, overrides bundle > ios > developmentTeam
+  #   APPLE_DEVELOPMENT_TEAM   - 10-digit team id, overrides bundle > iOS > developmentTeam
   # The Tauri CLI reads these directly; no custom keychain scripting is needed.
   build-device:
     runs-on: macos-latest

@@ -1,6 +1,6 @@
 // Small shared UI primitives.
 
-import { useEffect, useId, useRef, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { initials, memberColor } from "../lib/colors";
 
 /** Open modals, innermost last: only the topmost one handles Escape and Tab. */
@@ -24,9 +24,11 @@ export function Modal({
   const panel = useRef<HTMLDivElement>(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
+  // Read during the first render, before a child's autoFocus moves focus into the dialog.
+  const [opener] = useState(() => document.activeElement as HTMLElement | null);
 
   useEffect(() => {
-    const previous = document.activeElement as HTMLElement | null;
+    const previous = opener;
     modalStack.push(id);
     // Move focus into the dialog unless something inside already took it (autoFocus).
     if (!panel.current?.contains(document.activeElement)) panel.current?.focus();
@@ -61,7 +63,7 @@ export function Modal({
       if (i >= 0) modalStack.splice(i, 1);
       if (previous?.isConnected) previous.focus();
     };
-  }, [id]);
+  }, [id, opener]);
 
   return (
     <div
