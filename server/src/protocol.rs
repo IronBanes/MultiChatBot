@@ -40,6 +40,16 @@ pub enum ClientMsg {
         id: String,
         delta: String,
     },
+    AiReasoning {
+        room_id: String,
+        id: String,
+        delta: String,
+    },
+    AiTool {
+        room_id: String,
+        id: String,
+        activity: ToolActivity,
+    },
     AiComplete {
         room_id: String,
         id: String,
@@ -82,6 +92,16 @@ pub enum ServerMsg {
         room_id: String,
         id: String,
         delta: String,
+    },
+    AiReasoning {
+        room_id: String,
+        id: String,
+        delta: String,
+    },
+    AiTool {
+        room_id: String,
+        id: String,
+        activity: ToolActivity,
     },
     AiComplete {
         room_id: String,
@@ -142,6 +162,17 @@ pub struct Member {
     pub online: bool,
 }
 
+/// An MCP tool call made while generating an AI reply. Only names and status
+/// are shared; arguments and results stay on the sender's machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolActivity {
+    pub call_id: String,
+    pub server: String,
+    pub tool: String,
+    /// "awaiting_approval" | "running" | "done" | "error" | "denied"
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Message {
     pub id: String,
@@ -151,6 +182,9 @@ pub struct Message {
     pub author_id: String,
     pub author_name: String,
     pub content: String,
+    pub reasoning: String,
+    #[sqlx(json)]
+    pub tools: Vec<ToolActivity>,
     pub ai_requested: bool,
     pub anchor_id: Option<String>,
     pub model: Option<String>,

@@ -7,7 +7,32 @@ mod openai;
 use crate::config::{Profile, ProviderKind};
 use crate::context::ChatMessage;
 use futures_util::{Stream, StreamExt};
+use serde::Serialize;
+use serde_json::Value;
 use std::pin::Pin;
+
+/// A tool the model may call, already namespaced (see `mcp::qualified_name`).
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    pub schema: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    /// Parsed arguments; an empty object if the model sent none or invalid JSON.
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    pub call_id: String,
+    pub content: String,
+    pub is_error: bool,
+}
 
 pub struct ChatRequest {
     pub model: String,
@@ -15,6 +40,33 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub max_output_tokens: u32,
     pub temperature: Option<f64>,
+    pub show_reasoning: bool,
+    pub reasoning_effort: Option<String>,
+    pub tools: Vec<ToolSpec>,
+    /// False forces a plain answer (`tool_choice: none`) while keeping `tools` defined.
+    pub allow_tool_calls: bool,
+    /// Provider-native messages appended after `messages` (earlier tool rounds).
+    pub continuation: Vec<Value>,
+}
+
+pub enum StreamEvent {
+    Text(String),
+    Reasoning(String),
+    /// Emitted once at the end of a turn that called tools.
+    ToolCalls {
+        calls: Vec<ToolCall>,
+        /// The assistant turn in the provider's own format, to send back verbatim.
+        assistant: Value,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: Option<String>,
+    pub context_length: Option<u64>,
+    pub reasoning: Option<bool>,
+    pub tools: Option<bool>,
 }
 
 /// A user-facing, already-short error. Must never contain the key or endpoint
@@ -44,13 +96,19 @@ impl ProviderError {
     }
 }
 
-pub type DeltaStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError>> + Send>>;
+pub type EventStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ProviderError>> + Send>>;
 
 #[async_trait::async_trait]
 pub trait Provider: Send + Sync {
     /// Starts a streaming completion. Resolves once response headers arrive;
-    /// the stream then yields text deltas.
-    async fn stream_chat(&self, req: &ChatRequest) -> Result<DeltaStream, ProviderError>;
+    /// the stream then yields text/reasoning deltas and finally any tool calls.
+    async fn stream_chat(&self, req: &ChatRequest) -> Result<EventStream, ProviderError>;
+
+    /// Provider-native message(s) carrying tool results back to the model.
+    fn tool_results(&self, results: &[ToolResult]) -> Vec<Value>;
+
+    /// Models available to this key.
+    async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError>;
 }
 
 pub fn for_profile(profile: &Profile, api_key: Option<String>, http: reqwest::Client) -> Box<dyn Provider> {
@@ -60,6 +118,31 @@ pub fn for_profile(profile: &Profile, api_key: Option<String>, http: reqwest::Cl
         ProviderKind::Openai => Box::new(openai::OpenAiCompatible { http, base_url, api_key }),
         ProviderKind::Anthropic => Box::new(anthropic::Anthropic { http, base_url, api_key }),
     }
+}
+
+/// Parses `{"data": [...]}` model lists from OpenAI-compatible APIs (incl. NanoGPT's
+/// `detailed=true` fields) and Anthropic's `/v1/models`.
+pub(crate) fn parse_models(v: &Value) -> Vec<ModelInfo> {
+    let list = v.get("data").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut out: Vec<ModelInfo> = list
+        .iter()
+        .filter_map(|m| {
+            let id = m.get("id")?.as_str()?.to_string();
+            let name = ["name", "display_name"]
+                .iter()
+                .find_map(|k| m.get(*k).and_then(Value::as_str))
+                .filter(|n| *n != id)
+                .map(str::to_string);
+            let context_length = ["context_length", "max_input_tokens", "context_window"]
+                .iter()
+                .find_map(|k| m.get(*k).and_then(Value::as_u64));
+            let caps = m.get("capabilities");
+            let flag = |k: &str| caps.and_then(|c| c.get(k)).and_then(Value::as_bool);
+            Some(ModelInfo { id, name, context_length, reasoning: flag("reasoning"), tools: flag("tool_calling") })
+        })
+        .collect();
+    out.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
+    out
 }
 
 /// Builds a short error from a non-2xx response, using the provider's own message when present.

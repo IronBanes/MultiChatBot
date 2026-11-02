@@ -73,7 +73,7 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
   const [dot, label] = statusStyle[status];
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900/60">
+    <aside className="flex h-full w-64 shrink-0 flex-col border-r border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900/60">
       <div className="flex items-center gap-2 px-4 pt-4 pb-3">
         <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white">
           <Icon name="sparkle" size={16} />

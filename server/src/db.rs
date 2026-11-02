@@ -1,6 +1,6 @@
 //! SQLite persistence for users, rooms, members and messages.
 
-use crate::protocol::Message;
+use crate::protocol::{Message, ToolActivity};
 use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::str::FromStr;
@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS messages (
     author_id TEXT NOT NULL,
     author_name TEXT NOT NULL,
     content TEXT NOT NULL,
+    reasoning TEXT NOT NULL DEFAULT '',
+    tools TEXT NOT NULL DEFAULT '[]',
     ai_requested INTEGER NOT NULL DEFAULT 0,
     anchor_id TEXT,
     model TEXT,
@@ -52,6 +54,17 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
         .foreign_keys(true);
     let pool = SqlitePoolOptions::new().max_connections(8).connect_with(opts).await?;
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+    // Columns added after the first release; existing databases need them too.
+    for ddl in [
+        "ALTER TABLE messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'",
+    ] {
+        if let Err(e) = sqlx::query(ddl).execute(&pool).await {
+            if !e.to_string().contains("duplicate column") {
+                return Err(e.into());
+            }
+        }
+    }
     // Streams cannot survive a server restart.
     sqlx::query("UPDATE messages SET status = 'interrupted' WHERE status = 'streaming'")
         .execute(&pool)
@@ -196,7 +209,7 @@ pub async fn set_room_prompt(db: &Db, room_id: &str, prompt: &str) -> sqlx::Resu
     Ok(())
 }
 
-const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, ai_requested, \
+const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, reasoning, tools, ai_requested, \
                             anchor_id, model, status, error, created_at";
 
 pub async fn recent_messages(db: &Db, room_id: &str, limit: i64) -> sqlx::Result<Vec<Message>> {
@@ -252,17 +265,21 @@ pub async fn insert_message(db: &Db, m: NewMessage<'_>) -> sqlx::Result<Message>
     Ok(message(db, m.id).await?.expect("row just inserted"))
 }
 
-pub async fn finish_ai(
-    db: &Db,
-    id: &str,
-    content: &str,
-    status: &str,
-    error: Option<&str>,
-) -> sqlx::Result<()> {
-    sqlx::query("UPDATE messages SET content = ?, status = ?, error = ? WHERE id = ?")
-        .bind(content)
-        .bind(status)
-        .bind(error)
+pub struct AiResult<'a> {
+    pub content: &'a str,
+    pub reasoning: &'a str,
+    pub tools: &'a [ToolActivity],
+    pub status: &'a str,
+    pub error: Option<&'a str>,
+}
+
+pub async fn finish_ai(db: &Db, id: &str, r: AiResult<'_>) -> sqlx::Result<()> {
+    sqlx::query("UPDATE messages SET content = ?, reasoning = ?, tools = ?, status = ?, error = ? WHERE id = ?")
+        .bind(r.content)
+        .bind(r.reasoning)
+        .bind(serde_json::to_string(r.tools).unwrap_or_else(|_| "[]".into()))
+        .bind(r.status)
+        .bind(r.error)
         .bind(id)
         .execute(db)
         .await?;

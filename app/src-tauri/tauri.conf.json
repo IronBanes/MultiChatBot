@@ -15,8 +15,8 @@
         "title": "Multichat",
         "width": 1180,
         "height": 780,
-        "minWidth": 860,
-        "minHeight": 560
+        "minWidth": 420,
+        "minHeight": 480
       }
     ],
     "security": {

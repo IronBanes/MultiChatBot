@@ -27,6 +27,56 @@ pub struct Profile {
     pub max_context_tokens: u32,
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// Ask the model for its reasoning and show it in the chat.
+    #[serde(default = "yes")]
+    pub show_reasoning: bool,
+    /// "low" | "medium" | "high" | ... ; `None` leaves the provider default.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpMode {
+    /// Tools are not offered to the model.
+    #[default]
+    Off,
+    /// The model may call tools, but each call waits for the sender's approval.
+    Ask,
+    /// Tool calls run without asking.
+    Auto,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransport {
+    /// A local command speaking MCP over stdin/stdout.
+    Stdio,
+    /// A remote server speaking Streamable HTTP.
+    Http,
+}
+
+/// An MCP server the user added. Env vars and HTTP headers can hold secrets,
+/// so they live in the keychain (`secrets::McpSecrets`), not here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServer {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    pub transport: McpTransport,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub url: String,
+    /// Mode used in rooms where the user hasn't picked one.
+    #[serde(default)]
+    pub default_mode: McpMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +90,26 @@ pub struct Config {
     pub last_profile_by_room: HashMap<String, String>,
     #[serde(default)]
     pub profiles: Vec<Profile>,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServer>,
+    /// room id → server id → mode, overriding the server's default in that room.
+    #[serde(default)]
+    pub mcp_modes_by_room: HashMap<String, HashMap<String, McpMode>>,
+}
+
+impl Config {
+    /// The servers that are not off in `room_id`, with their effective mode.
+    pub fn active_mcp(&self, room_id: &str) -> Vec<(McpServer, McpMode)> {
+        let overrides = self.mcp_modes_by_room.get(room_id);
+        self.mcp_servers
+            .iter()
+            .map(|s| {
+                let mode = overrides.and_then(|o| o.get(&s.id)).copied().unwrap_or(s.default_mode);
+                (s.clone(), mode)
+            })
+            .filter(|(_, m)| *m != McpMode::Off)
+            .collect()
+    }
 }
 
 fn default_server_url() -> String {
@@ -54,6 +124,8 @@ impl Default for Config {
             server_url: default_server_url(),
             last_profile_by_room: HashMap::new(),
             profiles: Vec::new(),
+            mcp_servers: Vec::new(),
+            mcp_modes_by_room: HashMap::new(),
         }
     }
 }

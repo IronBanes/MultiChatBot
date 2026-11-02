@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MIN_NODE_MAJOR=22
-MIN_RUST_MINOR=85 # Rust 1.85+ (edition 2024)
+MIN_RUST_MINOR=88 # Rust 1.88+ (the MCP client needs it)
 ASSUME_YES=0
 PASSTHRU=()
 for arg in "$@"; do
@@ -60,20 +60,20 @@ if [ "$PLATFORM" = mac ]; then
   fi
 else
   say "Checking system libraries for Tauri"
-  if have pkg-config && have cc && pkg-config --exists webkit2gtk-4.1 dbus-1 openssl librsvg-2.0 2>/dev/null; then
-    ok "webkit2gtk-4.1, dbus, openssl, librsvg and a C compiler are installed"
+  if have pkg-config && have cc && have cmake && pkg-config --exists webkit2gtk-4.1 dbus-1 openssl librsvg-2.0 2>/dev/null; then
+    ok "webkit2gtk-4.1, dbus, openssl, librsvg, cmake and a C compiler are installed"
   else
     if have apt-get; then
       PKGS=(build-essential curl wget file pkg-config libwebkit2gtk-4.1-dev libxdo-dev libssl-dev
-            libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev)
+            libayatana-appindicator3-dev librsvg2-dev libdbus-1-dev cmake)
       INSTALL=(apt-get install -y "${PKGS[@]}"); PRE=(apt-get update)
     elif have dnf; then
       PKGS=(webkit2gtk4.1-devel openssl-devel curl wget file libappindicator-gtk3-devel librsvg2-devel
-            libxdo-devel dbus-devel pkgconf-pkg-config gcc gcc-c++ make)
+            libxdo-devel dbus-devel pkgconf-pkg-config gcc gcc-c++ make cmake)
       INSTALL=(dnf install -y "${PKGS[@]}"); PRE=(true)
     elif have pacman; then
       PKGS=(webkit2gtk-4.1 base-devel curl wget file openssl appmenu-gtk-module libappindicator-gtk3
-            librsvg xdotool dbus pkgconf)
+            librsvg xdotool dbus pkgconf cmake)
       INSTALL=(pacman -S --needed --noconfirm "${PKGS[@]}"); PRE=(true)
     else
       die "Could not find apt, dnf or pacman. Install the Tauri prerequisites for your distro

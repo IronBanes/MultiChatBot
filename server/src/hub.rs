@@ -1,7 +1,8 @@
 //! Connection registry, room fan-out and the message handlers.
 
 use crate::db::{self, Db, NewMessage};
-use crate::protocol::{ClientMsg, Member, RoomInfo, ServerMsg};
+use crate::db::AiResult;
+use crate::protocol::{ClientMsg, Member, RoomInfo, ServerMsg, ToolActivity};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
@@ -12,6 +13,7 @@ const MAX_CONTENT: usize = 200_000;
 const MAX_PROMPT: usize = 8_000;
 const MAX_ERROR: usize = 300;
 const HISTORY_LIMIT: i64 = 1000;
+const MAX_TOOL_CALLS: usize = 100;
 
 pub type ConnId = u64;
 
@@ -27,6 +29,8 @@ struct Stream {
     room_id: String,
     conn_id: ConnId,
     content: String,
+    reasoning: String,
+    tools: Vec<ToolActivity>,
 }
 
 #[derive(Default)]
@@ -242,6 +246,8 @@ impl State {
                     for m in messages.iter_mut().filter(|m| m.status == "streaming") {
                         if let Some(s) = hub.streams.get(&m.id) {
                             m.content = s.content.clone();
+                            m.reasoning = s.reasoning.clone();
+                            m.tools = s.tools.clone();
                         }
                     }
                 }
@@ -324,7 +330,13 @@ impl State {
                 let mut hub = self.hub();
                 hub.streams.insert(
                     id,
-                    Stream { room_id: room_id.clone(), conn_id: conn, content: String::new() },
+                    Stream {
+                        room_id: room_id.clone(),
+                        conn_id: conn,
+                        content: String::new(),
+                        reasoning: String::new(),
+                        tools: Vec::new(),
+                    },
                 );
                 hub.broadcast(&room_id, &ServerMsg::Message { room_id: room_id.clone(), message });
             }
@@ -339,25 +351,67 @@ impl State {
                 hub.broadcast(&room_id, &ServerMsg::AiDelta { room_id: room_id.clone(), id, delta });
             }
 
-            ClientMsg::AiComplete { room_id, id, content } => {
-                if !self.take_stream(conn, &room_id, &id) {
+            ClientMsg::AiReasoning { room_id, id, delta } => {
+                let mut hub = self.hub();
+                let Some(s) = hub.streams.get_mut(&id) else { return Ok(()) };
+                if s.conn_id != conn || s.room_id != room_id || s.reasoning.len() + delta.len() > MAX_CONTENT {
                     return Ok(());
                 }
+                s.reasoning.push_str(&delta);
+                hub.broadcast(&room_id, &ServerMsg::AiReasoning { room_id: room_id.clone(), id, delta });
+            }
+
+            ClientMsg::AiTool { room_id, id, activity } => {
+                const STATUSES: [&str; 5] = ["awaiting_approval", "running", "done", "error", "denied"];
+                if !STATUSES.contains(&activity.status.as_str()) {
+                    return Ok(());
+                }
+                let activity = ToolActivity {
+                    call_id: clip(&activity.call_id, 100),
+                    server: clip(&activity.server, 80),
+                    tool: clip(&activity.tool, 100),
+                    status: activity.status,
+                };
+                let mut hub = self.hub();
+                let Some(s) = hub.streams.get_mut(&id) else { return Ok(()) };
+                if s.conn_id != conn || s.room_id != room_id {
+                    return Ok(());
+                }
+                if let Some(i) = s.tools.iter().position(|t| t.call_id == activity.call_id) {
+                    s.tools[i] = activity.clone();
+                } else if s.tools.len() < MAX_TOOL_CALLS {
+                    s.tools.push(activity.clone());
+                } else {
+                    return Ok(());
+                }
+                hub.broadcast(&room_id, &ServerMsg::AiTool { room_id: room_id.clone(), id, activity });
+            }
+
+            ClientMsg::AiComplete { room_id, id, content } => {
+                let Some(stream) = self.take_stream(conn, &room_id, &id) else { return Ok(()) };
                 let content: String = content.chars().take(MAX_CONTENT).collect();
-                db::finish_ai(&self.db, &id, &content, "complete", None).await?;
+                let result = AiResult {
+                    content: &content,
+                    reasoning: &stream.reasoning,
+                    tools: &stream.tools,
+                    status: "complete",
+                    error: None,
+                };
+                db::finish_ai(&self.db, &id, result).await?;
                 self.broadcast(&room_id, ServerMsg::AiComplete { room_id: room_id.clone(), id, content });
             }
 
             ClientMsg::AiError { room_id, id, error } => {
-                let partial = {
-                    let hub = self.hub();
-                    hub.streams.get(&id).map(|s| s.content.clone()).unwrap_or_default()
-                };
-                if !self.take_stream(conn, &room_id, &id) {
-                    return Ok(());
-                }
+                let Some(stream) = self.take_stream(conn, &room_id, &id) else { return Ok(()) };
                 let error = clip(&error, MAX_ERROR);
-                db::finish_ai(&self.db, &id, &partial, "error", Some(&error)).await?;
+                let result = AiResult {
+                    content: &stream.content,
+                    reasoning: &stream.reasoning,
+                    tools: &stream.tools,
+                    status: "error",
+                    error: Some(&error),
+                };
+                db::finish_ai(&self.db, &id, result).await?;
                 self.broadcast(&room_id, ServerMsg::AiError { room_id: room_id.clone(), id, error });
             }
 
@@ -376,15 +430,12 @@ impl State {
         Ok(())
     }
 
-    /// Removes a stream if `conn` owns it. Returns false if it does not.
-    fn take_stream(&self, conn: ConnId, room_id: &str, id: &str) -> bool {
+    /// Removes and returns a stream if `conn` owns it.
+    fn take_stream(&self, conn: ConnId, room_id: &str, id: &str) -> Option<Stream> {
         let mut hub = self.hub();
         match hub.streams.get(id) {
-            Some(s) if s.conn_id == conn && s.room_id == room_id => {
-                hub.streams.remove(id);
-                true
-            }
-            _ => false,
+            Some(s) if s.conn_id == conn && s.room_id == room_id => hub.streams.remove(id),
+            _ => None,
         }
     }
 
@@ -464,7 +515,12 @@ impl State {
         };
 
         for (id, s) in orphaned {
-            if let Err(e) = db::finish_ai(&self.db, &id, &s.content, "interrupted", None).await {
+            if let Err(e) = db::finish_ai(
+                &self.db,
+                &id,
+                AiResult { content: &s.content, reasoning: &s.reasoning, tools: &s.tools, status: "interrupted", error: None },
+            )
+            .await {
                 tracing::error!("failed to mark {id} interrupted: {e}");
             }
             self.broadcast(

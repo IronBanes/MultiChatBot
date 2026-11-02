@@ -24,7 +24,9 @@ through the relay. The relay server never sees keys or endpoints.
 | `docs/PLAN.md` | WebSocket protocol, data models and context-building rules. |
 | `tools/smoke-test.mjs` | Two scripted clients that exercise the relay protocol end to end. |
 | `start.cmd`, `start.ps1`, `start.sh` | One-step setup and launch for Windows, macOS and Linux. |
-| `tools/mock-llm.mjs` | Fake OpenAI and Anthropic streaming server for testing without API keys. |
+| `tools/mock-llm.mjs` | Fake OpenAI and Anthropic streaming server (reasoning, tool calls, model list) for testing without API keys. |
+| `tools/mock-mcp.mjs` | Tiny MCP server over stdio with `echo`, `add` and `now` tools. |
+| `branding/` | Logo concepts. |
 
 ## Quick start (one script per OS)
 
@@ -42,7 +44,7 @@ What they check and install:
 |---|---|---|---|
 | Compiler | Visual Studio C++ Build Tools (winget) | Xcode Command Line Tools | `build-essential` / Development Tools |
 | System libraries | WebView2 Runtime (winget) | built in | WebKitGTK 4.1, librsvg, appindicator, OpenSSL, D-Bus (apt, dnf or pacman, via sudo) |
-| Rust 1.85+ | rustup (winget) | rustup | rustup |
+| Rust 1.88+ | rustup (winget) | rustup | rustup |
 | Node.js 22+ | Node LTS (winget) | Homebrew, or nvm | nvm (installed in your home folder) |
 
 The scripts ask before installing anything. Add `--yes` to skip the questions. The first
@@ -142,6 +144,11 @@ so you can try **Stop**, concurrent replies, or closing a window mid-reply (the 
 shows as *interrupted*). The mock prints the exact context it received for each request,
 including the merged roles, trimming and the room instructions.
 
+The mock also lists three models (try **Fetch models**), streams reasoning, and calls a
+tool when MCP tools are enabled and your message contains the word "tool". For a test MCP
+server, add one in **Settings → MCP servers** with command `node` and the full path to
+`tools/mock-mcp.mjs` as the argument.
+
 ### Automated checks
 
 ```bash
@@ -152,8 +159,19 @@ cd app/src-tauri && cargo test              # context building, trimming, error 
 
 ## Profiles
 
-A profile is a label, provider type, base URL, model, API key, max context tokens and an
-optional temperature.
+A profile is a label, provider type, base URL, model, API key, max context tokens, an
+optional temperature, and reasoning settings.
+
+- **Fetch models** lists the models your key can use, with context size and whether they
+  support reasoning and tools. Picking one fills in its context limit.
+- **NanoGPT** has a preset (`https://nano-gpt.com/api/v1`). Its model list includes context
+  lengths and capabilities, and for subscription accounts it only shows the models your
+  subscription covers.
+- **Show reasoning** displays the model's thinking in a collapsible section above the reply.
+  OpenAI-compatible providers show it when the model streams `reasoning` or
+  `reasoning_content`. For Anthropic it requests summarized thinking, which needs Claude 4.6
+  or newer; turn it off for older models. **Reasoning effort** is sent as `reasoning_effort`
+  (OpenAI-compatible) or `output_config.effort` (Anthropic).
 
 - **OpenAI-compatible** (`{base}/chat/completions`) covers OpenAI, OpenRouter, Groq,
   Ollama, LM Studio and others. Presets are built in.
@@ -164,6 +182,26 @@ Keys are stored in the OS keychain (Windows Credential Manager, macOS Keychain o
 Linux Secret Service) under the service `multichat-bot`. The other profile fields are
 stored in `<app config dir>/instances/<instance>/config.json`, together with your user
 id, display name, server URL and the last-used profile for each room.
+
+## MCP tools
+
+Add MCP servers in **Settings → MCP servers**: a **local command** (stdio, e.g. `npx -y
+@modelcontextprotocol/server-filesystem <folder>`) or a **remote URL** (Streamable HTTP).
+Env vars and headers, which often hold tokens, are stored in the OS keychain.
+**Test & list tools** connects and shows what the server offers.
+
+Each server has a mode for each chat, set from the **Tools** button in the composer:
+
+| Mode | What happens |
+|---|---|
+| **Off** | The AI can't use the server in this chat. |
+| **Ask** | The AI may call a tool, and you see the arguments and **Allow** or **Deny** each call. |
+| **Auto** | Tool calls run without asking. |
+
+A server's **Default in chats** setting applies to chats where you haven't picked a mode.
+Tools only run for replies generated with **your** profile, on **your** computer. The room
+sees which tool ran and whether it succeeded, never its arguments or results. You can
+click a tool chip on your own replies to see those details.
 
 To add a provider, implement the `Provider` trait in `app/src-tauri/src/providers/` and
 add a `ProviderKind` variant.
@@ -182,8 +220,11 @@ add a `ProviderKind` variant.
      always kept.
    - The group-chat system prompt is followed by the room's shared instructions, if any.
 3. Rust streams from the provider and batches deltas about every 100 ms. Your client
-   relays them as `ai_delta`, then sends `ai_complete` with the full text (which the
-   relay persists) or `ai_error` with a short, sanitized reason.
+   relays text as `ai_delta` and reasoning as `ai_reasoning`. When the model calls MCP
+   tools, Rust runs them (asking you first in **Ask** mode), reports each call's status
+   as `ai_tool`, and continues the reply with the results. Finally your client sends
+   `ai_complete` with the full text (the relay persists it with the reasoning and tool
+   activity) or `ai_error` with a short, sanitized reason.
 4. If you disconnect mid-stream, the relay marks the reply as **interrupted** and keeps
    the partial text.
 
@@ -195,6 +236,8 @@ message, generated with your own model.
 
 - Message content is rendered as Markdown with raw HTML disabled. `javascript:` links
   are neutralized, links open in the system browser, and remote images are never loaded.
+- MCP tool arguments and results never leave your machine; the relay only stores tool
+  names and statuses. Use **Ask** mode for servers that can change files or send data.
 - The HTML, SVG and CSS preview runs in an `<iframe sandbox="">`, so scripts, forms and
   same-origin access are all disabled.
 - Error text from providers has the key, the base URL and the host, plus anything that

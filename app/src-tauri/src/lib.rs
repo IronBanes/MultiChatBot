@@ -1,19 +1,24 @@
-//! Tauri backend: local profiles, keychain access and every LLM call.
-//! The webview only ever sees model text, never keys or endpoints.
+//! Tauri backend: local profiles, keychain access, MCP servers and every LLM call.
+//! The webview only ever sees model text, never keys, endpoints or MCP secrets.
 
 mod config;
 mod context;
+mod generate;
+mod mcp;
 mod providers;
 mod secrets;
 
-use config::{Config, Profile};
+use config::{Config, McpMode, McpServer, McpTransport, Profile};
 use context::HistoryItem;
 use futures_util::StreamExt;
-use providers::{ChatRequest, ProviderError};
-use serde::Serialize;
-use std::collections::HashMap;
+use generate::{Approvals, GenEvent};
+use mcp::McpManager;
+use providers::{ChatRequest, ModelInfo, ProviderError, StreamEvent};
+use secrets::McpSecrets;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
 use tauri::{Manager, State};
@@ -25,6 +30,8 @@ struct AppState {
     http: reqwest::Client,
     /// In-flight generations by AI message id; sending stops the stream.
     generations: Mutex<HashMap<String, oneshot::Sender<()>>>,
+    approvals: Approvals,
+    mcp: Arc<McpManager>,
 }
 
 impl AppState {
@@ -35,9 +42,12 @@ impl AppState {
         Ok(out)
     }
 
+    fn snapshot(&self) -> Result<Config, String> {
+        Ok(self.config.lock().map_err(|_| "config lock poisoned")?.clone())
+    }
+
     fn profile(&self, id: &str) -> Result<Profile, String> {
-        let cfg = self.config.lock().map_err(|_| "config lock poisoned")?;
-        cfg.profiles.iter().find(|p| p.id == id).cloned().ok_or_else(|| "Profile not found".to_string())
+        self.snapshot()?.profiles.into_iter().find(|p| p.id == id).ok_or_else(|| "Profile not found".to_string())
     }
 }
 
@@ -53,6 +63,20 @@ fn view(p: Profile) -> ProfileView {
     ProfileView { profile: p, has_key }
 }
 
+/// An MCP server as the webview sees it: secret names, never values.
+#[derive(Serialize)]
+struct McpServerView {
+    #[serde(flatten)]
+    server: McpServer,
+    env_names: Vec<String>,
+    header_names: Vec<String>,
+}
+
+fn mcp_view(server: McpServer) -> McpServerView {
+    let s = secrets::get_mcp(&server.id).unwrap_or_default();
+    McpServerView { server, env_names: s.env.into_keys().collect(), header_names: s.headers.into_keys().collect() }
+}
+
 #[derive(Serialize)]
 struct ClientState {
     instance: String,
@@ -61,11 +85,13 @@ struct ClientState {
     server_url: String,
     last_profile_by_room: HashMap<String, String>,
     profiles: Vec<ProfileView>,
+    mcp_servers: Vec<McpServerView>,
+    mcp_modes_by_room: HashMap<String, HashMap<String, McpMode>>,
 }
 
 #[tauri::command]
 fn get_state(state: State<'_, AppState>) -> Result<ClientState, String> {
-    let cfg = state.config.lock().map_err(|_| "config lock poisoned")?.clone();
+    let cfg = state.snapshot()?;
     Ok(ClientState {
         instance: config::instance_name(),
         user_id: cfg.user_id,
@@ -73,6 +99,8 @@ fn get_state(state: State<'_, AppState>) -> Result<ClientState, String> {
         server_url: cfg.server_url,
         last_profile_by_room: cfg.last_profile_by_room,
         profiles: cfg.profiles.into_iter().map(view).collect(),
+        mcp_servers: cfg.mcp_servers.into_iter().map(mcp_view).collect(),
+        mcp_modes_by_room: cfg.mcp_modes_by_room,
     })
 }
 
@@ -96,14 +124,28 @@ fn validate(p: &Profile) -> Result<(), String> {
     if p.label.trim().is_empty() || p.model.trim().is_empty() {
         return Err("Label and model are required".into());
     }
-    let url = p.base_url.trim();
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("Base URL must start with http:// or https://".into());
-    }
+    validate_base_url(p)?;
     if p.max_context_tokens < 512 {
         return Err("Max context tokens must be at least 512".into());
     }
     Ok(())
+}
+
+fn validate_base_url(p: &Profile) -> Result<(), String> {
+    let url = p.base_url.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("Base URL must start with http:// or https://".into());
+    }
+    Ok(())
+}
+
+/// The key typed into the form if any, else the stored one.
+fn resolve_key(profile: &Profile, api_key: Option<String>) -> Result<Option<String>, String> {
+    match api_key.filter(|k| !k.trim().is_empty()) {
+        Some(k) => Ok(Some(k)),
+        None if !profile.id.is_empty() => secrets::get_key(&profile.id),
+        None => Ok(None),
+    }
 }
 
 /// `api_key`: `None` keeps the stored key, `Some("")` removes it, otherwise replaces it.
@@ -115,6 +157,7 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     }
     profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
     profile.model = profile.model.trim().to_string();
+    profile.reasoning_effort = profile.reasoning_effort.filter(|e| !e.trim().is_empty());
     match api_key.as_deref().map(str::trim) {
         Some("") => secrets::delete_key(&profile.id)?,
         Some(k) => secrets::set_key(&profile.id, k)?,
@@ -148,64 +191,196 @@ fn set_last_profile(state: State<'_, AppState>, room_id: String, profile_id: Str
 #[tauri::command]
 async fn test_profile(state: State<'_, AppState>, profile: Profile, api_key: Option<String>) -> Result<String, String> {
     validate(&profile)?;
-    let key = match api_key.filter(|k| !k.trim().is_empty()) {
-        Some(k) => Some(k),
-        None if !profile.id.is_empty() => secrets::get_key(&profile.id)?,
-        None => None,
-    };
+    let key = resolve_key(&profile, api_key)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let req = ChatRequest {
         model: profile.model.clone(),
         system: "You are a connection test.".into(),
         messages: vec![context::ChatMessage { role: context::Role::User, content: "Reply with just the word OK.".into() }],
-        max_output_tokens: 256,
+        max_output_tokens: 1024,
         temperature: profile.temperature,
+        show_reasoning: profile.show_reasoning,
+        reasoning_effort: profile.reasoning_effort.clone(),
+        tools: Vec::new(),
+        allow_tool_calls: true,
+        continuation: Vec::new(),
     };
     let scrub = |e: ProviderError| providers::sanitize(&e.0, key.as_deref(), &profile.base_url);
     let run = async {
         let mut stream = provider.stream_chat(&req).await.map_err(scrub)?;
-        let mut text = String::new();
-        while let Some(d) = stream.next().await {
-            text.push_str(&d.map_err(scrub)?);
+        let (mut text, mut reasoned) = (String::new(), false);
+        while let Some(ev) = stream.next().await {
+            match ev.map_err(scrub)? {
+                StreamEvent::Text(t) => text.push_str(&t),
+                StreamEvent::Reasoning(_) => reasoned = true,
+                StreamEvent::ToolCalls { .. } => {}
+            }
             if text.len() > 40 {
                 break;
             }
         }
-        Ok::<_, String>(text)
+        Ok::<_, String>((text, reasoned))
     };
-    let text = tokio::time::timeout(Duration::from_secs(60), run)
+    let (text, reasoned) = tokio::time::timeout(Duration::from_secs(90), run)
         .await
         .map_err(|_| "Timed out waiting for the provider".to_string())??;
     let text: String = text.trim().chars().take(40).collect();
+    let thinking = if reasoned { " (with reasoning)" } else { "" };
     Ok(if text.is_empty() {
-        format!("Connected to {} (no text in reply)", profile.model)
+        format!("Connected to {}{thinking} (no text in reply)", profile.model)
     } else {
-        format!("Connected to {}. Model replied: \"{}\"", profile.model, text)
+        format!("Connected to {}{thinking}. Model replied: \"{}\"", profile.model, text)
     })
 }
 
-#[derive(Clone, Serialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-enum GenEvent {
-    Delta { text: String },
-    Done { content: String, stopped: bool },
-    Error { message: String, partial: String },
+/// Lists the models the (possibly unsaved) profile's key can use.
+#[tauri::command]
+async fn list_models(state: State<'_, AppState>, profile: Profile, api_key: Option<String>) -> Result<Vec<ModelInfo>, String> {
+    validate_base_url(&profile)?;
+    let key = resolve_key(&profile, api_key)?;
+    let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
+    tokio::time::timeout(Duration::from_secs(30), provider.list_models())
+        .await
+        .map_err(|_| "Timed out listing models".to_string())?
+        .map_err(|e| providers::sanitize(&e.0, key.as_deref(), &profile.base_url))
 }
 
-const FLUSH_EVERY: Duration = Duration::from_millis(100);
+// ------------------------------------------------------------------ MCP servers
 
-/// Streams a reply for AI message `id`. Deltas are batched (~100ms) and sent on
-/// `on_event`; exactly one `done` or `error` event ends the stream.
+/// One env var or header row from the editor. `value: None` keeps the stored value.
+#[derive(Deserialize)]
+struct SecretEdit {
+    kind: String,
+    name: String,
+    value: Option<String>,
+}
+
+fn merge_secrets(server_id: &str, edits: Option<Vec<SecretEdit>>) -> Result<McpSecrets, String> {
+    let old = if server_id.is_empty() { McpSecrets::default() } else { secrets::get_mcp(server_id)? };
+    let Some(edits) = edits else { return Ok(old) };
+    let mut new = McpSecrets::default();
+    for e in edits {
+        let name = e.name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let (target, previous): (&mut BTreeMap<String, String>, &BTreeMap<String, String>) =
+            if e.kind == "header" { (&mut new.headers, &old.headers) } else { (&mut new.env, &old.env) };
+        let value = match e.value {
+            Some(v) => v,
+            None => previous.get(&name).cloned().unwrap_or_default(),
+        };
+        target.insert(name, value);
+    }
+    Ok(new)
+}
+
+fn validate_mcp(s: &McpServer) -> Result<(), String> {
+    if s.name.trim().is_empty() {
+        return Err("Name is required".into());
+    }
+    match s.transport {
+        McpTransport::Stdio if s.command.trim().is_empty() => Err("Command is required".into()),
+        McpTransport::Http if !(s.url.starts_with("http://") || s.url.starts_with("https://")) => {
+            Err("URL must start with http:// or https://".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 #[tauri::command]
+async fn save_mcp_server(
+    state: State<'_, AppState>,
+    mut server: McpServer,
+    secrets: Option<Vec<SecretEdit>>,
+) -> Result<McpServerView, String> {
+    validate_mcp(&server)?;
+    let merged = merge_secrets(&server.id, secrets)?;
+    if server.id.is_empty() {
+        server.id = uuid::Uuid::new_v4().to_string();
+    }
+    server.name = server.name.trim().to_string();
+    server.command = server.command.trim().to_string();
+    server.url = server.url.trim().to_string();
+    server.args.retain(|a| !a.is_empty());
+    secrets::set_mcp(&server.id, &merged)?;
+    let saved = server.clone();
+    state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
+        Some(existing) => *existing = server,
+        None => c.mcp_servers.push(server),
+    })?;
+    // Pick up the new settings on next use.
+    state.mcp.disconnect(&saved.id).await;
+    Ok(mcp_view(saved))
+}
+
+#[tauri::command]
+async fn delete_mcp_server(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    secrets::delete_mcp(&id)?;
+    state.mcp.disconnect(&id).await;
+    state.update(|c| {
+        c.mcp_servers.retain(|s| s.id != id);
+        for modes in c.mcp_modes_by_room.values_mut() {
+            modes.remove(&id);
+        }
+    })
+}
+
+/// Connects with the (possibly unsaved) settings and lists the server's tools.
+#[tauri::command]
+async fn test_mcp_server(
+    state: State<'_, AppState>,
+    server: McpServer,
+    secrets: Option<Vec<SecretEdit>>,
+) -> Result<Vec<mcp::ToolInfo>, String> {
+    validate_mcp(&server)?;
+    let merged = merge_secrets(&server.id, secrets)?;
+    let mut probe = server.clone();
+    if probe.id.is_empty() {
+        probe.id = format!("test-{}", uuid::Uuid::new_v4());
+    }
+    let res = state.mcp.test(&probe, &merged).await;
+    if server.id.is_empty() {
+        state.mcp.disconnect(&probe.id).await;
+    }
+    res
+}
+
+#[tauri::command]
+fn set_room_mcp_mode(state: State<'_, AppState>, room_id: String, server_id: String, mode: McpMode) -> Result<(), String> {
+    state.update(|c| {
+        c.mcp_modes_by_room.entry(room_id).or_default().insert(server_id, mode);
+    })
+}
+
+#[tauri::command]
+fn resolve_tool_call(state: State<'_, AppState>, id: String, call_id: String, approved: bool) -> Result<(), String> {
+    let tx = state.approvals.lock().map_err(|_| "lock poisoned")?.remove(&format!("{id}:{call_id}"));
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(approved);
+            Ok(())
+        }
+        None => Err("That tool call is no longer waiting for approval".into()),
+    }
+}
+
+// ------------------------------------------------------------------ generation
+
+/// Streams a reply for AI message `id` on `on_event` (see `generate::GenEvent`).
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn generate(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     id: String,
     profile_id: String,
+    room_id: String,
     history: Vec<HistoryItem>,
     room_prompt: String,
     on_event: Channel<GenEvent>,
 ) -> Result<(), String> {
+    let cfg = state.snapshot()?;
     let profile = state.profile(&profile_id)?;
     let key = secrets::get_key(&profile.id)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
@@ -216,54 +391,44 @@ fn generate(
     if prompt.trimmed > 0 {
         eprintln!("[context] dropped {} oldest message(s) to fit {} tokens", prompt.trimmed, profile.max_context_tokens);
     }
+    let servers = cfg
+        .active_mcp(&room_id)
+        .into_iter()
+        .map(|(s, m)| {
+            let sec = secrets::get_mcp(&s.id).unwrap_or_default();
+            (s, m, sec)
+        })
+        .collect();
     let req = ChatRequest {
         model: profile.model.clone(),
         system: prompt.system,
         messages: prompt.messages,
         max_output_tokens: context::output_reserve(profile.max_context_tokens),
         temperature: profile.temperature,
+        show_reasoning: profile.show_reasoning,
+        reasoning_effort: profile.reasoning_effort.clone(),
+        tools: Vec::new(),
+        allow_tool_calls: true,
+        continuation: Vec::new(),
     };
 
-    let (stop_tx, mut stop_rx) = oneshot::channel::<()>();
+    let (stop_tx, stop) = oneshot::channel::<()>();
     state.generations.lock().map_err(|_| "lock poisoned")?.insert(id.clone(), stop_tx);
 
-    let scrub = move |e: ProviderError| providers::sanitize(&e.0, key.as_deref(), &profile.base_url);
+    let base_url = profile.base_url.clone();
+    let job = generate::Job {
+        id: id.clone(),
+        provider,
+        req,
+        servers,
+        mcp: state.mcp.clone(),
+        approvals: state.approvals.clone(),
+        scrub: Box::new(move |e: ProviderError| providers::sanitize(&e.0, key.as_deref(), &base_url)),
+        events: on_event,
+        stop,
+    };
     tauri::async_runtime::spawn(async move {
-        let mut full = String::new();
-        let mut pending = String::new();
-        let outcome: Result<bool, String> = async {
-            let mut stream = tokio::select! {
-                _ = &mut stop_rx => return Ok(true),
-                s = provider.stream_chat(&req) => s.map_err(&scrub)?,
-            };
-            let mut tick = tokio::time::interval(FLUSH_EVERY);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = &mut stop_rx => return Ok(true),
-                    item = stream.next() => match item {
-                        Some(Ok(d)) => { full.push_str(&d); pending.push_str(&d); }
-                        Some(Err(e)) => return Err(scrub(e)),
-                        None => return Ok(false),
-                    },
-                    _ = tick.tick() => {
-                        if !pending.is_empty() {
-                            let _ = on_event.send(GenEvent::Delta { text: std::mem::take(&mut pending) });
-                        }
-                    }
-                }
-            }
-        }
-        .await;
-        if !pending.is_empty() {
-            let _ = on_event.send(GenEvent::Delta { text: pending });
-        }
-        let event = match outcome {
-            Ok(stopped) if stopped || !full.trim().is_empty() => GenEvent::Done { content: full, stopped },
-            Ok(_) => GenEvent::Error { message: "The model returned an empty response".into(), partial: full },
-            Err(message) => GenEvent::Error { message, partial: full },
-        };
-        let _ = on_event.send(event);
+        generate::run(job).await;
         if let Ok(mut g) = app.state::<AppState>().generations.lock() {
             g.remove(&id);
         }
@@ -301,6 +466,8 @@ pub fn run() {
                 config: Mutex::new(config),
                 http,
                 generations: Mutex::new(HashMap::new()),
+                approvals: Arc::new(Mutex::new(HashMap::new())),
+                mcp: Arc::new(McpManager::default()),
             });
             Ok(())
         })
@@ -311,6 +478,12 @@ pub fn run() {
             delete_profile,
             set_last_profile,
             test_profile,
+            list_models,
+            save_mcp_server,
+            delete_mcp_server,
+            test_mcp_server,
+            set_room_mcp_mode,
+            resolve_tool_call,
             generate,
             stop_generation,
         ])

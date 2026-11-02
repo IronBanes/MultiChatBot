@@ -3,7 +3,14 @@
 import { create } from "zustand";
 import { backend, errorText } from "./lib/backend";
 import { Relay, type ConnStatus } from "./lib/relay";
-import type { ClientState, HistoryItem, Message, RoomInfo, ServerMsg } from "./lib/types";
+import type { ClientState, HistoryItem, McpMode, Message, RoomInfo, ServerMsg, ToolStatus } from "./lib/types";
+
+/** Tool call details only the sender sees (arguments and a result preview). */
+export interface LocalTool {
+  status: ToolStatus;
+  args: string | null;
+  detail: string | null;
+}
 
 export interface Toast {
   id: number;
@@ -22,6 +29,8 @@ interface ChatState {
   activeRoomId: string | null;
   /** AI message ids this client is currently generating. */
   myGenerations: Record<string, true>;
+  /** AI message id → call id → details, for replies this client generates. */
+  localTools: Record<string, Record<string, LocalTool>>;
   toasts: Toast[];
 
   init(): Promise<void>;
@@ -36,6 +45,8 @@ interface ChatState {
   stopAi(id: string): void;
   setRoomPrompt(roomId: string, prompt: string): void;
   chooseProfile(roomId: string, profileId: string): void;
+  setRoomMcpMode(roomId: string, serverId: string, mode: McpMode): void;
+  answerToolCall(id: string, callId: string, approved: boolean): void;
   toast(text: string, kind?: Toast["kind"]): void;
   dismissToast(id: number): void;
 }
@@ -128,9 +139,22 @@ export const useChat = create<ChatState>((set, get) => {
       });
 
     backend
-      .generate(id, profileId, history, room?.system_prompt ?? "", (ev) => {
+      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", (ev) => {
         if (ev.event === "delta") {
           relay?.send({ type: "ai_delta", room_id: roomId, id, delta: ev.text });
+        } else if (ev.event === "reasoning") {
+          relay?.send({ type: "ai_reasoning", room_id: roomId, id, delta: ev.text });
+        } else if (ev.event === "tool") {
+          // The room only learns which tool ran and how it went.
+          const activity = { call_id: ev.call_id, server: ev.server, tool: ev.tool, status: ev.status };
+          relay?.send({ type: "ai_tool", room_id: roomId, id, activity });
+          set((st) => {
+            const prev = st.localTools[id]?.[ev.call_id];
+            const local: LocalTool = { status: ev.status, args: ev.args ?? prev?.args ?? null, detail: ev.detail ?? prev?.detail ?? null };
+            return { localTools: { ...st.localTools, [id]: { ...st.localTools[id], [ev.call_id]: local } } };
+          });
+        } else if (ev.event === "notice") {
+          get().toast(ev.message, "info");
         } else if (ev.event === "done") {
           relay?.send({ type: "ai_complete", room_id: roomId, id, content: ev.content });
           finish();
@@ -218,6 +242,28 @@ export const useChat = create<ChatState>((set, get) => {
           },
         }));
         break;
+      case "ai_reasoning":
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [msg.room_id]: patchMessage(s.messages[msg.room_id], msg.id, (m) =>
+              m.status === "streaming" ? { ...m, reasoning: m.reasoning + msg.delta } : m,
+            )!,
+          },
+        }));
+        break;
+      case "ai_tool":
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [msg.room_id]: patchMessage(s.messages[msg.room_id], msg.id, (m) => {
+              const i = m.tools.findIndex((t) => t.call_id === msg.activity.call_id);
+              const tools = i < 0 ? [...m.tools, msg.activity] : m.tools.map((t, j) => (j === i ? msg.activity : t));
+              return { ...m, tools };
+            })!,
+          },
+        }));
+        break;
       case "ai_complete":
       case "ai_error":
       case "ai_interrupted":
@@ -281,6 +327,7 @@ export const useChat = create<ChatState>((set, get) => {
     unread: {},
     activeRoomId: null,
     myGenerations: {},
+    localTools: {},
     toasts: [],
 
     async init() {
@@ -352,6 +399,19 @@ export const useChat = create<ChatState>((set, get) => {
           : {},
       );
       void backend.setLastProfile(roomId, profileId);
+    },
+
+    setRoomMcpMode(roomId, serverId, mode) {
+      set((s) => {
+        if (!s.client) return {};
+        const modes = { ...s.client.mcp_modes_by_room, [roomId]: { ...s.client.mcp_modes_by_room[roomId], [serverId]: mode } };
+        return { client: { ...s.client, mcp_modes_by_room: modes } };
+      });
+      backend.setRoomMcpMode(roomId, serverId, mode).catch((e) => get().toast(errorText(e)));
+    },
+
+    answerToolCall(id, callId, approved) {
+      backend.resolveToolCall(id, callId, approved).catch((e) => get().toast(errorText(e)));
     },
 
     toast(text, kind = "error") {

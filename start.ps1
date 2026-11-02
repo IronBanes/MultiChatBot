@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 Set-Location -Path $PSScriptRoot
 
 $MinNodeMajor = 22
-$MinRustMinor = 85 # Rust 1.85+ (edition 2024)
+$MinRustMinor = 88 # Rust 1.88+ (the MCP client needs it)
 $AssumeYes = $false
 $PassThru = @()
 foreach ($a in $args) {

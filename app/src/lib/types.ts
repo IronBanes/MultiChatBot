@@ -14,6 +14,16 @@ export interface RoomInfo {
   members: Member[];
 }
 
+export type ToolStatus = "awaiting_approval" | "running" | "done" | "error" | "denied";
+
+/** An MCP tool call shown to the room: names and status only. */
+export interface ToolActivity {
+  call_id: string;
+  server: string;
+  tool: string;
+  status: ToolStatus;
+}
+
 export type MessageStatus = "complete" | "streaming" | "error" | "interrupted";
 
 export interface Message {
@@ -25,6 +35,8 @@ export interface Message {
   author_id: string;
   author_name: string;
   content: string;
+  reasoning: string;
+  tools: ToolActivity[];
   ai_requested: boolean;
   anchor_id: string | null;
   model: string | null;
@@ -42,6 +54,8 @@ export type ClientMsg =
   | { type: "send_message"; room_id: string; id: string; content: string; ai_requested: boolean }
   | { type: "ai_start"; room_id: string; id: string; anchor_id: string; model: string }
   | { type: "ai_delta"; room_id: string; id: string; delta: string }
+  | { type: "ai_reasoning"; room_id: string; id: string; delta: string }
+  | { type: "ai_tool"; room_id: string; id: string; activity: ToolActivity }
   | { type: "ai_complete"; room_id: string; id: string; content: string }
   | { type: "ai_error"; room_id: string; id: string; error: string }
   | { type: "set_room_prompt"; room_id: string; system_prompt: string };
@@ -53,6 +67,8 @@ export type ServerMsg =
   | { type: "room_history"; room_id: string; messages: Message[] }
   | { type: "message"; room_id: string; message: Message }
   | { type: "ai_delta"; room_id: string; id: string; delta: string }
+  | { type: "ai_reasoning"; room_id: string; id: string; delta: string }
+  | { type: "ai_tool"; room_id: string; id: string; activity: ToolActivity }
   | { type: "ai_complete"; room_id: string; id: string; content: string }
   | { type: "ai_error"; room_id: string; id: string; error: string }
   | { type: "ai_interrupted"; room_id: string; id: string; content: string }
@@ -75,6 +91,46 @@ export interface Profile {
   model: string;
   max_context_tokens: number;
   temperature: number | null;
+  show_reasoning: boolean;
+  reasoning_effort: string | null;
+}
+
+export interface ModelInfo {
+  id: string;
+  name: string | null;
+  context_length: number | null;
+  reasoning: boolean | null;
+  tools: boolean | null;
+}
+
+export type McpMode = "off" | "ask" | "auto";
+
+export interface McpServer {
+  id: string;
+  name: string;
+  transport: "stdio" | "http";
+  command: string;
+  args: string[];
+  url: string;
+  default_mode: McpMode;
+}
+
+/** As returned by the backend: secret names only, never values. */
+export interface McpServerView extends McpServer {
+  env_names: string[];
+  header_names: string[];
+}
+
+/** An env var or header row in the editor; value null keeps the stored value. */
+export interface SecretEdit {
+  kind: "env" | "header";
+  name: string;
+  value: string | null;
+}
+
+export interface McpToolInfo {
+  name: string;
+  description: string;
 }
 
 export interface ProfileView extends Profile {
@@ -88,6 +144,8 @@ export interface ClientState {
   server_url: string;
   last_profile_by_room: Record<string, string>;
   profiles: ProfileView[];
+  mcp_servers: McpServerView[];
+  mcp_modes_by_room: Record<string, Record<string, McpMode>>;
 }
 
 export interface HistoryItem {
@@ -98,5 +156,17 @@ export interface HistoryItem {
 
 export type GenEvent =
   | { event: "delta"; text: string }
+  | { event: "reasoning"; text: string }
+  | {
+      event: "tool";
+      call_id: string;
+      server: string;
+      tool: string;
+      status: ToolStatus;
+      /** Local only: never sent to the relay. */
+      args: string | null;
+      detail: string | null;
+    }
+  | { event: "notice"; message: string }
   | { event: "done"; content: string; stopped: boolean }
   | { event: "error"; message: string; partial: string };

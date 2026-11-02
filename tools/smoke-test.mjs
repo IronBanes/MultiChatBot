@@ -87,6 +87,9 @@ alice.send({ type: "send_message", room_id: room.id, id: trigger, content: "Let'
 await bob.wait(type("message", (m) => m.message.id === trigger), "trigger message");
 const aiA = uuid();
 alice.send({ type: "ai_start", room_id: room.id, id: aiA, anchor_id: trigger, model: "model-a" });
+alice.send({ type: "ai_reasoning", room_id: room.id, id: aiA, delta: "Squares have four equal sides." });
+alice.send({ type: "ai_tool", room_id: room.id, id: aiA, activity: { call_id: "c1", server: "Files", tool: "read", status: "running" } });
+alice.send({ type: "ai_tool", room_id: room.id, id: aiA, activity: { call_id: "c1", server: "Files", tool: "read", status: "done" } });
 alice.send({ type: "ai_delta", room_id: room.id, id: aiA, delta: "Here is " });
 // Concurrent reply from Bob's profile anchored to the same message (regenerate).
 const aiB = uuid();
@@ -98,6 +101,11 @@ alice.send({ type: "ai_delta", room_id: room.id, id: aiA, delta: "a square." });
 alice.send({ type: "ai_complete", room_id: room.id, id: aiA, content: "Here is a square." });
 const start = await bob.wait(type("message", (m) => m.message.id === aiA), "ai_start broadcast");
 ok(start.message.status === "streaming" && start.message.model === "model-a" && start.message.author_name === "Alice", "AI message labeled via Alice · model-a");
+const reasoning = await bob.wait(type("ai_reasoning", (m) => m.id === aiA), "ai_reasoning");
+ok(reasoning.delta === "Squares have four equal sides.", "reasoning relayed");
+await bob.wait(type("ai_tool", (m) => m.id === aiA && m.activity.status === "running"), "ai_tool running");
+await bob.wait(type("ai_tool", (m) => m.id === aiA && m.activity.status === "done"), "ai_tool done");
+ok(true, "tool activity relayed (names and status only)");
 const deltas = [];
 deltas.push((await bob.wait(type("ai_delta", (m) => m.id === aiA), "delta 1")).delta);
 deltas.push((await bob.wait(type("ai_delta", (m) => m.id === aiA), "delta 2")).delta);
@@ -138,7 +146,9 @@ ok(
   status[aiA] === "complete" && status[aiB] === "interrupted" && status[aiErr] === "error" && hist.messages.length === 6,
   "history persisted: complete / interrupted / error statuses",
 );
-ok(hist.messages.find((m) => m.id === aiA).content === "Here is a square.", "final AI text persisted");
+const finalA = hist.messages.find((m) => m.id === aiA);
+ok(finalA.content === "Here is a square.", "final AI text persisted");
+ok(finalA.reasoning === "Squares have four equal sides." && finalA.tools.length === 1 && finalA.tools[0].status === "done", "reasoning and tool activity persisted");
 
 alice.close();
 bob2.close();

@@ -29,6 +29,8 @@ messages (seq INTEGER PK AUTOINCREMENT,      -- global ordering
           room_id TEXT, kind TEXT,           -- 'human' | 'ai'
           author_id TEXT, author_name TEXT,  -- human: author. ai: triggering user
           content TEXT,
+          reasoning TEXT,                    -- ai: streamed reasoning, if any
+          tools TEXT,                        -- ai: JSON [{call_id, server, tool, status}]
           ai_requested INTEGER,              -- human: did it ask for an AI reply
           anchor_id TEXT,                    -- ai: triggering human message id
           model TEXT,                        -- ai: model name (never base URL / key)
@@ -76,7 +78,9 @@ all rooms. The first client frame must be `hello`.
 | `send_message` | `room_id, id, content, ai_requested` | human message |
 | `ai_start` | `room_id, id, anchor_id, model` | anchor = human msg in room |
 | `ai_delta` | `room_id, id, delta` | only from the stream's owner connection |
-| `ai_complete` | `room_id, id, content` | full final text, persisted |
+| `ai_reasoning` | `room_id, id, delta` | reasoning text, same rules as `ai_delta` |
+| `ai_tool` | `room_id, id, activity: {call_id, server, tool, status}` | MCP tool status; no arguments or results |
+| `ai_complete` | `room_id, id, content` | full final text, persisted with reasoning and tool activity |
 | `ai_error` | `room_id, id, error` | short, sanitized reason |
 | `set_room_prompt` | `room_id, system_prompt` | any member |
 
@@ -90,6 +94,8 @@ all rooms. The first client frame must be `hello`.
 | `room_history` | `room_id, messages: Message[]` |
 | `message` | `room_id, message: Message` (human, or AI on `ai_start` with status `streaming`) |
 | `ai_delta` | `room_id, id, delta` |
+| `ai_reasoning` | `room_id, id, delta` |
+| `ai_tool` | `room_id, id, activity` |
 | `ai_complete` | `room_id, id, content` |
 | `ai_error` | `room_id, id, error` |
 | `ai_interrupted` | `room_id, id, content` (partial) |
