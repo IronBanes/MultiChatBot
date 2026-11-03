@@ -20,6 +20,11 @@ export const backend = {
   getState: () => invoke<ClientState>("get_state"),
   setIdentity: (displayName: string, serverUrl: string) =>
     invoke<void>("set_identity", { displayName, serverUrl }),
+  /** Switches this device to another device's account (device linking). */
+  linkDevice: (userId: string, displayName: string) =>
+    invoke<void>("link_device", { userId, displayName }),
+  /** Returns this device to its own account after `linkDevice`. */
+  unlinkDevice: () => invoke<void>("unlink_device"),
   /** apiKey: undefined keeps the stored key, "" removes it. */
   saveProfile: (profile: Profile, apiKey?: string) =>
     invoke<ProfileView>("save_profile", { profile, apiKey: apiKey ?? null }),

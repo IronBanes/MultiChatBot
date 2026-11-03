@@ -4,7 +4,7 @@ import { create } from "zustand";
 import { backend, errorText } from "./lib/backend";
 import { prepareImage } from "./lib/images";
 import { Relay, type ConnStatus } from "./lib/relay";
-import type { Attachment, ClientState, HistoryItem, McpMode, Message, RoomInfo, ServerMsg, ToolStatus } from "./lib/types";
+import type { Attachment, ClientState, Device, HistoryItem, McpMode, Message, RoomInfo, ServerMsg, ToolStatus } from "./lib/types";
 
 /** Tool call details only the sender sees (arguments and a result preview). */
 export interface LocalTool {
@@ -33,6 +33,8 @@ interface ChatState {
   /** True after the phone's back button: stay on the room list instead of opening a
    *  room automatically when the relay (re)connects. */
   roomClosed: boolean;
+  /** This account's devices that are online right now (device linking). */
+  devices: Device[];
   /** AI message ids this client is currently generating. */
   myGenerations: Record<string, true>;
   /** AI message id → call id → details, for replies this client generates. */
@@ -51,6 +53,12 @@ interface ChatState {
   closeRoom(): void;
   createRoom(name: string): Promise<RoomInfo>;
   joinRoom(code: string): Promise<RoomInfo>;
+  /** Creates a one-use code another device can redeem to join this account. */
+  createLinkCode(): Promise<{ code: string; expiresInSecs: number }>;
+  /** Redeems another device's code and switches this device to its account. */
+  redeemLinkCode(code: string): Promise<void>;
+  /** Leaves the linked account and returns to this device's own. */
+  unlink(): Promise<void>;
   leaveRoom(id: string): void;
   /** Resolves true once the message was actually written to the relay. */
   sendMessage(roomId: string, content: string, aiRequested: boolean, profileId: string | null): Promise<boolean>;
@@ -81,8 +89,20 @@ function withAttachments(m: Message, extra: Attachment[] = []): Message {
   return add.length ? { ...m, attachments: [...m.attachments, ...add] } : m;
 }
 
-const pendingRequests = new Map<string, { resolve: (r: RoomInfo) => void; reject: (e: Error) => void }>();
+const pendingRequests = new Map<string, { resolve: (r: unknown) => void; reject: (e: Error) => void }>();
 let toastSeq = 0;
+
+/** Reply to `create_link_code`. */
+interface LinkCodeReply {
+  code: string;
+  expires_in_secs: number;
+}
+
+/** Reply to `redeem_link_code`: the code owner's identity. */
+interface LinkedReply {
+  user_id: string;
+  display_name: string;
+}
 
 function upsert(list: Message[] | undefined, m: Message): Message[] {
   const next = (list ?? []).filter((x) => x.id !== m.id);
@@ -100,14 +120,14 @@ function patchMessage(list: Message[] | undefined, id: string, f: (m: Message) =
   return next;
 }
 
-function request(build: (requestId: string) => Parameters<Relay["send"]>[0]): Promise<RoomInfo> {
+function request<T>(build: (requestId: string) => Parameters<Relay["send"]>[0]): Promise<T> {
   return new Promise((resolve, reject) => {
     const requestId = crypto.randomUUID();
     if (!relay?.send(build(requestId))) {
       reject(new Error("Not connected to the server"));
       return;
     }
-    pendingRequests.set(requestId, { resolve, reject });
+    pendingRequests.set(requestId, { resolve: resolve as (r: unknown) => void, reject });
     window.setTimeout(() => {
       if (pendingRequests.delete(requestId)) reject(new Error("The server did not respond"));
     }, 10_000);
@@ -129,7 +149,12 @@ export const useChat = create<ChatState>((set, get) => {
     if (!client?.display_name) return;
     relay = new Relay(
       client.server_url,
-      { user_id: client.user_id, display_name: client.display_name },
+      {
+        user_id: client.user_id,
+        display_name: client.display_name,
+        device_id: client.device_id,
+        platform: client.platform,
+      },
       {
         onMessage: handle,
         onStatus: (status, error) => {
@@ -384,6 +409,21 @@ export const useChat = create<ChatState>((set, get) => {
       case "room_updated":
         patchRoom(msg.room_id, (r) => ({ ...r, system_prompt: msg.system_prompt }));
         break;
+      case "link_code": {
+        const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
+        if (msg.request_id) pendingRequests.delete(msg.request_id);
+        pending?.resolve({ code: msg.code, expires_in_secs: msg.expires_in_secs });
+        break;
+      }
+      case "linked": {
+        const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
+        if (msg.request_id) pendingRequests.delete(msg.request_id);
+        pending?.resolve({ user_id: msg.user_id, display_name: msg.display_name });
+        break;
+      }
+      case "devices":
+        set({ devices: msg.devices });
+        break;
       case "error": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
         if (pending && msg.request_id) {
@@ -408,6 +448,7 @@ export const useChat = create<ChatState>((set, get) => {
     unread: {},
     activeRoomId: null,
     roomClosed: false,
+    devices: [],
     myGenerations: {},
     localTools: {},
     images: {},
@@ -449,8 +490,30 @@ export const useChat = create<ChatState>((set, get) => {
       set({ activeRoomId: null, roomClosed: true });
     },
 
-    createRoom: (name) => request((request_id) => ({ type: "create_room", request_id, name })),
-    joinRoom: (code) => request((request_id) => ({ type: "join_room", request_id, invite_code: code })),
+    createRoom: (name) => request<RoomInfo>((request_id) => ({ type: "create_room", request_id, name })),
+    joinRoom: (code) => request<RoomInfo>((request_id) => ({ type: "join_room", request_id, invite_code: code })),
+
+    async createLinkCode() {
+      const reply = await request<LinkCodeReply>((request_id) => ({ type: "create_link_code", request_id }));
+      return { code: reply.code, expiresInSecs: reply.expires_in_secs };
+    },
+
+    async redeemLinkCode(code) {
+      const reply = await request<LinkedReply>((request_id) => ({ type: "redeem_link_code", request_id, code }));
+      await backend.linkDevice(reply.user_id, reply.display_name);
+      await get().refreshClient();
+      // The relay refuses a user change on an open connection, so reconnect
+      // fresh (the same reset saveIdentity does when the server URL changes).
+      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null });
+      connect();
+    },
+
+    async unlink() {
+      await backend.unlinkDevice();
+      await get().refreshClient();
+      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null });
+      connect();
+    },
 
     leaveRoom(id) {
       relay?.send({ type: "leave_room", room_id: id });
