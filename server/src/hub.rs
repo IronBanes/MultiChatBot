@@ -16,6 +16,10 @@ const MAX_ERROR: usize = 300;
 const HISTORY_LIMIT: i64 = 1000;
 const MAX_TOOL_CALLS: usize = 100;
 const MAX_ATTACHMENTS: usize = 8;
+/// Distinct emoji one message accepts across all members.
+const MAX_REACTION_EMOJI: usize = 20;
+/// Reaction emoji length cap; single emoji are a few chars of UTF-16.
+const MAX_EMOJI: usize = 16;
 /// Base64 length cap (~4.5 MB of image); clients downscale before sending.
 const MAX_ATTACHMENT_B64: usize = 6_000_000;
 /// Reported image dimensions outside 1..=this are rejected as bogus metadata.
@@ -518,6 +522,37 @@ impl State {
                 self.broadcast(
                     &room_id,
                     ServerMsg::RoomUpdated { room_id: room_id.clone(), system_prompt: prompt, updated_by: user_id },
+                );
+            }
+
+            ClientMsg::React { room_id, message_id, emoji, on } => {
+                if !self.in_room(conn, &room_id) {
+                    return Ok(());
+                }
+                let Some(message) = db::message(&self.db, &message_id).await? else {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                };
+                if message.room_id != room_id {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                }
+                let emoji = emoji.trim();
+                let ok_emoji = (1..=MAX_EMOJI).contains(&emoji.chars().count())
+                    && emoji.chars().all(|c| !c.is_whitespace() && !c.is_ascii_alphanumeric());
+                if !ok_emoji {
+                    self.send(conn, err(None, "Not a valid reaction"));
+                    return Ok(());
+                }
+                if on && !message.reactions.iter().any(|r| r.emoji == emoji) && message.reactions.len() >= MAX_REACTION_EMOJI {
+                    self.send(conn, err(None, "Too many different reactions on this message"));
+                    return Ok(());
+                }
+                db::set_reaction(&self.db, &room_id, &message_id, &user_id, &emoji, on).await?;
+                let reactions = db::reactions(&self.db, &message_id).await?;
+                self.broadcast(
+                    &room_id,
+                    ServerMsg::Reactions { room_id: room_id.clone(), message_id, reactions },
                 );
             }
 
