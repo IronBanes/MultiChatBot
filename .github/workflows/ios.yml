@@ -82,8 +82,6 @@ jobs:
 
   # Unsigned real-device (arm64) .ipa for sideloading: Sideloadly or AltStore re-sign it
   # with a free Apple ID, so no Mac, paid account or secrets are needed.
-  # `tauri ios build` always archives and exports, which requires a signing team, so
-  # this job builds the generated Xcode project directly with signing turned off.
   build-unsigned-ipa:
     runs-on: macos-latest
     timeout-minutes: 90
@@ -117,38 +115,23 @@ jobs:
         working-directory: app
         run: npm run tauri -- icon ../branding/logo.svg
 
-      # Plain xcodebuild skips Tauri's beforeBuildCommand, so build the frontend here.
-      - name: Build the frontend
+      # --no-sign archives with code signing off and zips Payload/<app>.app into an
+      # unsigned .ipa, skipping the export step that would need a signing team.
+      - name: Build the unsigned device .ipa
         working-directory: app
-        run: npm run build
+        run: npm run tauri -- ios build --ci --target aarch64 --no-sign
 
-      - name: Build the device .app (no signing)
+      - name: Collect multichat-unsigned.ipa
         working-directory: app/src-tauri/gen/apple
         run: |
-          project=$(ls -d *.xcodeproj | head -n 1)
-          scheme="$(basename "$project" .xcodeproj)_iOS"
-          xcodebuild build \
-            -project "$project" \
-            -scheme "$scheme" \
-            -sdk iphoneos \
-            -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build/unsigned \
-            ARCHS=arm64 \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
-
-      # An .ipa is just a zip with the app under Payload/.
-      - name: Package multichat-unsigned.ipa
-        working-directory: app/src-tauri/gen/apple
-        run: |
-          app=$(find build/unsigned/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)
-          [ -n "$app" ] || { echo "::error::no .app in Release-iphoneos"; exit 1; }
-          rm -rf ipa && mkdir -p ipa/Payload
-          cp -R "$app" ipa/Payload/
-          (cd ipa && zip -qry ../multichat-unsigned.ipa Payload)
-          unzip -l multichat-unsigned.ipa | head -n 20
+          ipa=$(find build -name '*.ipa' | head -n 1)
+          [ -n "$ipa" ] || { echo "::error::tauri ios build --no-sign produced no .ipa"; exit 1; }
+          cp "$ipa" multichat-unsigned.ipa
+          # Sideloadly/AltStore need the app bundle under Payload/.
+          unzip -l multichat-unsigned.ipa > ipa-listing.txt
+          head -n 20 ipa-listing.txt
+          grep -Eq ' Payload/[^/]+\.app/Info\.plist$' ipa-listing.txt \
+            || { echo "::error::multichat-unsigned.ipa has no Payload/*.app/Info.plist"; exit 1; }
 
       - name: Upload unsigned .ipa
         uses: actions/upload-artifact@v4
