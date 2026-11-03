@@ -96,6 +96,8 @@ struct ClientState {
     instance: String,
     user_id: String,
     display_name: String,
+    device_id: String,
+    linked: bool,
     server_url: String,
     platform: &'static str,
     last_profile_by_room: HashMap<String, String>,
@@ -122,12 +124,43 @@ fn get_state(state: State<'_, AppState>) -> Result<ClientState, String> {
         instance: config::instance_name(),
         user_id: cfg.user_id,
         display_name: cfg.display_name,
+        device_id: cfg.device_id,
+        linked: cfg.linked_from.is_some(),
         server_url: cfg.server_url,
         platform: platform(),
         last_profile_by_room: cfg.last_profile_by_room,
         profiles: cfg.profiles.into_iter().map(view).collect(),
         mcp_servers: cfg.mcp_servers.into_iter().map(mcp_view).collect(),
         mcp_modes_by_room: cfg.mcp_modes_by_room,
+    })
+}
+
+#[tauri::command]
+fn link_device(
+    state: State<'_, AppState>,
+    user_id: String,
+    display_name: String,
+) -> Result<(), String> {
+    if uuid::Uuid::parse_str(&user_id).is_err() {
+        return Err("Invalid user id".into());
+    }
+    let name: String = display_name.trim().chars().take(40).collect();
+    state.update(|c| {
+        // Remember this device's own account so unlinking can return to it.
+        if c.linked_from.is_none() {
+            c.linked_from = Some(c.user_id.clone());
+        }
+        c.user_id = user_id;
+        c.display_name = name;
+    })
+}
+
+#[tauri::command]
+fn unlink_device(state: State<'_, AppState>) -> Result<(), String> {
+    state.update(|c| {
+        // Back to this device's own account, or a fresh one if never linked.
+        c.user_id =
+            c.linked_from.take().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     })
 }
 
@@ -613,6 +646,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_state,
             set_identity,
+            link_device,
+            unlink_device,
             save_profile,
             delete_profile,
             set_last_profile,
