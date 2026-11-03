@@ -37,10 +37,10 @@ messages (seq INTEGER PK AUTOINCREMENT,      -- global ordering
           status TEXT,                       -- 'complete'|'streaming'|'error'|'interrupted'
           error TEXT, created_at INTEGER)
 attachments (id TEXT PK, message_id TEXT, room_id TEXT, mime TEXT,
-              call_id TEXT, width INTEGER, height INTEGER,
-              data TEXT,                      -- base64 image
-              created_at INTEGER)        -- source of truth for a reply's images,
-                                         -- written at upload so they survive disconnects
+             call_id TEXT, width INTEGER, height INTEGER,
+             data TEXT,                      -- base64 image
+             created_at INTEGER)        -- source of truth for a reply's images,
+                                        -- written at upload so they survive disconnects
 reactions (message_id TEXT, room_id TEXT, user_id TEXT, emoji TEXT,
            created_at INTEGER, PRIMARY KEY(message_id, user_id, emoji))  -- emoji reactions
 ```

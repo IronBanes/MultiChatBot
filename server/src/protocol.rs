@@ -257,7 +257,7 @@ pub struct Attachment {
     pub height: Option<u32>,
 }
 
-/// One emoji everyone who used it on a message, in reaction order.
+/// One emoji and everyone who used it on a message, in reaction order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reaction {
     pub emoji: String,

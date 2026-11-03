@@ -215,8 +215,9 @@ function ReactionChips({ m, members }: { m: Message; members: Member[] }) {
   );
 }
 
-/** Desktop hover action: opens the quick palette right above the button. */
-function ReactButton({ m }: { m: Message }) {
+/** Desktop hover action: opens the quick palette right above the button. `align` is the
+ *  side the palette lines up with, so it stays on screen near the right edge. */
+function ReactButton({ m, align = "left" }: { m: Message; align?: "left" | "right" }) {
   const react = useChat((s) => s.react);
   const myId = useChat((s) => s.client!.user_id);
   const [open, setOpen] = useState(false);
@@ -246,7 +247,7 @@ function ReactButton({ m }: { m: Message }) {
         <Icon name="smile" size={12} /> React
       </button>
       {open && (
-        <div className="absolute bottom-full left-0 z-20 mb-1.5 flex gap-0.5 rounded-full border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+        <div className={`absolute bottom-full ${align === "right" ? "right-0" : "left-0"} z-20 mb-1.5 flex gap-0.5 rounded-full border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-700 dark:bg-zinc-900`}>
           {REACTIONS.map((emoji) => (
             <button
               key={emoji}
@@ -290,7 +291,7 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="mx-auto mb-2 h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-700" />
-        <div className="flex flex-wrap justify-center gap-1 px-3 pb-1">
+        <div className="grid grid-cols-8 px-2 pb-1">
           {REACTIONS.map((emoji) => (
             <button
               key={emoji}
@@ -298,7 +299,7 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
                 react(m.room_id, m.id, emoji, !mine(emoji));
                 onClose();
               }}
-              className={`flex h-11 w-11 items-center justify-center rounded-full text-2xl leading-none transition active:bg-zinc-100 dark:active:bg-zinc-800 ${
+              className={`mx-auto flex h-11 w-11 items-center justify-center rounded-full text-2xl leading-none transition active:bg-zinc-100 dark:active:bg-zinc-800 ${
                 mine(emoji) ? "bg-indigo-50 dark:bg-indigo-950/60" : ""
               }`}
               aria-label={`React with ${emoji}`}
@@ -326,6 +327,8 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
 function useLongPress(onLongPress: () => void) {
   const timer = useRef<number | undefined>(undefined);
   const start = useRef<{ x: number; y: number } | null>(null);
+  /** Set once the press fired, so lifting the finger isn't also taken as a tap. */
+  const fired = useRef(false);
   const [pressing, setPressing] = useState(false);
   const cancel = () => {
     window.clearTimeout(timer.current);
@@ -340,9 +343,11 @@ function useLongPress(onLongPress: () => void) {
       onTouchStart: (e: React.TouchEvent) => {
         const t = e.touches[0];
         start.current = { x: t.clientX, y: t.clientY };
+        fired.current = false;
         setPressing(true);
         timer.current = window.setTimeout(() => {
           cancel();
+          fired.current = true;
           onLongPress();
         }, 500);
       },
@@ -351,7 +356,12 @@ function useLongPress(onLongPress: () => void) {
         const t = e.touches[0];
         if (Math.hypot(t.clientX - start.current.x, t.clientY - start.current.y) > 10) cancel();
       },
-      onTouchEnd: cancel,
+      onTouchEnd: (e: React.TouchEvent) => {
+        // The lift would otherwise click whatever is now under the finger: the
+        // sheet's backdrop, which closes it again.
+        if (fired.current) e.preventDefault();
+        cancel();
+      },
       onTouchCancel: cancel,
     },
   };
@@ -425,7 +435,7 @@ const MessageItem = memo(function MessageItem({
 
   if (m.kind === "human") {
     return (
-      <div className={`group flex gap-3 px-4 sm:px-5 ${compact ? "pt-0.5" : "pt-3"}`}>
+      <div className={`group relative flex gap-3 px-4 sm:px-5 ${compact ? "pt-0.5" : "pt-3"}`}>
         <div className="w-8 shrink-0">{!compact && <Avatar userId={m.author_id} name={m.author_name} />}</div>
         <div className="min-w-0 flex-1">
           {!compact && (
@@ -436,16 +446,23 @@ const MessageItem = memo(function MessageItem({
               <span className="shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
             </div>
           )}
-          <div className="text-[15px] leading-relaxed break-words text-zinc-800 dark:text-zinc-200">
+          <div
+            {...longPress.handlers}
+            className={`text-[15px] leading-relaxed break-words text-zinc-800 dark:text-zinc-200 ${
+              longPress.pressing ? "select-none [-webkit-touch-callout:none]" : ""
+            }`}
+          >
             <Markdown text={m.content} />
           </div>
           <ReactionChips m={m} members={members} />
           {!m.ai_requested && <span className="mt-0.5 inline-block text-[11px] text-zinc-400">humans only · no AI reply</span>}
-          {/* Hover actions (React), same reveal classes as the AI actions row. */}
-          <div className="mt-1 flex h-6 flex-wrap gap-1 text-xs text-zinc-500 opacity-0 transition group-hover:opacity-100 [@media(hover:none)]:opacity-100 focus-within:opacity-100">
-            <ReactButton m={m} />
-          </div>
         </div>
+        {/* Floats over the message's top edge on hover, so it adds no height to the chat.
+            Touch screens long-press instead. */}
+        <div className="absolute -top-3 right-4 hidden rounded-md border border-zinc-200 bg-white p-0.5 text-xs text-zinc-500 shadow-sm group-hover:flex focus-within:flex sm:right-5 dark:border-zinc-700 dark:bg-zinc-900 [@media(hover:none)]:!hidden">
+          <ReactButton m={m} align="right" />
+        </div>
+        {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
       </div>
     );
   }
