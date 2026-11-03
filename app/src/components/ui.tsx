@@ -76,7 +76,7 @@ export function Modal({
         aria-modal="true"
         aria-labelledby={titleId}
         tabIndex={-1}
-        className={`flex max-h-[90dvh] w-full flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-2xl outline-none dark:border-zinc-800 dark:bg-zinc-900 ${wide ? "max-w-3xl" : "max-w-md"}`}
+        className={`flex max-h-[90vh] supports-[height:100dvh]:max-h-[90dvh] w-full flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-2xl outline-none dark:border-zinc-800 dark:bg-zinc-900 ${wide ? "max-w-3xl" : "max-w-md"}`}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-zinc-200 px-5 py-3 dark:border-zinc-800">

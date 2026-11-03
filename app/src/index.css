@@ -143,7 +143,7 @@ body {
 /* iOS zooms into any focused field whose text is under 16px and doesn't zoom back
    out. Phones get 16px fields; this rule is unlayered, so it beats Tailwind's
    text-sm/text-xs utilities. */
-@media (pointer: coarse) {
+@media (any-pointer: coarse) {
   input,
   textarea,
   select {
