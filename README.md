@@ -71,6 +71,12 @@ suspends apps in the background, but they connect to a hosted relay like any des
 While the app isn't connected, the sidebar shows why, for example "Nothing is listening at
 192.168.1.49:8787", with a **Retry** button that reconnects right away.
 
+To use your phone as the same person as your computer, link them. On the computer, open
+**Settings → General → Devices → Create code**. On the phone, enter that code under
+**Link to another device**. The phone then shows the computer's rooms, and its messages
+count as yours. Codes work once and expire after 10 minutes. **Unlink** returns the phone
+to its own account and rooms. AI profiles and MCP servers stay on each device for now.
+
 ### Playing with a friend
 
 1. **Host:** run `start.cmd --server` or `./start.sh --server`, or turn on **Host a

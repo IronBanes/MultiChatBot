@@ -101,6 +101,9 @@ pub struct Config {
     /// Unlinking returns to it.
     #[serde(default)]
     pub linked_from: Option<String>,
+    /// This device's own display name from before linking, restored on unlink.
+    #[serde(default)]
+    pub linked_from_name: Option<String>,
     #[serde(default = "default_server_url")]
     pub server_url: String,
     #[serde(default)]
@@ -148,6 +151,7 @@ impl Default for Config {
             display_name: String::new(),
             device_id: new_device_id(),
             linked_from: None,
+            linked_from_name: None,
             server_url: default_server_url(),
             last_profile_by_room: HashMap::new(),
             profiles: Vec::new(),

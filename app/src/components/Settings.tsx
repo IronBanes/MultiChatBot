@@ -1078,6 +1078,10 @@ function GeneralPanel() {
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [appearance, setAppearance] = useAppearance();
 
+  // Linking or unlinking switches accounts, and with it the name; a stale field
+  // here would rename the other account on the next Save.
+  useEffect(() => setName(client.display_name), [client.user_id, client.display_name]);
+
   const save = async () => {
     try {
       await saveIdentity(name, url);

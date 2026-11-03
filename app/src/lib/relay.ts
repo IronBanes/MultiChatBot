@@ -92,7 +92,7 @@ export class Relay {
   private lastHeard = 0;
   private closed = false;
   /** Sends go through one queue per connection so frames reach the relay in the order
-    *  they were sent; a new connection starts with an empty queue. */
+   *  they were sent; a new connection starts with an empty queue. */
   private queue: Promise<void> = Promise.resolve();
 
   private hello: {

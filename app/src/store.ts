@@ -160,6 +160,7 @@ export const useChat = create<ChatState>((set, get) => {
         onStatus: (status, error) => {
           // The relay marks our in-flight replies as interrupted when the socket drops.
           if (status === "offline") stopAllGenerations();
+          if (status !== "online") set({ devices: [] });
           if (status === "online") set({ status, connError: null });
           else if (error) set({ status, connError: error });
           else set({ status });
@@ -504,14 +505,14 @@ export const useChat = create<ChatState>((set, get) => {
       await get().refreshClient();
       // The relay refuses a user change on an open connection, so reconnect
       // fresh (the same reset saveIdentity does when the server URL changes).
-      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null });
+      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null, unread: {} });
       connect();
     },
 
     async unlink() {
       await backend.unlinkDevice();
       await get().refreshClient();
-      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null });
+      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null, unread: {} });
       connect();
     },
 

@@ -548,7 +548,7 @@ impl State {
                 if hub.conns.get(&conn).is_some_and(|c| c.failed_redeems >= MAX_FAILED_REDEEMS) {
                     hub.send(
                         conn,
-                        &err(Some(request_id), "Too many wrong codes. Reconnect to try again"),
+                        &err(Some(request_id), "Too many wrong codes. Close and reopen the app to try again"),
                     );
                     return Ok(());
                 }

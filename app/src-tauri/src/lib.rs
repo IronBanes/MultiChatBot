@@ -149,6 +149,7 @@ fn link_device(
         // Remember this device's own account so unlinking can return to it.
         if c.linked_from.is_none() {
             c.linked_from = Some(c.user_id.clone());
+            c.linked_from_name = Some(c.display_name.clone());
         }
         c.user_id = user_id;
         c.display_name = name;
@@ -161,6 +162,9 @@ fn unlink_device(state: State<'_, AppState>) -> Result<(), String> {
         // Back to this device's own account, or a fresh one if never linked.
         c.user_id =
             c.linked_from.take().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        if let Some(name) = c.linked_from_name.take().filter(|n| !n.is_empty()) {
+            c.display_name = name;
+        }
     })
 }
 
