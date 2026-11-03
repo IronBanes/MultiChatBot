@@ -124,6 +124,14 @@ html {
   /* Keep iOS from inflating text sizes when the phone rotates. */
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
+  /* No double-tap zoom; taps also fire without the 300ms wait. */
+  touch-action: manipulation;
+}
+
+html,
+body {
+  /* The app is a fixed-size shell; don't let a drag rubber-band the whole page. */
+  overscroll-behavior: none;
 }
 
 body {
