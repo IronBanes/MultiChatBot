@@ -211,8 +211,11 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
             };
             // If the old key can't come back, remove the key entirely rather than leave
             // the new one paired with the old endpoint.
-            if restored.is_err() && secrets::delete_key(&id).is_ok() {
-                return Err(format!("{e}. The API key for this profile was removed; enter it again."));
+            if restored.is_err() {
+                return Err(match secrets::delete_key(&id) {
+                    Ok(()) => format!("{e}. The API key for this profile was removed; enter it again."),
+                    Err(_) => format!("{e}. The API key for this profile couldn't be restored; enter it again before using it."),
+                });
             }
         }
         return Err(e);
@@ -353,17 +356,19 @@ async fn save_mcp_server(
     secrets: Option<Vec<SecretEdit>>,
 ) -> Result<McpServerView, String> {
     validate_mcp(&server)?;
-    let merged = merge_secrets(&server.id, secrets)?;
-    if server.id.is_empty() {
-        server.id = uuid::Uuid::new_v4().to_string();
-    }
-    server.name = server.name.trim().to_string();
-    server.command = server.command.trim().to_string();
-    server.url = server.url.trim().to_string();
-    server.args.retain(|a| !a.is_empty());
-    let saved = server.clone();
-    {
+    let saved = {
+        // Merge against the stored secrets inside the lock, so a concurrent save of the
+        // same server can't be overwritten with stale values.
         let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
+        let merged = merge_secrets(&server.id, secrets)?;
+        if server.id.is_empty() {
+            server.id = uuid::Uuid::new_v4().to_string();
+        }
+        server.name = server.name.trim().to_string();
+        server.command = server.command.trim().to_string();
+        server.url = server.url.trim().to_string();
+        server.args.retain(|a| !a.is_empty());
+        let saved = server.clone();
         let previous = secrets::get_mcp(&server.id)?;
         secrets::set_mcp(&server.id, &merged)?;
         let updated = state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
@@ -374,11 +379,15 @@ async fn save_mcp_server(
             // Keep the secrets paired with the server settings that are still in effect,
             // or drop them if that fails.
             if secrets::set_mcp(&saved.id, &previous).is_err() {
-                let _ = secrets::delete_mcp(&saved.id);
+                return Err(match secrets::delete_mcp(&saved.id) {
+                    Ok(()) => format!("{e}. This server's env vars and headers were removed; enter them again."),
+                    Err(_) => format!("{e}. This server's env vars and headers couldn't be restored; enter them again before using it."),
+                });
             }
             return Err(e);
         }
-    }
+        saved
+    };
     // Pick up the new settings on next use.
     state.mcp.disconnect(&saved.id).await;
     Ok(mcp_view(saved))
