@@ -64,6 +64,8 @@ const statusStyle = {
 export function Sidebar({ onSettings }: { onSettings: () => void }) {
   const client = useChat((s) => s.client)!;
   const status = useChat((s) => s.status);
+  const connError = useChat((s) => s.connError);
+  const reconnect = useChat((s) => s.reconnect);
   const rooms = useChat((s) => s.rooms);
   const roomOrder = useChat((s) => s.roomOrder);
   const unread = useChat((s) => s.unread);
@@ -80,6 +82,15 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
           <div className="font-semibold leading-tight">Multichat</div>
           <div className="flex items-center gap-1.5 text-xs text-zinc-500">
             <span className={`inline-block h-1.5 w-1.5 rounded-full ${dot}`} /> {label}
+            {status !== "online" && (
+              <button
+                onClick={reconnect}
+                className="ml-0.5 rounded px-1 font-medium text-indigo-600 hover:bg-zinc-200 dark:text-indigo-400 dark:hover:bg-zinc-800"
+                title="Reconnect to the relay now"
+              >
+                Retry
+              </button>
+            )}
           </div>
         </div>
         {client.instance !== "default" && (
@@ -88,6 +99,12 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
           </span>
         )}
       </div>
+
+      {status !== "online" && connError && (
+        <p className="mx-3 mb-3 rounded-lg bg-amber-50 px-2.5 py-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+          {connError} Check the relay address in Settings.
+        </p>
+      )}
 
       <div className="flex gap-2 px-3 pb-3">
         <Button variant="outline" className="flex-1 !py-1.5" onClick={() => setDialog("create")}>

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { backend, errorText } from "../lib/backend";
 import type {
+  HostStatus,
   McpMode,
   McpServer,
   McpServerView,
@@ -765,6 +766,137 @@ function McpPanel() {
 
 // ------------------------------------------------------------------ General
 
+function CopyRow({ label, value, action }: { label: string; value: string; action?: React.ReactNode }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
+  return (
+    <div className="flex items-center gap-2 text-sm">
+      <span className="w-24 shrink-0 text-xs text-zinc-500">{label}</span>
+      <code className="min-w-0 flex-1 truncate rounded bg-zinc-100 px-1.5 py-0.5 text-xs dark:bg-zinc-800">{value}</code>
+      {action}
+      <button onClick={copy} className="rounded-md p-1 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Copy" aria-label={`Copy ${label}`}>
+        {copied ? <span className="text-xs text-emerald-600">Copied</span> : <Icon name="copy" size={14} />}
+      </button>
+    </div>
+  );
+}
+
+/** Hosting the relay inside the desktop app. */
+function HostSection({ serverUrl, onUse }: { serverUrl: string; onUse: (url: string) => Promise<void> }) {
+  const [host, setHost] = useState<HostStatus | null>(null);
+  const [port, setPort] = useState("8787");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    backend
+      .hostStatus()
+      .then((h) => {
+        setHost(h);
+        const p = h.port ?? h.saved_port;
+        if (p) setPort(String(p));
+      })
+      .catch((e) => setError(errorText(e)));
+  }, []);
+
+  const run = async (action: () => Promise<HostStatus>) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const h = await action();
+      setHost(h);
+      // If this app points at the relay it just (re)started, connect now instead of
+      // waiting out the retry backoff.
+      const { status, reconnect } = useChat.getState();
+      if (h.running && status !== "online") reconnect();
+    } catch (e) {
+      setError(errorText(e));
+      setHost(await backend.hostStatus().catch(() => host));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (!host?.supported) return null;
+  const portNum = Number(port);
+  const portOk = Number.isInteger(portNum) && portNum >= 1024 && portNum <= 65535;
+  const p = host.port;
+  const localUrl = p ? `ws://127.0.0.1:${p}/ws` : null;
+  const shownError = error ?? host.error;
+
+  return (
+    <div className="space-y-3 border-t border-zinc-200 pt-5 dark:border-zinc-800">
+      <div>
+        <h3 className="text-sm font-semibold">Host a relay</h3>
+        <p className="mt-1 text-xs text-zinc-500">
+          Run the relay inside this app so your phone and friends can join. It stops when Multichat closes and starts again the next
+          time you open it.
+        </p>
+      </div>
+      <div className="flex flex-wrap items-end gap-2">
+        <label className="block w-28">
+          <span className="mb-1 block text-xs font-medium text-zinc-700 dark:text-zinc-300">Port</span>
+          <input
+            className={inputCls}
+            value={port}
+            inputMode="numeric"
+            onChange={(e) => setPort(e.target.value.replace(/\D/g, "").slice(0, 5))}
+          />
+        </label>
+        {host.running ? (
+          <>
+            <Button variant="outline" disabled={busy || !portOk} onClick={() => run(() => backend.hostStart(portNum))}>
+              <Icon name="refresh" size={14} /> Restart
+            </Button>
+            <Button variant="outline" disabled={busy} onClick={() => run(backend.hostStop)}>
+              Stop
+            </Button>
+          </>
+        ) : (
+          <Button disabled={busy || !portOk} onClick={() => run(() => backend.hostStart(portNum))}>
+            Start hosting
+          </Button>
+        )}
+        <span className="flex items-center gap-1.5 pb-2 text-xs text-zinc-500">
+          <span className={`inline-block h-1.5 w-1.5 rounded-full ${host.running ? "bg-emerald-500" : "bg-zinc-400"}`} />
+          {host.running ? `Running on port ${p}` : "Not hosting"}
+        </span>
+      </div>
+      {shownError && <p className="text-sm text-red-600 dark:text-red-400">{shownError}</p>}
+      {host.running && localUrl && (
+        <div className="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+          <CopyRow
+            label="This computer"
+            value={localUrl}
+            action={
+              serverUrl !== localUrl && (
+                <Button variant="outline" className="!px-2 !py-0.5 text-xs" onClick={() => onUse(localUrl)}>
+                  Use
+                </Button>
+              )
+            }
+          />
+          {host.lan_ip && <CopyRow label="Same Wi-Fi" value={`ws://${host.lan_ip}:${p}/ws`} />}
+          {host.tailscale_ip && <CopyRow label="Tailscale" value={`ws://${host.tailscale_ip}:${p}/ws`} />}
+          <p className="text-xs text-zinc-500">
+            Give phones and friends the Wi-Fi address. Phones only accept plain <code>ws://</code> on the local network: over
+            Tailscale, run <code>tailscale serve --bg {p}</code> once and use <code>wss://&lt;this computer&gt;.&lt;tailnet&gt;.ts.net/ws</code>{" "}
+            on the phone (the Tailscale address above works for desktops). If Windows asks, allow Multichat on private networks.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function GeneralPanel() {
   const client = useChat((s) => s.client)!;
   const saveIdentity = useChat((s) => s.saveIdentity);
@@ -801,6 +933,19 @@ function GeneralPanel() {
           </div>
         </div>
       </div>
+
+      <HostSection
+        serverUrl={client.server_url}
+        onUse={async (u) => {
+          setUrl(u);
+          try {
+            await saveIdentity(name, u);
+            setMsg({ ok: true, text: "Saved" });
+          } catch (e) {
+            setMsg({ ok: false, text: errorText(e) });
+          }
+        }}
+      />
 
       <div className="space-y-3 border-t border-zinc-200 pt-5 dark:border-zinc-800">
         <h3 className="text-sm font-semibold">Appearance</h3>

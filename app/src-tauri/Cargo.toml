@@ -32,6 +32,9 @@ tauri-plugin-websocket = "2"
 # on mobile only the Streamable HTTP transport is compiled in.
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 rmcp = { version = "3.8", default-features = false, features = ["transport-child-process"] }
+# The desktop app can host the relay for friends (Settings > General); phones can't
+# keep a server running in the background, so it isn't compiled in there.
+multichat-relay = { path = "../../server" }
 
 [profile.release]
 codegen-units = 1

@@ -12,7 +12,8 @@ export type ConnStatus = "connecting" | "online" | "offline";
 
 interface Handlers {
   onMessage: (msg: ServerMsg) => void;
-  onStatus: (status: ConnStatus) => void;
+  /** `error` says why the last connection attempt failed, while offline. */
+  onStatus: (status: ConnStatus, error?: string) => void;
 }
 
 /** A silent connection (e.g. after a phone sleeps or switches networks) is detected
@@ -44,6 +45,39 @@ async function sendWhenRegistered(ws: WebSocket, frame: Parameters<WebSocket["se
   }
 }
 
+/** Closes a connection, retrying briefly if its writer isn't registered yet (a close
+ *  sent too early fails with "connection not found" and would leave the socket open). */
+async function closeWhenRegistered(ws: WebSocket) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await ws.disconnect();
+      return;
+    } catch (e) {
+      if (attempt >= REGISTER_RETRIES || !String(e).toLowerCase().includes(NOT_REGISTERED)) return;
+      await new Promise((r) => setTimeout(r, REGISTER_RETRY_MS));
+    }
+  }
+}
+
+/** A short, human reason for a failed connection attempt. */
+function connectError(url: string, e: unknown): string {
+  let host = url;
+  try {
+    host = new URL(url).host;
+  } catch {
+    /* keep the raw URL */
+  }
+  const raw = String(e instanceof Error ? e.message : e).toLowerCase();
+  if (raw.includes("refused") || raw.includes("10061") || raw.includes("os error 61") || raw.includes("os error 111"))
+    return `Nothing is listening at ${host}. Is the relay running?`;
+  if (raw.includes("timed out") || raw.includes("timeout") || raw.includes("10060"))
+    return `${host} didn't answer. Check the address and that both devices are on the same network.`;
+  if (raw.includes("dns") || raw.includes("resolve") || raw.includes("lookup") || raw.includes("11001"))
+    return `Couldn't find ${host}. Check the address.`;
+  if (raw.includes("certificate") || raw.includes("tls")) return `Secure connection to ${host} failed (TLS).`;
+  return `Can't reach ${host}: ${String(e instanceof Error ? e.message : e)}`;
+}
+
 export class Relay {
   private ws: WebSocket | null = null;
   private generation = 0;
@@ -70,12 +104,15 @@ export class Relay {
     let ws: WebSocket;
     try {
       ws = await WebSocket.connect(this.url, { maxMessageSize: 64 << 20 });
-    } catch {
-      if (gen === this.generation) this.scheduleReconnect();
+    } catch (e) {
+      if (gen === this.generation && !this.closed) {
+        this.handlers.onStatus("offline", connectError(this.url, e));
+        this.scheduleReconnect();
+      }
       return;
     }
     if (this.closed || gen !== this.generation) {
-      void ws.disconnect().catch(() => {});
+      void closeWhenRegistered(ws);
       return;
     }
     this.ws = ws;
@@ -128,7 +165,7 @@ export class Relay {
     this.ws = null;
     this.generation++;
     window.clearInterval(this.pingTimer);
-    void ws.disconnect().catch(() => {});
+    void closeWhenRegistered(ws);
     this.handlers.onStatus("offline");
     this.scheduleReconnect();
   }
@@ -138,6 +175,19 @@ export class Relay {
     const delay = Math.min(10_000, 500 * 2 ** this.retry++);
     window.clearTimeout(this.timer);
     this.timer = window.setTimeout(() => void this.connect(), delay);
+  }
+
+  /** Drops the current connection (if any) and connects again right away. */
+  reconnectNow() {
+    if (this.closed) return;
+    this.generation++;
+    window.clearTimeout(this.timer);
+    window.clearInterval(this.pingTimer);
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) void closeWhenRegistered(ws);
+    this.retry = 0;
+    void this.connect();
   }
 
   get isOpen() {
@@ -183,6 +233,6 @@ export class Relay {
     window.clearInterval(this.pingTimer);
     const ws = this.ws;
     this.ws = null;
-    void ws?.disconnect().catch(() => {});
+    if (ws) void closeWhenRegistered(ws);
   }
 }

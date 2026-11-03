@@ -4,6 +4,7 @@
 mod config;
 mod context;
 mod generate;
+mod host;
 mod mcp;
 mod net;
 mod providers;
@@ -33,6 +34,7 @@ struct AppState {
     generations: Mutex<HashMap<String, oneshot::Sender<()>>>,
     approvals: Approvals,
     mcp: Arc<McpManager>,
+    host: Arc<host::Host>,
 }
 
 impl AppState {
@@ -473,6 +475,33 @@ fn stop_generation(state: State<'_, AppState>, id: String) -> Result<(), String>
     Ok(())
 }
 
+#[tauri::command]
+async fn host_status(state: State<'_, AppState>) -> Result<host::HostStatus, String> {
+    let saved = state.snapshot()?.host_relay_port;
+    Ok(state.host.status(saved).await)
+}
+
+/// Hosts the relay on `port` (restarting it if it already runs) and remembers it,
+/// so hosting resumes on the next launch.
+#[tauri::command]
+async fn host_start(state: State<'_, AppState>, port: u16) -> Result<host::HostStatus, String> {
+    if port < 1024 {
+        return Err("Use a port from 1024 to 65535.".into());
+    }
+    state.host.start(port).await?;
+    state.update(|c| c.host_relay_port = Some(port))?;
+    Ok(state.host.status(Some(port)).await)
+}
+
+#[tauri::command]
+async fn host_stop(state: State<'_, AppState>) -> Result<host::HostStatus, String> {
+    // Save first: if saving fails the relay keeps running, matching what the next
+    // launch would do.
+    state.update(|c| c.host_relay_port = None)?;
+    state.host.stop().await;
+    Ok(state.host.status(None).await)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -482,6 +511,14 @@ pub fn run() {
             let base = app.path().app_config_dir()?;
             let config_path = config::config_path(&base);
             let config = config::load(&config_path);
+            let host = Arc::new(host::Host::new(config_path.with_file_name("relay.db")));
+            if let Some(port) = config.host_relay_port {
+                let host = host.clone();
+                // A failure (say, the port is taken) shows up in Settings.
+                tauri::async_runtime::spawn(async move {
+                    let _ = host.start(port).await;
+                });
+            }
             let http = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .read_timeout(Duration::from_secs(180))
@@ -503,6 +540,7 @@ pub fn run() {
                 generations: Mutex::new(HashMap::new()),
                 approvals: Arc::new(Mutex::new(HashMap::new())),
                 mcp: Arc::new(McpManager::default()),
+                host,
             });
             Ok(())
         })
@@ -521,6 +559,9 @@ pub fn run() {
             resolve_tool_call,
             generate,
             stop_generation,
+            host_status,
+            host_start,
+            host_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
