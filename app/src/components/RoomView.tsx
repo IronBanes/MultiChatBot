@@ -187,6 +187,7 @@ const MessageItem = memo(function MessageItem({
   compact,
   myProfileId,
   mine,
+  bubbles,
 }: {
   m: Message;
   anchor: Message | undefined;
@@ -194,6 +195,8 @@ const MessageItem = memo(function MessageItem({
   compact: boolean;
   myProfileId: string | null;
   mine: boolean;
+  /** Phone layout: chat bubbles, yours on the right. */
+  bubbles: boolean;
 }) {
   const regenerate = useChat((s) => s.regenerate);
   const stopAi = useChat((s) => s.stopAi);
@@ -201,6 +204,37 @@ const MessageItem = memo(function MessageItem({
   const generating = useChat((s) => !!s.myGenerations[m.id]);
   const localTools = useChat((s) => s.localTools[m.id]);
   const [copied, setCopied] = useState(false);
+
+  if (m.kind === "human" && bubbles) {
+    return (
+      <div className={`flex gap-2 px-3 ${mine ? "justify-end" : ""} ${compact ? "pt-0.5" : "pt-3"}`}>
+        {!mine && <div className="w-7 shrink-0">{!compact && <Avatar userId={m.author_id} name={m.author_name} size={28} />}</div>}
+        <div className={`flex min-w-0 max-w-[80%] flex-col ${mine ? "items-end" : "items-start"}`}>
+          {!compact && (
+            <div className="mb-0.5 flex items-baseline gap-1.5 px-1 text-xs">
+              {!mine && (
+                <span className="truncate font-medium" style={{ color: memberColor(m.author_id) }}>
+                  {m.author_name}
+                </span>
+              )}
+              <span className="shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
+            </div>
+          )}
+          <div
+            className={`rounded-[20px] px-3.5 py-2 text-[16px] leading-snug break-words ${
+              mine
+                ? "md-on-accent rounded-br-md bg-indigo-600 text-white"
+                : "rounded-bl-md bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100"
+            }`}
+          >
+            <Markdown text={m.content} />
+          </div>
+          {/* Only on your own: on everyone else's it would repeat under every message. */}
+          {mine && !m.ai_requested && <span className="mt-0.5 px-1 text-[11px] text-zinc-400">no AI reply</span>}
+        </div>
+      </div>
+    );
+  }
 
   if (m.kind === "human") {
     return (
@@ -236,6 +270,94 @@ const MessageItem = memo(function MessageItem({
 
   const streaming = m.status === "streaming";
   const waitingOnTools = m.tools.some((t) => t.status === "awaiting_approval" || t.status === "running");
+
+  const body = (
+    <>
+      {m.reasoning && <Reasoning text={m.reasoning} live={streaming && !m.content && !waitingOnTools} />}
+      {m.tools.length > 0 && (
+        <div className="mb-2 flex flex-col items-start gap-1.5">
+          {m.tools.map((t) => (
+            <ToolCall
+              key={t.call_id}
+              t={t}
+              local={mine ? localTools?.[t.call_id] : undefined}
+              onAnswer={(ok) => answerToolCall(m.id, t.call_id, ok)}
+            />
+          ))}
+        </div>
+      )}
+      {m.attachments.length > 0 && <Gallery attachments={m.attachments} />}
+      {m.content ? (
+        <Markdown text={m.content} />
+      ) : streaming && !m.reasoning && m.tools.length === 0 && m.attachments.length === 0 ? (
+        <span className="text-sm text-zinc-400">Thinking…</span>
+      ) : null}
+      {streaming && m.content && <span className="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-indigo-500 align-middle" />}
+      {m.status === "error" && (
+        <div className="mt-1 rounded-lg bg-red-50 px-2.5 py-1.5 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
+          Reply failed: {m.error || "unknown error"}
+        </div>
+      )}
+      {m.status === "interrupted" && (
+        <div className="mt-1 rounded-lg bg-amber-50 px-2.5 py-1.5 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+          Interrupted — {m.author_name} disconnected before the reply finished.
+        </div>
+      )}
+    </>
+  );
+
+  const actionCls = bubbles
+    ? "flex h-8 items-center gap-1 rounded-full px-2 text-[11px] active:bg-zinc-100 dark:active:bg-zinc-800"
+    : "flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800";
+  const actions = (
+    <>
+      {mine && generating && (
+        <button onClick={() => stopAi(m.id)} className={actionCls}>
+          <Icon name="stop" size={12} /> Stop
+        </button>
+      )}
+      {!streaming && m.content && (
+        <button onClick={copy} className={actionCls}>
+          <Icon name="copy" size={12} /> {copied ? "Copied" : "Copy"}
+        </button>
+      )}
+      {!streaming && myProfileId && anchor && (
+        <button onClick={() => regenerate(m, myProfileId)} className={actionCls}>
+          <Icon name="refresh" size={12} /> {bubbles ? "Regenerate" : "Regenerate with my profile"}
+        </button>
+      )}
+    </>
+  );
+
+  if (bubbles) {
+    return (
+      <div className="flex gap-2 px-3 pt-3">
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white">
+          <Icon name="sparkle" size={14} />
+        </div>
+        <div className="flex min-w-0 max-w-[88%] flex-col items-start">
+          <div className="mb-0.5 flex max-w-full items-baseline gap-1 px-1 text-xs text-zinc-500">
+            <span className="shrink-0 font-semibold text-zinc-700 dark:text-zinc-300">AI</span>
+            <span className="shrink-0">for</span>
+            <span className="truncate font-medium" style={{ color: memberColor(m.author_id) }}>
+              {m.author_name}
+            </span>
+            <span className="ml-1 shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
+          </div>
+          {showAnchor && anchor && (
+            <div className="mb-1 max-w-full truncate px-1 text-xs text-zinc-500">
+              ↪ <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>: “{snippet(anchor.content, 50)}”
+            </div>
+          )}
+          <div className="max-w-full rounded-[20px] rounded-bl-md bg-indigo-50 px-3.5 py-2 text-[16px] leading-snug break-words text-zinc-900 dark:bg-indigo-950/60 dark:text-zinc-100">
+            {body}
+          </div>
+          <div className="mt-0.5 flex flex-wrap text-xs text-zinc-500">{actions}</div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="group flex gap-3 px-4 pt-3 sm:px-5">
       <div
@@ -268,99 +390,75 @@ const MessageItem = memo(function MessageItem({
           </div>
         )}
         <div className="mt-1 rounded-xl rounded-tl-sm border border-zinc-200 bg-white px-3.5 py-2.5 text-[15px] leading-relaxed break-words shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
-          {m.reasoning && <Reasoning text={m.reasoning} live={streaming && !m.content && !waitingOnTools} />}
-          {m.tools.length > 0 && (
-            <div className="mb-2 flex flex-col items-start gap-1.5">
-              {m.tools.map((t) => (
-                <ToolCall
-                  key={t.call_id}
-                  t={t}
-                  local={mine ? localTools?.[t.call_id] : undefined}
-                  onAnswer={(ok) => answerToolCall(m.id, t.call_id, ok)}
-                />
-              ))}
-            </div>
-          )}
-          {m.attachments.length > 0 && <Gallery attachments={m.attachments} />}
-          {m.content ? (
-            <Markdown text={m.content} />
-          ) : streaming && !m.reasoning && m.tools.length === 0 && m.attachments.length === 0 ? (
-            <span className="text-sm text-zinc-400">Thinking…</span>
-          ) : null}
-          {streaming && m.content && <span className="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-indigo-500 align-middle" />}
-          {m.status === "error" && (
-            <div className="mt-1 rounded-lg bg-red-50 px-2.5 py-1.5 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
-              Reply failed: {m.error || "unknown error"}
-            </div>
-          )}
-          {m.status === "interrupted" && (
-            <div className="mt-1 rounded-lg bg-amber-50 px-2.5 py-1.5 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
-              Interrupted — {m.author_name} disconnected before the reply finished.
-            </div>
-          )}
+          {body}
         </div>
         <div className="mt-1 flex h-6 flex-wrap gap-1 text-xs text-zinc-500 opacity-0 transition group-hover:opacity-100 [@media(hover:none)]:opacity-100 focus-within:opacity-100">
-          {mine && generating && (
-            <button onClick={() => stopAi(m.id)} className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
-              <Icon name="stop" size={12} /> Stop
-            </button>
-          )}
-          {!streaming && m.content && (
-            <button onClick={copy} className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
-              <Icon name="copy" size={12} /> {copied ? "Copied" : "Copy"}
-            </button>
-          )}
-          {!streaming && myProfileId && anchor && (
-            <button
-              onClick={() => regenerate(m, myProfileId)}
-              className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-            >
-              <Icon name="refresh" size={12} /> Regenerate with my profile
-            </button>
-          )}
+          {actions}
         </div>
       </div>
     </div>
   );
 });
 
-function MessageList({ room, myProfileId }: { room: RoomInfo; myProfileId: string | null }) {
+function MessageList({ room, myProfileId, bubbles }: { room: RoomInfo; myProfileId: string | null; bubbles: boolean }) {
   const messages = useChat((s) => s.messages[room.id]);
   const loaded = useChat((s) => !!s.loaded[room.id]);
   const myId = useChat((s) => s.client!.user_id);
   const ref = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
+  /** Distance from the bottom of the list, kept when the list is resized (window, or an
+   *  on-screen keyboard opening) so the same messages stay in view. */
+  const fromBottom = useRef(0);
   const byId = useMemo(() => new Map((messages ?? []).map((m) => [m.id, m])), [messages]);
 
   useLayoutEffect(() => {
     stick.current = true;
+    fromBottom.current = 0;
   }, [room.id]);
 
   useLayoutEffect(() => {
     const el = ref.current;
-    if (el && stick.current) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    if (stick.current) el.scrollTop = el.scrollHeight;
+    else fromBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight;
   }, [messages, room.id]);
 
-  // Keep the newest message in view when the window is resized.
+  // On resize (window, or the keyboard opening), keep the newest message in view, or
+  // wherever the user had scrolled to, measured from the bottom. Content that grows
+  // after rendering (highlighted code, images) is watched too, so a room opened at its
+  // newest message stays there.
   useEffect(() => {
     const el = ref.current;
     if (!el) return;
     const ro = new ResizeObserver(() => {
-      if (stick.current) el.scrollTop = el.scrollHeight;
+      el.scrollTop = stick.current ? el.scrollHeight : el.scrollHeight - el.clientHeight - fromBottom.current;
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    // Growing content only matters at the bottom; scrolled up, what you're reading stays put.
+    const grow = new ResizeObserver(() => {
+      if (stick.current) el.scrollTop = el.scrollHeight;
+    });
+    if (content.current) grow.observe(content.current);
+    return () => {
+      ro.disconnect();
+      grow.disconnect();
+    };
   }, []);
 
   const onScroll = () => {
     const el = ref.current;
-    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    if (!el) return;
+    fromBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stick.current = fromBottom.current < 80;
   };
 
   const list = messages ?? [];
   return (
-    <div ref={ref} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto pb-4">
-      <div className="mx-auto max-w-4xl">
+    <div ref={ref} onScroll={onScroll} className={`min-h-0 flex-1 overflow-y-auto ${bubbles ? "overscroll-contain pb-2" : "pb-4"}`}>
+      {/* Phones keep the newest message at the bottom, so a short chat starts there and
+          older messages move up as new ones arrive. */}
+      <div ref={content} className={`mx-auto max-w-4xl ${bubbles ? "flex min-h-full flex-col justify-end" : ""}`}>
         {!loaded && list.length === 0 && <div className="p-8 text-center text-sm text-zinc-400">Loading history…</div>}
         {loaded && list.length === 0 && (
           <div className="mx-auto mt-16 max-w-sm px-6 text-center">
@@ -386,6 +484,7 @@ function MessageList({ room, myProfileId }: { room: RoomInfo; myProfileId: strin
               compact={compact}
               myProfileId={myProfileId}
               mine={m.author_id === myId}
+              bubbles={bubbles}
             />
           );
         })}
@@ -394,11 +493,30 @@ function MessageList({ room, myProfileId }: { room: RoomInfo; myProfileId: strin
   );
 }
 
+/** The Off / Ask / Auto switch for each MCP server, in this room. */
+function ToolsList({ room }: { room: RoomInfo }) {
+  const servers = useChat((s) => s.client!.mcp_servers);
+  const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
+  const setRoomMcpMode = useChat((s) => s.setRoomMcpMode);
+  if (servers.length === 0) return <p className="py-2 text-sm text-zinc-500">No MCP servers yet. Add one to let the AI use tools.</p>;
+  return (
+    <div className="space-y-2">
+      {servers.map((s) => (
+        <div key={s.id} className="flex items-center justify-between gap-2">
+          <span className="min-w-0 truncate text-sm" title={s.name}>
+            {s.name}
+          </span>
+          <Segmented size="sm" value={modes?.[s.id] ?? s.default_mode} onChange={(mode) => setRoomMcpMode(room.id, s.id, mode)} options={MODE_OPTIONS} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** Per-chat MCP switches: Off / Ask / Auto for each server the user added. */
 function ToolsMenu({ room, onOpenSettings }: { room: RoomInfo; onOpenSettings: (tab: SettingsTab) => void }) {
   const servers = useChat((s) => s.client!.mcp_servers);
   const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
-  const setRoomMcpMode = useChat((s) => s.setRoomMcpMode);
   const [open, setOpen] = useState(false);
   const box = useRef<HTMLDivElement>(null);
 
@@ -440,25 +558,7 @@ function ToolsMenu({ room, onOpenSettings }: { room: RoomInfo; onOpenSettings: (
             <span className="text-sm font-semibold">Tools in #{room.name}</span>
             <span className="text-[11px] text-zinc-500">for your replies</span>
           </div>
-          {servers.length === 0 ? (
-            <p className="py-2 text-sm text-zinc-500">No MCP servers yet. Add one to let the AI use tools.</p>
-          ) : (
-            <div className="space-y-2">
-              {servers.map((s) => (
-                <div key={s.id} className="flex items-center justify-between gap-2">
-                  <span className="min-w-0 truncate text-sm" title={s.name}>
-                    {s.name}
-                  </span>
-                  <Segmented
-                    size="sm"
-                    value={modeOf(s.id, s.default_mode)}
-                    onChange={(mode) => setRoomMcpMode(room.id, s.id, mode)}
-                    options={MODE_OPTIONS}
-                  />
-                </div>
-              ))}
-            </div>
-          )}
+          <ToolsList room={room} />
           <p className="mt-3 text-[11px] leading-snug text-zinc-500">
             <b>Ask</b> shows you each tool call to approve. <b>Auto</b> runs them without asking. Others in the room only see which tool ran.
           </p>
@@ -477,14 +577,98 @@ function ToolsMenu({ room, onOpenSettings }: { room: RoomInfo; onOpenSettings: (
   );
 }
 
+/** Phones: everything that sits beside the message box on desktop, in a bottom sheet. */
+function ComposerSheet({
+  room,
+  profileId,
+  aiOn,
+  setAiOn,
+  onOpenSettings,
+  onClose,
+}: {
+  room: RoomInfo;
+  profileId: string | null;
+  aiOn: boolean;
+  setAiOn: (on: boolean) => void;
+  onOpenSettings: (tab: SettingsTab) => void;
+  onClose: () => void;
+}) {
+  const profiles = useChat((s) => s.client!.profiles);
+  const chooseProfile = useChat((s) => s.chooseProfile);
+  const settings = (tab: SettingsTab) => {
+    onClose();
+    onOpenSettings(tab);
+  };
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={onClose}>
+      <div
+        className="max-h-[85%] animate-[sheet-up_180ms_ease-out] overflow-y-auto rounded-t-3xl bg-white px-4 pt-2 pb-[max(1rem,env(safe-area-inset-bottom))] dark:bg-zinc-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mx-auto mb-3 h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-700" />
+        <div className="flex items-center justify-between py-2">
+          <div>
+            <div className="font-semibold">AI reply</div>
+            <div className="text-xs text-zinc-500">Your next message gets an answer from your AI</div>
+          </div>
+          <Segmented
+            value={aiOn ? "on" : "off"}
+            onChange={(v) => setAiOn(v === "on")}
+            options={[
+              { value: "on", label: "On" },
+              { value: "off", label: "Off" },
+            ]}
+          />
+        </div>
+        <div className="mt-3 mb-1 text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Answer with</div>
+        {profiles.length === 0 ? (
+          <button onClick={() => settings("profiles")} className="py-2 text-sm font-medium text-indigo-600 dark:text-indigo-400">
+            Add an AI profile
+          </button>
+        ) : (
+          <div className="overflow-hidden rounded-2xl border border-zinc-200 dark:border-zinc-800">
+            {profiles.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => chooseProfile(room.id, p.id)}
+                disabled={!aiOn}
+                className="flex min-h-12 w-full items-center gap-3 border-b border-zinc-100 px-3 py-2 text-left last:border-b-0 disabled:opacity-50 active:bg-zinc-50 dark:border-zinc-800 dark:active:bg-zinc-800"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[15px] font-medium">{p.label}</span>
+                  <span className="block truncate font-mono text-xs text-zinc-500">{p.model}</span>
+                </span>
+                {p.id === profileId && <Icon name="check" size={18} className="shrink-0 text-indigo-600 dark:text-indigo-400" />}
+              </button>
+            ))}
+          </div>
+        )}
+        <div className="mt-4 mb-1 flex items-baseline justify-between">
+          <span className="text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Tools in #{room.name}</span>
+          <button onClick={() => settings("mcp")} className="text-xs font-medium text-indigo-600 dark:text-indigo-400">
+            Manage
+          </button>
+        </div>
+        <ToolsList room={room} />
+        <Button variant="outline" className="mt-5 w-full !py-3" onClick={onClose}>
+          Done
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function Composer({
   room,
   profileId,
   onOpenSettings,
+  phone,
 }: {
   room: RoomInfo;
   profileId: string | null;
   onOpenSettings: (tab: SettingsTab) => void;
+  /** Phone layout: a pill message box with the options in a sheet. */
+  phone: boolean;
 }) {
   const profiles = useChat((s) => s.client!.profiles);
   const platform = useChat((s) => s.client!.platform);
@@ -493,19 +677,23 @@ function Composer({
   const chooseProfile = useChat((s) => s.chooseProfile);
   const [text, setText] = useState("");
   const [aiOn, setAiOn] = useState(true);
+  const [sheet, setSheet] = useState(false);
+  const servers = useChat((s) => s.client!.mcp_servers);
+  const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
   const ta = useRef<HTMLTextAreaElement>(null);
   const ai = aiOn && !!profileId;
 
+  // On phones, focusing would pop the keyboard up as soon as a room opens.
   useEffect(() => {
-    ta.current?.focus();
-  }, [room.id]);
+    if (!phone) ta.current?.focus();
+  }, [room.id, phone]);
 
   useLayoutEffect(() => {
     const el = ta.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = Math.min(el.scrollHeight, 220) + "px";
-  }, [text]);
+    el.style.height = Math.min(el.scrollHeight, phone ? 140 : 220) + "px";
+  }, [text, phone]);
 
   const sending = useRef(false);
   const send = async () => {
@@ -522,6 +710,61 @@ function Composer({
       sending.current = false;
     }
   };
+
+  if (phone) {
+    const profile = profiles.find((p) => p.id === profileId);
+    const toolsOn = servers.filter((s) => (modes?.[s.id] ?? s.default_mode) !== "off").length;
+    return (
+      <div className="safe-bottom border-t border-zinc-200 px-2 pt-1.5 pb-[max(0.5rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
+        <button
+          onClick={() => (profiles.length ? setSheet(true) : onOpenSettings("profiles"))}
+          className="mb-1 flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-xs text-zinc-500 active:bg-zinc-100 dark:active:bg-zinc-800"
+        >
+          <Icon name="sparkle" size={13} className={ai ? "text-indigo-600 dark:text-indigo-400" : ""} />
+          <span className="truncate">
+            {!profiles.length ? "Add an AI profile to get replies" : ai ? `AI reply · ${profile?.label ?? ""}` : "AI reply off"}
+            {toolsOn > 0 && ` · ${toolsOn} tool${toolsOn === 1 ? "" : "s"}`}
+          </span>
+          <Icon name="chevron" size={12} className="shrink-0 -rotate-90" />
+        </button>
+        <div className="flex items-end gap-1.5">
+          <button
+            onClick={() => setSheet(true)}
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-zinc-100 text-zinc-600 active:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:active:bg-zinc-700"
+            aria-label="Reply options"
+          >
+            <Icon name="plus" size={20} />
+          </button>
+          <textarea
+            ref={ta}
+            rows={1}
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            placeholder={ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
+            className="block min-h-10 min-w-0 flex-1 resize-none rounded-[20px] border border-zinc-300 bg-white px-4 py-2 text-[16px] leading-snug outline-none placeholder:text-zinc-400 focus:border-indigo-500 dark:border-zinc-700 dark:bg-zinc-900"
+          />
+          <button
+            onClick={send}
+            disabled={!text.trim() || status !== "online"}
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-white transition active:bg-indigo-500 disabled:bg-zinc-200 disabled:text-zinc-400 dark:disabled:bg-zinc-800 dark:disabled:text-zinc-600"
+            aria-label="Send"
+          >
+            <Icon name="send" size={18} className="-rotate-90" />
+          </button>
+        </div>
+        {sheet && (
+          <ComposerSheet
+            room={room}
+            profileId={profileId}
+            aiOn={aiOn}
+            setAiOn={setAiOn}
+            onOpenSettings={onOpenSettings}
+            onClose={() => setSheet(false)}
+          />
+        )}
+      </div>
+    );
+  }
 
   return (
     <div className="border-t border-zinc-200 px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-4 sm:pb-[max(1rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
@@ -676,24 +919,110 @@ function RoomPromptDialog({ room, onClose }: { room: RoomInfo; onClose: () => vo
 /** Below this width the member list becomes a slide-over instead of a column. */
 const MEMBERS_INLINE_MIN = 1100;
 
+/** Phones: room actions that sit in the header on desktop. */
+function RoomMenu({
+  room,
+  onInstructions,
+  onLeave,
+  onClose,
+}: {
+  room: RoomInfo;
+  onInstructions: () => void;
+  onLeave: () => void;
+  onClose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const copyCode = async () => {
+    try {
+      await navigator.clipboard.writeText(room.invite_code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch {
+      /* clipboard unavailable */
+    }
+  };
+  const row = "flex min-h-12 w-full items-center gap-3 px-4 text-left text-[15px] active:bg-zinc-100 dark:active:bg-zinc-800";
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={onClose}>
+      <div
+        className="animate-[sheet-up_180ms_ease-out] rounded-t-3xl bg-white pt-2 pb-[max(1rem,env(safe-area-inset-bottom))] dark:bg-zinc-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mx-auto mb-2 h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-700" />
+        <button onClick={copyCode} className={row}>
+          <Icon name="copy" size={18} className="text-zinc-500" />
+          <span className="flex-1">Invite code</span>
+          <span className="font-mono text-sm tracking-widest text-zinc-500">{copied ? "Copied" : room.invite_code}</span>
+        </button>
+        <button onClick={onInstructions} className={row}>
+          <Icon name="note" size={18} className="text-zinc-500" />
+          <span className="min-w-0 flex-1">
+            <span className="block">Room instructions</span>
+            <span className="block truncate text-xs text-zinc-500">{room.system_prompt ? snippet(room.system_prompt, 60) : "None yet"}</span>
+          </span>
+        </button>
+        <button onClick={onLeave} className={`${row} text-red-600 dark:text-red-400`}>
+          <Icon name="door" size={18} />
+          <span className="flex-1">Leave room</span>
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Swipe right from the left edge to go back, following the finger. */
+function useSwipeBack(onBack: (() => void) | undefined) {
+  const [dx, setDx] = useState(0);
+  const start = useRef<{ x: number; y: number } | null>(null);
+  if (!onBack) return { dx: 0, handlers: {} };
+  return {
+    dx,
+    handlers: {
+      onTouchStart: (e: React.TouchEvent) => {
+        const t = e.touches[0];
+        start.current = t.clientX < 28 ? { x: t.clientX, y: t.clientY } : null;
+      },
+      onTouchMove: (e: React.TouchEvent) => {
+        if (!start.current) return;
+        const t = e.touches[0];
+        const x = t.clientX - start.current.x;
+        // A mostly vertical drag is a scroll, not a swipe.
+        if (dx === 0 && Math.abs(t.clientY - start.current.y) > Math.abs(x)) {
+          start.current = null;
+          return;
+        }
+        setDx(Math.max(0, x));
+      },
+      onTouchEnd: () => {
+        if (start.current && dx > 90) onBack();
+        start.current = null;
+        setDx(0);
+      },
+    },
+  };
+}
+
 export function RoomView({
   room,
   onOpenSettings,
-  onOpenNav,
+  onBack,
 }: {
   room: RoomInfo;
   onOpenSettings: (tab: SettingsTab) => void;
-  /** Set when the sidebar is collapsed into a drawer. */
-  onOpenNav?: () => void;
+  /** Set on phones, where the room is its own screen over the room list. */
+  onBack?: () => void;
 }) {
   const client = useChat((s) => s.client!);
   const leaveRoom = useChat((s) => s.leaveRoom);
   const width = useWidth();
-  const inlineMembers = width >= MEMBERS_INLINE_MIN;
+  const phone = !!onBack;
+  const inlineMembers = !phone && width >= MEMBERS_INLINE_MIN;
   const [membersPref, setMembersPref] = useState(true);
   const [membersOverlay, setMembersOverlay] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  const swipe = useSwipeBack(onBack);
 
   const remembered = client.last_profile_by_room[room.id];
   const profileId = client.profiles.some((p) => p.id === remembered) ? remembered : (client.profiles[0]?.id ?? null);
@@ -709,59 +1038,97 @@ export function RoomView({
     }
   };
 
+  const leave = async () => {
+    setMenuOpen(false);
+    if (await confirmAction("Leave room", `Leave #${room.name}? You can rejoin with its invite code.`, "Leave")) {
+      leaveRoom(room.id);
+      onBack?.();
+    }
+  };
+
+  const header = phone ? (
+    <header className="flex items-center gap-1 border-b border-zinc-200 px-1 pb-1.5 pt-[calc(env(safe-area-inset-top)+0.25rem)] dark:border-zinc-800">
+      <button
+        onClick={onBack}
+        className="flex h-11 items-center gap-0.5 rounded-full pr-2 pl-1 text-indigo-600 active:bg-zinc-100 dark:text-indigo-400 dark:active:bg-zinc-800"
+        aria-label="Back to rooms"
+      >
+        <Icon name="chevron" size={24} className="rotate-180" />
+      </button>
+      <button onClick={() => setMembersOverlay(true)} className="min-w-0 flex-1 text-center">
+        <span className="block truncate text-[16px] font-semibold">#{room.name}</span>
+        <span className="block truncate text-xs text-zinc-500">
+          {online} online · {room.members.length} member{room.members.length === 1 ? "" : "s"}
+        </span>
+      </button>
+      <button
+        onClick={() => setMenuOpen(true)}
+        className="flex h-11 w-11 items-center justify-center rounded-full text-zinc-600 active:bg-zinc-100 dark:text-zinc-300 dark:active:bg-zinc-800"
+        aria-label="Room options"
+      >
+        <Icon name="dots" size={22} />
+      </button>
+    </header>
+  ) : (
+    <header className="flex items-center gap-1 border-b border-zinc-200 px-2 pb-2 pt-[calc(env(safe-area-inset-top)+0.5rem)] sm:gap-2 sm:px-4 dark:border-zinc-800">
+      <div className="min-w-0 flex-1 px-1">
+        <h1 className="truncate font-semibold"># {room.name}</h1>
+        <p className="truncate text-xs text-zinc-500">
+          {room.system_prompt ? `Room instructions: ${snippet(room.system_prompt, 90)}` : "No room instructions"}
+        </p>
+      </div>
+      <button
+        onClick={copyCode}
+        className="hidden shrink-0 rounded-lg border border-dashed border-zinc-300 px-2.5 py-1 font-mono text-xs tracking-widest hover:bg-zinc-100 min-[560px]:block dark:border-zinc-700 dark:hover:bg-zinc-800"
+        title="Copy invite code"
+      >
+        {copied ? "COPIED" : room.invite_code}
+      </button>
+      <Button variant="ghost" className="!px-2" onClick={() => setPromptOpen(true)} title="Room instructions">
+        <Icon name="note" size={17} />
+      </Button>
+      <Button
+        variant="ghost"
+        className="!px-2"
+        onClick={() => (inlineMembers ? setMembersPref((v) => !v) : setMembersOverlay(true))}
+        title="Members"
+      >
+        <Icon name="users" size={17} />
+        {!inlineMembers && <span className="text-xs">{online}</span>}
+      </Button>
+      <Button variant="ghost" className="!px-2" title="Leave room" onClick={leave}>
+        <Icon name="door" size={17} />
+      </Button>
+    </header>
+  );
+
   return (
-    <div className="flex min-w-0 flex-1">
+    <div
+      className={`flex min-w-0 flex-1 bg-white dark:bg-zinc-950 ${phone ? "animate-[slide-in_200ms_ease-out]" : ""}`}
+      style={swipe.dx ? { transform: `translateX(${swipe.dx}px)` } : undefined}
+      {...swipe.handlers}
+    >
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex items-center gap-1 border-b border-zinc-200 px-2 pb-2 pt-[calc(env(safe-area-inset-top)+0.5rem)] sm:gap-2 sm:px-4 dark:border-zinc-800">
-          {onOpenNav && (
-            <button onClick={onOpenNav} className="rounded-lg p-2 text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800" aria-label="Rooms">
-              <Icon name="menu" />
-            </button>
-          )}
-          <div className="min-w-0 flex-1 px-1">
-            <h1 className="truncate font-semibold"># {room.name}</h1>
-            <p className="truncate text-xs text-zinc-500">
-              {room.system_prompt ? `Room instructions: ${snippet(room.system_prompt, 90)}` : "No room instructions"}
-            </p>
-          </div>
-          <button
-            onClick={copyCode}
-            className="hidden shrink-0 rounded-lg border border-dashed border-zinc-300 px-2.5 py-1 font-mono text-xs tracking-widest hover:bg-zinc-100 min-[560px]:block dark:border-zinc-700 dark:hover:bg-zinc-800"
-            title="Copy invite code"
-          >
-            {copied ? "COPIED" : room.invite_code}
-          </button>
-          <Button variant="ghost" className="!px-2" onClick={() => setPromptOpen(true)} title="Room instructions">
-            <Icon name="note" size={17} />
-          </Button>
-          <Button
-            variant="ghost"
-            className="!px-2"
-            onClick={() => (inlineMembers ? setMembersPref((v) => !v) : setMembersOverlay(true))}
-            title="Members"
-          >
-            <Icon name="users" size={17} />
-            {!inlineMembers && <span className="text-xs">{online}</span>}
-          </Button>
-          <Button
-            variant="ghost"
-            className="!px-2"
-            title="Leave room"
-            onClick={async () => {
-              if (await confirmAction("Leave room", `Leave #${room.name}? You can rejoin with its invite code.`, "Leave")) leaveRoom(room.id);
-            }}
-          >
-            <Icon name="door" size={17} />
-          </Button>
-        </header>
-        <MessageList room={room} myProfileId={profileId} />
+        {header}
+        <MessageList room={room} myProfileId={profileId} bubbles={phone} />
         {/* Keyed by room: each room gets a fresh draft, and a send that finishes after
             switching rooms can't edit the new room's text. */}
-        <Composer key={room.id} room={room} profileId={profileId} onOpenSettings={onOpenSettings} />
+        <Composer key={room.id} room={room} profileId={profileId} onOpenSettings={onOpenSettings} phone={phone} />
       </div>
       {inlineMembers && membersPref && <MemberList room={room} overlay={false} onClose={() => setMembersPref(false)} />}
       {!inlineMembers && membersOverlay && <MemberList room={room} overlay onClose={() => setMembersOverlay(false)} />}
       {promptOpen && <RoomPromptDialog room={room} onClose={() => setPromptOpen(false)} />}
+      {menuOpen && (
+        <RoomMenu
+          room={room}
+          onInstructions={() => {
+            setMenuOpen(false);
+            setPromptOpen(true);
+          }}
+          onLeave={leave}
+          onClose={() => setMenuOpen(false)}
+        />
+      )}
     </div>
   );
 }

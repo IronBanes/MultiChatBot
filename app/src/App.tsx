@@ -5,9 +5,10 @@ import { applyTheme } from "./theme";
 import { ConfirmHost } from "./components/Confirm";
 import { RoomView } from "./components/RoomView";
 import { SettingsDialog, type SettingsTab } from "./components/Settings";
+import { useKeyboardViewport } from "./lib/useKeyboardViewport";
 import { useWidth } from "./lib/useWidth";
-import { RoomDialog, Sidebar } from "./components/Sidebar";
-import { Button, Field, Icon, inputCls, Logo } from "./components/ui";
+import { PhoneRoomList, RoomDialog, Sidebar } from "./components/Sidebar";
+import { Button, Field, inputCls, Logo } from "./components/ui";
 
 function Onboarding() {
   const client = useChat((s) => s.client)!;
@@ -49,22 +50,13 @@ function Onboarding() {
   );
 }
 
-/** Below this width the sidebar collapses into a drawer. */
+/** Below this width the app switches to its phone layout. */
 const NAV_INLINE_MIN = 760;
 
-function EmptyState({ onOpenNav }: { onOpenNav?: () => void }) {
+function EmptyState() {
   const [dialog, setDialog] = useState<"create" | "join" | null>(null);
   return (
     <div className="relative flex flex-1 items-center justify-center p-8">
-      {onOpenNav && (
-        <button
-          onClick={onOpenNav}
-          className="absolute top-[calc(env(safe-area-inset-top)+0.5rem)] left-2 rounded-lg p-2 text-zinc-600 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-800"
-          aria-label="Rooms"
-        >
-          <Icon name="menu" />
-        </button>
-      )}
       <div className="max-w-sm text-center">
         <h2 className="text-lg font-semibold">No room selected</h2>
         <p className="mt-1 text-sm text-zinc-500">Create a room and share its invite code, or join one with a code from a friend.</p>
@@ -86,17 +78,18 @@ export default function App() {
   const room = useChat((s) => (s.activeRoomId ? s.rooms[s.activeRoomId] : undefined));
   const toasts = useChat((s) => s.toasts);
   const dismissToast = useChat((s) => s.dismissToast);
+  const closeRoom = useChat((s) => s.closeRoom);
   const [settings, setSettings] = useState<null | SettingsTab>(null);
   const [fatal, setFatal] = useState<string | null>(null);
   const width = useWidth();
-  // Narrow windows: the room list becomes a slide-over drawer.
+  // Narrow windows (phones): the room list and each room are separate screens.
   const compactNav = width < NAV_INLINE_MIN;
-  const [navOpen, setNavOpen] = useState(false);
-  const activeRoomId = room?.id;
+  useKeyboardViewport();
 
+  // Phones open on the room list rather than jumping into the first room.
   useEffect(() => {
-    setNavOpen(false);
-  }, [activeRoomId, compactNav]);
+    if (window.innerWidth < NAV_INLINE_MIN) closeRoom();
+  }, [closeRoom]);
 
   useEffect(() => {
     if (client) document.title = client.instance === "default" ? "Multichat" : `Multichat — ${client.instance}`;
@@ -111,28 +104,8 @@ export default function App() {
   if (!client) return null;
   if (!client.display_name) return <Onboarding />;
 
-  return (
-    <div className="flex h-full overflow-hidden pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
-      {!compactNav && <Sidebar onSettings={() => setSettings("general")} />}
-      {compactNav && navOpen && (
-        <div className="fixed inset-0 z-30 flex bg-black/30" onMouseDown={() => setNavOpen(false)}>
-          <div className="h-full bg-white pl-[env(safe-area-inset-left)] shadow-2xl dark:bg-zinc-950" onMouseDown={(e) => e.stopPropagation()}>
-            <Sidebar
-              onSettings={() => {
-                setNavOpen(false);
-                setSettings("general");
-              }}
-            />
-          </div>
-        </div>
-      )}
-      <main className="flex min-w-0 flex-1 bg-white dark:bg-zinc-950">
-        {room ? (
-          <RoomView room={room} onOpenSettings={setSettings} onOpenNav={compactNav ? () => setNavOpen(true) : undefined} />
-        ) : (
-          <EmptyState onOpenNav={compactNav ? () => setNavOpen(true) : undefined} />
-        )}
-      </main>
+  const overlays = (
+    <>
       {settings && <SettingsDialog tab={settings} onClose={() => setSettings(null)} />}
       <ConfirmHost />
       <div className="pointer-events-none fixed right-[max(1rem,env(safe-area-inset-right))] bottom-[max(1rem,env(safe-area-inset-bottom))] z-50 flex flex-col gap-2">
@@ -148,6 +121,30 @@ export default function App() {
           </button>
         ))}
       </div>
+    </>
+  );
+
+  // Phones: a room list screen, and each room as its own screen on top of it.
+  if (compactNav) {
+    return (
+      <div className="flex h-full overflow-hidden bg-white pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)] dark:bg-zinc-950">
+        {room ? (
+          <RoomView key={room.id} room={room} onOpenSettings={setSettings} onBack={closeRoom} />
+        ) : (
+          <PhoneRoomList onSettings={() => setSettings("general")} />
+        )}
+        {overlays}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full overflow-hidden pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
+      <Sidebar onSettings={() => setSettings("general")} />
+      <main className="flex min-w-0 flex-1 bg-white dark:bg-zinc-950">
+        {room ? <RoomView room={room} onOpenSettings={setSettings} /> : <EmptyState />}
+      </main>
+      {overlays}
     </div>
   );
 }

@@ -181,6 +181,15 @@ URL (Streamable HTTP) MCP servers work fully, including **Ask** approvals and to
 sharing; the settings UI simply hides the Local command option. Run your stdio servers on
 your desktop and HTTP servers on either.
 
+On a phone (or any window narrower than 760px) the app switches to a phone layout:
+- It opens on a full-screen room list with last-message previews and unread counts.
+- A room slides in over the list. The back button, or a swipe from the left edge, returns.
+- Messages are chat bubbles: yours on the right, everyone else's on the left, AI replies
+  tinted. The newest message sits at the bottom.
+- The keyboard shrinks the chat instead of pushing the app up, so the last message, or
+  wherever you'd scrolled to, stays in view.
+- The **+** next to the message box opens the AI reply, profile and tool options.
+
 iOS builds require macOS with Xcode — a Windows or Linux machine cannot produce them. There
 are two supported paths:
 

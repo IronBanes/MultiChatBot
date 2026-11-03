@@ -30,6 +30,9 @@ interface ChatState {
   loaded: Record<string, boolean>;
   unread: Record<string, number>;
   activeRoomId: string | null;
+  /** True after the phone's back button: stay on the room list instead of opening a
+   *  room automatically when the relay (re)connects. */
+  roomClosed: boolean;
   /** AI message ids this client is currently generating. */
   myGenerations: Record<string, true>;
   /** AI message id → call id → details, for replies this client generates. */
@@ -44,6 +47,8 @@ interface ChatState {
   reconnect(): void;
   saveIdentity(displayName: string, serverUrl: string): Promise<void>;
   selectRoom(id: string): void;
+  /** Back to the room list (phones). */
+  closeRoom(): void;
   createRoom(name: string): Promise<RoomInfo>;
   joinRoom(code: string): Promise<RoomInfo>;
   leaveRoom(id: string): void;
@@ -224,7 +229,7 @@ export const useChat = create<ChatState>((set, get) => {
         for (const r of msg.rooms) rooms[r.id] = r;
         const order = msg.rooms.map((r) => r.id);
         let active = get().activeRoomId;
-        if (!active || !rooms[active]) active = order[0] ?? null;
+        if (!active || !rooms[active]) active = get().roomClosed ? null : (order[0] ?? null);
         // Image fetches still pending when the connection dropped never got an answer;
         // forget them so the images request again on this connection.
         const images = Object.fromEntries(Object.entries(get().images).filter(([, src]) => src));
@@ -402,6 +407,7 @@ export const useChat = create<ChatState>((set, get) => {
     loaded: {},
     unread: {},
     activeRoomId: null,
+    roomClosed: false,
     myGenerations: {},
     localTools: {},
     images: {},
@@ -435,8 +441,12 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     selectRoom(id) {
-      set((s) => ({ activeRoomId: id, unread: { ...s.unread, [id]: 0 } }));
+      set((s) => ({ activeRoomId: id, roomClosed: false, unread: { ...s.unread, [id]: 0 } }));
       if (!get().loaded[id]) relay?.send({ type: "open_room", room_id: id });
+    },
+
+    closeRoom() {
+      set({ activeRoomId: null, roomClosed: true });
     },
 
     createRoom: (name) => request((request_id) => ({ type: "create_room", request_id, name })),
