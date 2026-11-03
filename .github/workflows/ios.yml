@@ -1,6 +1,7 @@
 # Builds the Multichat iOS app on a macOS runner, so development machines
-# (Windows/Linux) never need Xcode. Job 1 needs no Apple account at all;
-# job 2 signs a real-device .ipa when the repo has signing secrets.
+# (Windows/Linux) never need Xcode. The simulator and unsigned-ipa jobs need no
+# Apple account at all; build-device signs a real-device .ipa when the repo has
+# signing secrets.
 name: iOS build
 
 on:
@@ -77,6 +78,66 @@ jobs:
         with:
           name: multichat-ios-simulator
           path: app/src-tauri/gen/apple/build/**/*.app
+          if-no-files-found: error
+
+  # Unsigned real-device (arm64) .ipa for sideloading: Sideloadly or AltStore re-sign it
+  # with a free Apple ID, so no Mac, paid account or secrets are needed.
+  build-unsigned-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "app/src-tauri -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+
+      - name: Generate the Xcode project
+        working-directory: app
+        run: npm run tauri -- ios init --ci
+
+      # The generated project ships Tauri's default icon; replace it with ours.
+      - name: Generate app icons
+        working-directory: app
+        run: npm run tauri -- icon ../branding/logo.svg
+
+      # --no-sign archives with code signing off and zips Payload/<app>.app into an
+      # unsigned .ipa, skipping the export step that would need a signing team.
+      - name: Build the unsigned device .ipa
+        working-directory: app
+        run: npm run tauri -- ios build --ci --target aarch64 --no-sign
+
+      - name: Collect multichat-unsigned.ipa
+        working-directory: app/src-tauri/gen/apple
+        run: |
+          ipa=$(find build -name '*.ipa' | head -n 1)
+          [ -n "$ipa" ] || { echo "::error::tauri ios build --no-sign produced no .ipa"; exit 1; }
+          cp "$ipa" multichat-unsigned.ipa
+          # Sideloadly/AltStore need the app bundle under Payload/.
+          unzip -l multichat-unsigned.ipa > ipa-listing.txt
+          head -n 20 ipa-listing.txt
+          grep -Eq ' Payload/[^/]+\.app/Info\.plist$' ipa-listing.txt \
+            || { echo "::error::multichat-unsigned.ipa has no Payload/*.app/Info.plist"; exit 1; }
+
+      - name: Upload unsigned .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: multichat-ios-unsigned
+          path: app/src-tauri/gen/apple/multichat-unsigned.ipa
           if-no-files-found: error
 
   # Signed device build. Needs these repo secrets (base64 where noted):
