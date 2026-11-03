@@ -22,6 +22,8 @@ export interface Toast {
 interface ChatState {
   client: ClientState | null;
   status: ConnStatus;
+  /** Why the last connection attempt failed, while not connected. */
+  connError: string | null;
   rooms: Record<string, RoomInfo>;
   roomOrder: string[];
   messages: Record<string, Message[]>;
@@ -38,6 +40,8 @@ interface ChatState {
 
   init(): Promise<void>;
   refreshClient(): Promise<void>;
+  /** Reconnects to the relay now instead of waiting for the next retry. */
+  reconnect(): void;
   saveIdentity(displayName: string, serverUrl: string): Promise<void>;
   selectRoom(id: string): void;
   createRoom(name: string): Promise<RoomInfo>;
@@ -123,10 +127,12 @@ export const useChat = create<ChatState>((set, get) => {
       { user_id: client.user_id, display_name: client.display_name },
       {
         onMessage: handle,
-        onStatus: (status) => {
+        onStatus: (status, error) => {
           // The relay marks our in-flight replies as interrupted when the socket drops.
           if (status === "offline") stopAllGenerations();
-          set({ status });
+          if (status === "online") set({ status, connError: null });
+          else if (error) set({ status, connError: error });
+          else set({ status });
         },
       },
     );
@@ -389,6 +395,7 @@ export const useChat = create<ChatState>((set, get) => {
   return {
     client: null,
     status: "offline",
+    connError: null,
     rooms: {},
     roomOrder: [],
     messages: {},
@@ -407,6 +414,11 @@ export const useChat = create<ChatState>((set, get) => {
 
     async refreshClient() {
       set({ client: await backend.getState() });
+    },
+
+    reconnect() {
+      if (relay) relay.reconnectNow();
+      else connect();
     },
 
     async saveIdentity(displayName, serverUrl) {

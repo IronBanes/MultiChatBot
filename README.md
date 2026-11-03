@@ -62,9 +62,19 @@ Options (the same on every OS):
 With `--server`, the relay runs until you close the app window. On Windows, allow it
 through the firewall on private networks when asked.
 
+You can also host from inside the desktop app: **Settings → General → Host a relay →
+Start hosting**. The app lists the addresses to share (this computer, same Wi-Fi,
+Tailscale) and keeps hosting on every launch until you press **Stop**. **Restart**
+restarts the relay; everyone reconnects on their own. Phones can't host, because iOS
+suspends apps in the background, but they connect to a hosted relay like any desktop.
+
+While the app isn't connected, the sidebar shows why, for example "Nothing is listening at
+192.168.1.49:8787", with a **Retry** button that reconnects right away.
+
 ### Playing with a friend
 
-1. **Host:** run `start.cmd --server` or `./start.sh --server`.
+1. **Host:** run `start.cmd --server` or `./start.sh --server`, or turn on **Host a
+   relay** in Settings → General.
 2. **Friend:** gets the project folder (zip or `git clone`) and runs the start script
    without `--server`.
 3. **Connect:** in the app, each of you sets the relay server address on first launch,
