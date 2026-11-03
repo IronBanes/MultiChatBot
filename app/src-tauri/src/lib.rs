@@ -38,10 +38,14 @@ struct AppState {
 }
 
 impl AppState {
+    /// Applies `f` and saves. The change is made on a copy, so if saving fails the
+    /// settings in memory stay as they were and can't be persisted later by accident.
     fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> Result<T, String> {
         let mut cfg = self.config.lock().map_err(|_| "config lock poisoned")?;
-        let out = f(&mut cfg);
-        config::save(&self.config_path, &cfg).map_err(|e| format!("Could not save settings: {e}"))?;
+        let mut next = cfg.clone();
+        let out = f(&mut next);
+        config::save(&self.config_path, &next).map_err(|e| format!("Could not save settings: {e}"))?;
+        *cfg = next;
         Ok(out)
     }
 
