@@ -120,10 +120,35 @@ body,
   height: 100%;
 }
 
+html {
+  /* Keep iOS from inflating text sizes when the phone rotates. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  /* No double-tap zoom; taps also fire without the 300ms wait. */
+  touch-action: manipulation;
+}
+
+html,
+body {
+  /* The app is a fixed-size shell; don't let a drag rubber-band the whole page. */
+  overscroll-behavior: none;
+}
+
 body {
   margin: 0;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   @apply bg-white text-zinc-900 antialiased dark:bg-zinc-950 dark:text-zinc-100;
+}
+
+/* iOS zooms into any focused field whose text is under 16px and doesn't zoom back
+   out. Phones get 16px fields; this rule is unlayered, so it beats Tailwind's
+   text-sm/text-xs utilities. */
+@media (any-pointer: coarse) {
+  input,
+  textarea,
+  select {
+    font-size: 16px;
+  }
 }
 
 /* Markdown content */
