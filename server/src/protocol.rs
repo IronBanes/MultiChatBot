@@ -8,6 +8,13 @@ pub enum ClientMsg {
     Hello {
         user_id: String,
         display_name: String,
+        /// Identifies the physical device so several can share one account.
+        #[serde(default)]
+        device_id: String,
+        #[serde(default)]
+        device_name: String,
+        #[serde(default)]
+        platform: String,
     },
     CreateRoom {
         request_id: String,
@@ -74,6 +81,13 @@ pub enum ClientMsg {
     SetRoomPrompt {
         room_id: String,
         system_prompt: String,
+    },
+    CreateLinkCode {
+        request_id: String,
+    },
+    RedeemLinkCode {
+        request_id: String,
+        code: String,
     },
 }
 
@@ -161,6 +175,19 @@ pub enum ServerMsg {
         system_prompt: String,
         updated_by: String,
     },
+    LinkCode {
+        request_id: String,
+        code: String,
+        expires_in_secs: u64,
+    },
+    Linked {
+        request_id: String,
+        user_id: String,
+        display_name: String,
+    },
+    Devices {
+        devices: Vec<Device>,
+    },
     Error {
         request_id: Option<String>,
         message: String,
@@ -181,6 +208,14 @@ pub struct Member {
     pub user_id: String,
     pub display_name: String,
     pub online: bool,
+}
+
+/// One of the user's devices that is online right now.
+#[derive(Debug, Clone, Serialize)]
+pub struct Device {
+    pub device_id: String,
+    pub device_name: String,
+    pub platform: String,
 }
 
 /// An MCP tool call made while generating an AI reply. Only names and status

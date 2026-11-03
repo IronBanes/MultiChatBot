@@ -75,7 +75,7 @@ all rooms. The first client frame must be `hello`.
 
 | type | fields | notes |
 |---|---|---|
-| `hello` | `user_id, display_name` | also used to rename |
+| `hello` | `user_id, display_name, device_id?, device_name?, platform?` | also used to rename; optional fields identify the device for linking |
 | `create_room` | `request_id, name` | → `room_joined` |
 | `join_room` | `request_id, invite_code` | → `room_joined` |
 | `leave_room` | `room_id` | |
@@ -90,6 +90,8 @@ all rooms. The first client frame must be `hello`.
 | `ai_complete` | `room_id, id, content` | full final text, persisted with reasoning, tool activity and attachments |
 | `ai_error` | `room_id, id, error` | short, sanitized reason |
 | `set_room_prompt` | `room_id, system_prompt` | any member |
+| `create_link_code` | `request_id` | → `link_code`; one live code per user, valid 10 min, single use |
+| `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
 
 ### Server → client
 
@@ -112,10 +114,14 @@ all rooms. The first client frame must be `hello`.
 | `member_left` | `room_id, user_id` |
 | `presence` | `room_id, user_id, online` |
 | `room_updated` | `room_id, system_prompt, updated_by` |
+| `link_code` | `request_id, code, expires_in_secs` |
+| `linked` | `request_id, user_id, display_name` |
+| `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline) |
 | `error` | `request_id?, message` |
 
 `RoomInfo = {id, name, invite_code, system_prompt, members: Member[]}`
 `Member = {user_id, display_name, online}`
+`Device = {device_id, device_name, platform}`
 
 ### AI reply lifecycle
 
