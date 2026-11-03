@@ -158,6 +158,7 @@ const paths: Record<string, string> = {
   brain: "M9 18h6M10 22h4M12 2a7 7 0 00-4 12.7V17h8v-2.3A7 7 0 0012 2z",
   chevron: "M9 18l6-6-6-6",
   menu: "M3 6h18M3 12h18M3 18h18",
+  dots: "M5 12h.01M12 12h.01M19 12h.01",
   check: "M20 6L9 17l-5-5",
   server: "M2 4h20v6H2zM2 14h20v6H2zM6 7h.01M6 17h.01",
   sun: "M12 17a5 5 0 100-10 5 5 0 000 10zM12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4",

@@ -115,9 +115,34 @@
 }
 
 html,
-body,
-#root {
+body {
   height: 100%;
+}
+
+/* Sized to the visual viewport (see useKeyboardViewport), so an on-screen keyboard
+   shrinks the app rather than scrolling it out of view. */
+#root {
+  position: fixed;
+  inset: var(--app-top, 0px) 0 auto 0;
+  height: var(--app-height, 100%);
+}
+
+/* With the keyboard up, the home-indicator inset is hidden behind it. */
+html[data-keyboard] .safe-bottom {
+  padding-bottom: 0.5rem;
+}
+
+@keyframes slide-in {
+  from {
+    transform: translateX(24%);
+    opacity: 0.4;
+  }
+}
+
+@keyframes sheet-up {
+  from {
+    transform: translateY(100%);
+  }
 }
 
 html {
@@ -170,6 +195,11 @@ body {
 .md th, .md td { @apply border border-zinc-300 px-2 py-1 dark:border-zinc-700; }
 .md th { @apply bg-zinc-100 font-semibold dark:bg-zinc-800; }
 .md hr { @apply my-3 border-zinc-200 dark:border-zinc-800; }
+
+/* Markdown inside your own (accent-colored) chat bubbles. */
+.md-on-accent a { color: inherit; text-decoration: underline; }
+.md-on-accent :not(pre) > code { @apply bg-white/20 text-white; }
+.md-on-accent blockquote { @apply border-white/50 text-white/90; }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { @apply rounded-full border-2 border-solid border-transparent bg-zinc-300 bg-clip-padding dark:bg-zinc-700; }
