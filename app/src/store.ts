@@ -64,6 +64,8 @@ interface ChatState {
   sendMessage(roomId: string, content: string, aiRequested: boolean, profileId: string | null): Promise<boolean>;
   regenerate(ai: Message, profileId: string): void;
   stopAi(id: string): void;
+  /** Adds or removes this user's reaction on a message (human or AI). */
+  react(roomId: string, messageId: string, emoji: string, on: boolean): void;
   setRoomPrompt(roomId: string, prompt: string): void;
   chooseProfile(roomId: string, profileId: string): void;
   setRoomMcpMode(roomId: string, serverId: string, mode: McpMode): void;
@@ -407,6 +409,15 @@ export const useChat = create<ChatState>((set, get) => {
           members: r.members.map((m) => (m.user_id === msg.user_id ? { ...m, online: msg.online } : m)),
         }));
         break;
+      case "reactions":
+        // The frame always carries the message's full current list, so replace.
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [msg.room_id]: patchMessage(s.messages[msg.room_id], msg.message_id, (m) => ({ ...m, reactions: msg.reactions }))!,
+          },
+        }));
+        break;
       case "room_updated":
         patchRoom(msg.room_id, (r) => ({ ...r, system_prompt: msg.system_prompt }));
         break;
@@ -544,6 +555,10 @@ export const useChat = create<ChatState>((set, get) => {
 
     stopAi(id) {
       void backend.stopGeneration(id);
+    },
+
+    react(roomId, messageId, emoji, on) {
+      relay?.send({ type: "react", room_id: roomId, message_id: messageId, emoji, on });
     },
 
     setRoomPrompt(roomId, prompt) {
