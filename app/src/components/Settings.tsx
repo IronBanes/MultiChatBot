@@ -801,7 +801,8 @@ function HostSection({ serverUrl, onUse }: { serverUrl: string; onUse: (url: str
       .hostStatus()
       .then((h) => {
         setHost(h);
-        if (h.port) setPort(String(h.port));
+        const p = h.port ?? h.saved_port;
+        if (p) setPort(String(p));
       })
       .catch((e) => setError(errorText(e)));
   }, []);

@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// A running relay. Dropping it leaves the relay running; call `stop`.
+/// A running relay. Dropping it stops the relay (the same as `stop`, without waiting).
 pub struct Relay {
     addr: SocketAddr,
     stop: watch::Sender<bool>,

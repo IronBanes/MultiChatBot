@@ -12,6 +12,8 @@ pub struct HostStatus {
     pub supported: bool,
     pub running: bool,
     pub port: Option<u16>,
+    /// The port hosting is saved to resume on, even if it isn't running right now.
+    pub saved_port: Option<u16>,
     /// Why hosting last failed to start, if it did.
     pub error: Option<String>,
     /// This machine's address on the local network, for phones on the same Wi-Fi.
@@ -44,7 +46,7 @@ impl Host {
         }
     }
 
-    pub async fn status(&self) -> HostStatus {
+    pub async fn status(&self, saved_port: Option<u16>) -> HostStatus {
         #[cfg(desktop)]
         let (running, port) = {
             let relay = self.relay.lock().await;
@@ -59,6 +61,7 @@ impl Host {
             supported: cfg!(desktop),
             running,
             port,
+            saved_port,
             error: self.error.lock().ok().and_then(|e| e.clone()),
             lan_ip: lan_ip().map(|ip| ip.to_string()),
             tailscale_ip: tailscale_ip().map(|ip| ip.to_string()),

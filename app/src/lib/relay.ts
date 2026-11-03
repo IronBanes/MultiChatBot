@@ -45,6 +45,20 @@ async function sendWhenRegistered(ws: WebSocket, frame: Parameters<WebSocket["se
   }
 }
 
+/** Closes a connection, retrying briefly if its writer isn't registered yet (a close
+ *  sent too early fails with "connection not found" and would leave the socket open). */
+async function closeWhenRegistered(ws: WebSocket) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await ws.disconnect();
+      return;
+    } catch (e) {
+      if (attempt >= REGISTER_RETRIES || !String(e).toLowerCase().includes(NOT_REGISTERED)) return;
+      await new Promise((r) => setTimeout(r, REGISTER_RETRY_MS));
+    }
+  }
+}
+
 /** A short, human reason for a failed connection attempt. */
 function connectError(url: string, e: unknown): string {
   let host = url;
@@ -98,7 +112,7 @@ export class Relay {
       return;
     }
     if (this.closed || gen !== this.generation) {
-      void ws.disconnect().catch(() => {});
+      void closeWhenRegistered(ws);
       return;
     }
     this.ws = ws;
@@ -151,7 +165,7 @@ export class Relay {
     this.ws = null;
     this.generation++;
     window.clearInterval(this.pingTimer);
-    void ws.disconnect().catch(() => {});
+    void closeWhenRegistered(ws);
     this.handlers.onStatus("offline");
     this.scheduleReconnect();
   }
@@ -171,7 +185,7 @@ export class Relay {
     window.clearInterval(this.pingTimer);
     const ws = this.ws;
     this.ws = null;
-    void ws?.disconnect().catch(() => {});
+    if (ws) void closeWhenRegistered(ws);
     this.retry = 0;
     void this.connect();
   }
@@ -219,6 +233,6 @@ export class Relay {
     window.clearInterval(this.pingTimer);
     const ws = this.ws;
     this.ws = null;
-    void ws?.disconnect().catch(() => {});
+    if (ws) void closeWhenRegistered(ws);
   }
 }

@@ -477,7 +477,8 @@ fn stop_generation(state: State<'_, AppState>, id: String) -> Result<(), String>
 
 #[tauri::command]
 async fn host_status(state: State<'_, AppState>) -> Result<host::HostStatus, String> {
-    Ok(state.host.status().await)
+    let saved = state.snapshot()?.host_relay_port;
+    Ok(state.host.status(saved).await)
 }
 
 /// Hosts the relay on `port` (restarting it if it already runs) and remembers it,
@@ -489,14 +490,16 @@ async fn host_start(state: State<'_, AppState>, port: u16) -> Result<host::HostS
     }
     state.host.start(port).await?;
     state.update(|c| c.host_relay_port = Some(port))?;
-    Ok(state.host.status().await)
+    Ok(state.host.status(Some(port)).await)
 }
 
 #[tauri::command]
 async fn host_stop(state: State<'_, AppState>) -> Result<host::HostStatus, String> {
-    state.host.stop().await;
+    // Save first: if saving fails the relay keeps running, matching what the next
+    // launch would do.
     state.update(|c| c.host_relay_port = None)?;
-    Ok(state.host.status().await)
+    state.host.stop().await;
+    Ok(state.host.status(None).await)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
