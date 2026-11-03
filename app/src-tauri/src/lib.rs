@@ -229,7 +229,8 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
         }
         return Err(e);
     }
-    if let Ok(mut blocked) = state.unsafe_keys.lock() {
+    // Only a new or removed key, saved together with the settings, repairs the pairing.
+    if changing_key && let Ok(mut blocked) = state.unsafe_keys.lock() {
         blocked.remove(&saved.id);
     }
     Ok(view(saved))
