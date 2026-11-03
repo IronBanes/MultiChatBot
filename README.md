@@ -210,11 +210,33 @@ npm run tauri ios build         # .ipa for a real device
 - **build-simulator** — unsigned simulator `.app`, needs **no secrets and no Apple
   account**; it exists to prove every push compiles for iOS. Install the artifact with
   `xcrun simctl install booted <app>` on a Mac.
+- **build-unsigned-ipa** — unsigned real-device `.ipa` (artifact `multichat-ios-unsigned`,
+  file `multichat-unsigned.ipa`), also with **no secrets**. Sideload it from Windows as
+  described below.
 - **build-device** — signed `.ipa`, runs on manual dispatch or `v*` tags when the repo has
   these secrets: `IOS_CERTIFICATE` (base64 `.p12`), `IOS_CERTIFICATE_PASSWORD` and
   `IOS_MOBILE_PROVISION` (base64). Without them the job prints a notice and skips, leaving
   the simulator build as the artifact. Side-load the `.ipa` via Xcode → Devices, or upload
   it to TestFlight with Transporter once you have a paid account.
+
+### Sideloading from Windows (no Mac, free Apple ID)
+
+[Sideloadly](https://sideloadly.io) or [AltStore](https://altstore.io) can install the
+unsigned `.ipa` on a real iPhone; they re-sign it with your Apple ID.
+
+1. Install **iTunes and iCloud from apple.com**, not the Microsoft Store versions —
+   Sideloadly and AltServer need the non-Store builds to talk to the phone.
+2. Download `multichat-ios-unsigned` from a green run of the **iOS build** workflow
+   (Actions tab) and unzip it to get `multichat-unsigned.ipa`.
+3. Connect the iPhone over USB, open the `.ipa` in Sideloadly (or AltStore → My Apps →
+   `+`), and sign in with a **free Apple ID**.
+4. On the phone, turn on **Developer Mode** (Settings → Privacy & Security → Developer
+   Mode, then restart), and trust your Apple ID under Settings → General → VPN & Device
+   Management.
+
+Free-account installs **expire after 7 days**; re-sign by repeating step 3 (AltStore can
+refresh automatically over Wi-Fi). The relay must be reachable from the phone: a
+`ws://<LAN IP>:8787/ws` relay on the same Wi-Fi, otherwise a `wss://` tunnel.
 
 ## Profiles
 

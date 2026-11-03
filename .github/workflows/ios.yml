@@ -1,6 +1,7 @@
 # Builds the Multichat iOS app on a macOS runner, so development machines
-# (Windows/Linux) never need Xcode. Job 1 needs no Apple account at all;
-# job 2 signs a real-device .ipa when the repo has signing secrets.
+# (Windows/Linux) never need Xcode. The simulator and unsigned-ipa jobs need no
+# Apple account at all; build-device signs a real-device .ipa when the repo has
+# signing secrets.
 name: iOS build
 
 on:
@@ -77,6 +78,83 @@ jobs:
         with:
           name: multichat-ios-simulator
           path: app/src-tauri/gen/apple/build/**/*.app
+          if-no-files-found: error
+
+  # Unsigned real-device (arm64) .ipa for sideloading: Sideloadly or AltStore re-sign it
+  # with a free Apple ID, so no Mac, paid account or secrets are needed.
+  # `tauri ios build` always archives and exports, which requires a signing team, so
+  # this job builds the generated Xcode project directly with signing turned off.
+  build-unsigned-ipa:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "app/src-tauri -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+
+      - name: Generate the Xcode project
+        working-directory: app
+        run: npm run tauri -- ios init --ci
+
+      # The generated project ships Tauri's default icon; replace it with ours.
+      - name: Generate app icons
+        working-directory: app
+        run: npm run tauri -- icon ../branding/logo.svg
+
+      # Plain xcodebuild skips Tauri's beforeBuildCommand, so build the frontend here.
+      - name: Build the frontend
+        working-directory: app
+        run: npm run build
+
+      - name: Build the device .app (no signing)
+        working-directory: app/src-tauri/gen/apple
+        run: |
+          project=$(ls -d *.xcodeproj | head -n 1)
+          scheme="$(basename "$project" .xcodeproj)_iOS"
+          xcodebuild build \
+            -project "$project" \
+            -scheme "$scheme" \
+            -sdk iphoneos \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/unsigned \
+            ARCHS=arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      # An .ipa is just a zip with the app under Payload/.
+      - name: Package multichat-unsigned.ipa
+        working-directory: app/src-tauri/gen/apple
+        run: |
+          app=$(find build/unsigned/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' | head -n 1)
+          [ -n "$app" ] || { echo "::error::no .app in Release-iphoneos"; exit 1; }
+          rm -rf ipa && mkdir -p ipa/Payload
+          cp -R "$app" ipa/Payload/
+          (cd ipa && zip -qry ../multichat-unsigned.ipa Payload)
+          unzip -l multichat-unsigned.ipa | head -n 20
+
+      - name: Upload unsigned .ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: multichat-ios-unsigned
+          path: app/src-tauri/gen/apple/multichat-unsigned.ipa
           if-no-files-found: error
 
   # Signed device build. Needs these repo secrets (base64 where noted):
