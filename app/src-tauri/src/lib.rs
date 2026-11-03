@@ -4,6 +4,7 @@
 mod config;
 mod context;
 mod generate;
+mod host;
 mod mcp;
 mod net;
 mod providers;
@@ -17,7 +18,7 @@ use mcp::McpManager;
 use providers::{ChatRequest, ModelInfo, ProviderError, StreamEvent};
 use secrets::McpSecrets;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,13 +34,25 @@ struct AppState {
     generations: Mutex<HashMap<String, oneshot::Sender<()>>>,
     approvals: Approvals,
     mcp: Arc<McpManager>,
+    host: Arc<host::Host>,
+    /// Held for a whole secret-plus-settings save, so two saves can't interleave their
+    /// keychain writes, settings update and rollback.
+    saving: Mutex<()>,
+    /// Profiles whose stored key may belong to settings that never got saved (the save,
+    /// the key restore and the key removal all failed). They can't generate until the
+    /// profile is saved successfully again.
+    unsafe_keys: Mutex<HashSet<String>>,
 }
 
 impl AppState {
+    /// Applies `f` and saves. The change is made on a copy, so if saving fails the
+    /// settings in memory stay as they were and can't be persisted later by accident.
     fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> Result<T, String> {
         let mut cfg = self.config.lock().map_err(|_| "config lock poisoned")?;
-        let out = f(&mut cfg);
-        config::save(&self.config_path, &cfg).map_err(|e| format!("Could not save settings: {e}"))?;
+        let mut next = cfg.clone();
+        let out = f(&mut next);
+        config::save(&self.config_path, &next).map_err(|e| format!("Could not save settings: {e}"))?;
+        *cfg = next;
         Ok(out)
     }
 
@@ -178,16 +191,48 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
     profile.model = profile.model.trim().to_string();
     profile.reasoning_effort = profile.reasoning_effort.filter(|e| !e.trim().is_empty());
+    let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
+    let changing_key = api_key.is_some();
+    let previous_key = if changing_key { secrets::get_key(&profile.id)? } else { None };
     match api_key.as_deref().map(str::trim) {
         Some("") => secrets::delete_key(&profile.id)?,
         Some(k) => secrets::set_key(&profile.id, k)?,
         None => {}
     }
     let saved = profile.clone();
-    state.update(move |c| match c.profiles.iter_mut().find(|p| p.id == profile.id) {
+    let id = profile.id.clone();
+    let updated = state.update(move |c| match c.profiles.iter_mut().find(|p| p.id == profile.id) {
         Some(existing) => *existing = profile,
         None => c.profiles.push(profile),
-    })?;
+    });
+    if let Err(e) = updated {
+        // The old endpoint is still in effect, so put its key back: the new key must
+        // never be sent to the endpoint it wasn't meant for.
+        if changing_key {
+            let restored = match &previous_key {
+                Some(k) => secrets::set_key(&id, k),
+                None => secrets::delete_key(&id),
+            };
+            // If the old key can't come back, remove the key entirely rather than leave
+            // the new one paired with the old endpoint.
+            if restored.is_err() {
+                return Err(match secrets::delete_key(&id) {
+                    Ok(()) => format!("{e}. The API key for this profile was removed; enter it again."),
+                    Err(_) => {
+                        if let Ok(mut blocked) = state.unsafe_keys.lock() {
+                            blocked.insert(id.clone());
+                        }
+                        format!("{e}. The API key for this profile couldn't be restored, so the profile is disabled until you save it again.")
+                    }
+                });
+            }
+        }
+        return Err(e);
+    }
+    // Only a new or removed key, saved together with the settings, repairs the pairing.
+    if changing_key && let Ok(mut blocked) = state.unsafe_keys.lock() {
+        blocked.remove(&saved.id);
+    }
     Ok(view(saved))
 }
 
@@ -324,20 +369,38 @@ async fn save_mcp_server(
     secrets: Option<Vec<SecretEdit>>,
 ) -> Result<McpServerView, String> {
     validate_mcp(&server)?;
-    let merged = merge_secrets(&server.id, secrets)?;
-    if server.id.is_empty() {
-        server.id = uuid::Uuid::new_v4().to_string();
-    }
-    server.name = server.name.trim().to_string();
-    server.command = server.command.trim().to_string();
-    server.url = server.url.trim().to_string();
-    server.args.retain(|a| !a.is_empty());
-    secrets::set_mcp(&server.id, &merged)?;
-    let saved = server.clone();
-    state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
-        Some(existing) => *existing = server,
-        None => c.mcp_servers.push(server),
-    })?;
+    let saved = {
+        // Merge against the stored secrets inside the lock, so a concurrent save of the
+        // same server can't be overwritten with stale values.
+        let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
+        let merged = merge_secrets(&server.id, secrets)?;
+        if server.id.is_empty() {
+            server.id = uuid::Uuid::new_v4().to_string();
+        }
+        server.name = server.name.trim().to_string();
+        server.command = server.command.trim().to_string();
+        server.url = server.url.trim().to_string();
+        server.args.retain(|a| !a.is_empty());
+        let saved = server.clone();
+        let previous = secrets::get_mcp(&server.id)?;
+        secrets::set_mcp(&server.id, &merged)?;
+        let updated = state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
+            Some(existing) => *existing = server,
+            None => c.mcp_servers.push(server),
+        });
+        if let Err(e) = updated {
+            // Keep the secrets paired with the server settings that are still in effect,
+            // or drop them if that fails.
+            if secrets::set_mcp(&saved.id, &previous).is_err() {
+                return Err(match secrets::delete_mcp(&saved.id) {
+                    Ok(()) => format!("{e}. This server's env vars and headers were removed; enter them again."),
+                    Err(_) => format!("{e}. This server's env vars and headers couldn't be restored; enter them again before using it."),
+                });
+            }
+            return Err(e);
+        }
+        saved
+    };
     // Pick up the new settings on next use.
     state.mcp.disconnect(&saved.id).await;
     Ok(mcp_view(saved))
@@ -411,6 +474,9 @@ fn generate(
 ) -> Result<(), String> {
     let cfg = state.snapshot()?;
     let profile = state.profile(&profile_id)?;
+    if state.unsafe_keys.lock().map_err(|_| "lock poisoned")?.contains(&profile.id) {
+        return Err(format!("{} is disabled after a failed save. Save it again in Settings to use it.", profile.label));
+    }
     let key = secrets::get_key(&profile.id)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let prompt = context::build(&history, &room_prompt, profile.max_context_tokens);
@@ -473,6 +539,33 @@ fn stop_generation(state: State<'_, AppState>, id: String) -> Result<(), String>
     Ok(())
 }
 
+#[tauri::command]
+async fn host_status(state: State<'_, AppState>) -> Result<host::HostStatus, String> {
+    let saved = state.snapshot()?.host_relay_port;
+    Ok(state.host.status(saved).await)
+}
+
+/// Hosts the relay on `port` (restarting it if it already runs) and remembers it,
+/// so hosting resumes on the next launch.
+#[tauri::command]
+async fn host_start(state: State<'_, AppState>, port: u16) -> Result<host::HostStatus, String> {
+    if port < 1024 {
+        return Err("Use a port from 1024 to 65535.".into());
+    }
+    state.host.start(port).await?;
+    state.update(|c| c.host_relay_port = Some(port))?;
+    Ok(state.host.status(Some(port)).await)
+}
+
+#[tauri::command]
+async fn host_stop(state: State<'_, AppState>) -> Result<host::HostStatus, String> {
+    // Save first: if saving fails the relay keeps running, matching what the next
+    // launch would do.
+    state.update(|c| c.host_relay_port = None)?;
+    state.host.stop().await;
+    Ok(state.host.status(None).await)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -482,6 +575,14 @@ pub fn run() {
             let base = app.path().app_config_dir()?;
             let config_path = config::config_path(&base);
             let config = config::load(&config_path);
+            let host = Arc::new(host::Host::new(config_path.with_file_name("relay.db")));
+            if let Some(port) = config.host_relay_port {
+                let host = host.clone();
+                // A failure (say, the port is taken) shows up in Settings.
+                tauri::async_runtime::spawn(async move {
+                    let _ = host.start(port).await;
+                });
+            }
             let http = reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .read_timeout(Duration::from_secs(180))
@@ -503,6 +604,9 @@ pub fn run() {
                 generations: Mutex::new(HashMap::new()),
                 approvals: Arc::new(Mutex::new(HashMap::new())),
                 mcp: Arc::new(McpManager::default()),
+                host,
+                saving: Mutex::new(()),
+                unsafe_keys: Mutex::new(HashSet::new()),
             });
             Ok(())
         })
@@ -521,6 +625,9 @@ pub fn run() {
             resolve_tool_call,
             generate,
             stop_generation,
+            host_status,
+            host_start,
+            host_stop,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

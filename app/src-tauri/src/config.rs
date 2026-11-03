@@ -105,6 +105,10 @@ pub struct Config {
     /// room id → server id → mode, overriding the server's default in that room.
     #[serde(default)]
     pub mcp_modes_by_room: HashMap<String, HashMap<String, McpMode>>,
+    /// Port of the relay this app hosts (desktop only); `None` when not hosting.
+    /// Hosting resumes on the next launch.
+    #[serde(default)]
+    pub host_relay_port: Option<u16>,
 }
 
 impl Config {
@@ -136,6 +140,7 @@ impl Default for Config {
             profiles: Vec::new(),
             mcp_servers: Vec::new(),
             mcp_modes_by_room: HashMap::new(),
+            host_relay_port: None,
         }
     }
 }

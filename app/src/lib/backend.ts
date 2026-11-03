@@ -5,6 +5,7 @@ import type {
   ClientState,
   GenEvent,
   HistoryItem,
+  HostStatus,
   McpMode,
   McpServer,
   McpServerView,
@@ -54,6 +55,11 @@ export const backend = {
     return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, onEvent: channel });
   },
   stopGeneration: (id: string) => invoke<void>("stop_generation", { id }),
+
+  hostStatus: () => invoke<HostStatus>("host_status"),
+  /** Starts the hosted relay on `port`, or restarts it if it's already running. */
+  hostStart: (port: number) => invoke<HostStatus>("host_start", { port }),
+  hostStop: () => invoke<HostStatus>("host_stop"),
 };
 
 export function errorText(e: unknown): string {

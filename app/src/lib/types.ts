@@ -168,6 +168,20 @@ export interface ClientState {
   mcp_modes_by_room: Record<string, Record<string, McpMode>>;
 }
 
+/** The relay this desktop app hosts (Settings > General). */
+export interface HostStatus {
+  /** False on phones, which can't keep a server running in the background. */
+  supported: boolean;
+  running: boolean;
+  port: number | null;
+  /** The port hosting resumes on at launch, even if it isn't running right now. */
+  saved_port: number | null;
+  /** Why hosting last failed to start. */
+  error: string | null;
+  lan_ip: string | null;
+  tailscale_ip: string | null;
+}
+
 export interface HistoryItem {
   kind: "human" | "ai";
   author_name: string;
