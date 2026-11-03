@@ -68,10 +68,13 @@ impl Host {
         }
     }
 
-    /// Starts (or restarts) the relay on `port`, listening on every interface.
+    /// Starts (or restarts) the relay on `port`, listening on every interface. If a
+    /// running relay can't move to `port`, it's started again on its old port.
     #[cfg(desktop)]
     pub async fn start(&self, port: u16) -> Result<(), String> {
         let mut relay = self.relay.lock().await;
+        let old_port = relay.as_ref().filter(|r| r.is_running()).map(|r| r.local_addr().port());
+        // The old relay has to let go of its port first: a restart often reuses it.
         if let Some(old) = relay.take() {
             old.stop().await;
         }
@@ -83,6 +86,11 @@ impl Host {
                 Ok(())
             }
             Err(e) => {
+                if let Some(old_port) = old_port.filter(|&p| p != port) {
+                    if let Ok(r) = multichat_relay::start(&format!("0.0.0.0:{old_port}"), &db).await {
+                        *relay = Some(r);
+                    }
+                }
                 let in_use = e
                     .downcast_ref::<std::io::Error>()
                     .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse);

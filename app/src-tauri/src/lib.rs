@@ -35,6 +35,9 @@ struct AppState {
     approvals: Approvals,
     mcp: Arc<McpManager>,
     host: Arc<host::Host>,
+    /// Held for a whole secret-plus-settings save, so two saves can't interleave their
+    /// keychain writes, settings update and rollback.
+    saving: Mutex<()>,
 }
 
 impl AppState {
@@ -184,6 +187,7 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
     profile.model = profile.model.trim().to_string();
     profile.reasoning_effort = profile.reasoning_effort.filter(|e| !e.trim().is_empty());
+    let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
     let changing_key = api_key.is_some();
     let previous_key = if changing_key { secrets::get_key(&profile.id)? } else { None };
     match api_key.as_deref().map(str::trim) {
@@ -201,10 +205,15 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
         // The old endpoint is still in effect, so put its key back: the new key must
         // never be sent to the endpoint it wasn't meant for.
         if changing_key {
-            let _ = match &previous_key {
+            let restored = match &previous_key {
                 Some(k) => secrets::set_key(&id, k),
                 None => secrets::delete_key(&id),
             };
+            // If the old key can't come back, remove the key entirely rather than leave
+            // the new one paired with the old endpoint.
+            if restored.is_err() && secrets::delete_key(&id).is_ok() {
+                return Err(format!("{e}. The API key for this profile was removed; enter it again."));
+            }
         }
         return Err(e);
     }
@@ -352,17 +361,23 @@ async fn save_mcp_server(
     server.command = server.command.trim().to_string();
     server.url = server.url.trim().to_string();
     server.args.retain(|a| !a.is_empty());
-    let previous = secrets::get_mcp(&server.id)?;
-    secrets::set_mcp(&server.id, &merged)?;
     let saved = server.clone();
-    let updated = state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
-        Some(existing) => *existing = server,
-        None => c.mcp_servers.push(server),
-    });
-    if let Err(e) = updated {
-        // Keep the secrets paired with the server settings that are still in effect.
-        let _ = secrets::set_mcp(&saved.id, &previous);
-        return Err(e);
+    {
+        let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
+        let previous = secrets::get_mcp(&server.id)?;
+        secrets::set_mcp(&server.id, &merged)?;
+        let updated = state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
+            Some(existing) => *existing = server,
+            None => c.mcp_servers.push(server),
+        });
+        if let Err(e) = updated {
+            // Keep the secrets paired with the server settings that are still in effect,
+            // or drop them if that fails.
+            if secrets::set_mcp(&saved.id, &previous).is_err() {
+                let _ = secrets::delete_mcp(&saved.id);
+            }
+            return Err(e);
+        }
     }
     // Pick up the new settings on next use.
     state.mcp.disconnect(&saved.id).await;
@@ -565,6 +580,7 @@ pub fn run() {
                 approvals: Arc::new(Mutex::new(HashMap::new())),
                 mcp: Arc::new(McpManager::default()),
                 host,
+                saving: Mutex::new(()),
             });
             Ok(())
         })
