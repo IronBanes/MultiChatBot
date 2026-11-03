@@ -184,16 +184,30 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     profile.base_url = profile.base_url.trim().trim_end_matches('/').to_string();
     profile.model = profile.model.trim().to_string();
     profile.reasoning_effort = profile.reasoning_effort.filter(|e| !e.trim().is_empty());
+    let changing_key = api_key.is_some();
+    let previous_key = if changing_key { secrets::get_key(&profile.id)? } else { None };
     match api_key.as_deref().map(str::trim) {
         Some("") => secrets::delete_key(&profile.id)?,
         Some(k) => secrets::set_key(&profile.id, k)?,
         None => {}
     }
     let saved = profile.clone();
-    state.update(move |c| match c.profiles.iter_mut().find(|p| p.id == profile.id) {
+    let id = profile.id.clone();
+    let updated = state.update(move |c| match c.profiles.iter_mut().find(|p| p.id == profile.id) {
         Some(existing) => *existing = profile,
         None => c.profiles.push(profile),
-    })?;
+    });
+    if let Err(e) = updated {
+        // The old endpoint is still in effect, so put its key back: the new key must
+        // never be sent to the endpoint it wasn't meant for.
+        if changing_key {
+            let _ = match &previous_key {
+                Some(k) => secrets::set_key(&id, k),
+                None => secrets::delete_key(&id),
+            };
+        }
+        return Err(e);
+    }
     Ok(view(saved))
 }
 
@@ -338,12 +352,18 @@ async fn save_mcp_server(
     server.command = server.command.trim().to_string();
     server.url = server.url.trim().to_string();
     server.args.retain(|a| !a.is_empty());
+    let previous = secrets::get_mcp(&server.id)?;
     secrets::set_mcp(&server.id, &merged)?;
     let saved = server.clone();
-    state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
+    let updated = state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
         Some(existing) => *existing = server,
         None => c.mcp_servers.push(server),
-    })?;
+    });
+    if let Err(e) = updated {
+        // Keep the secrets paired with the server settings that are still in effect.
+        let _ = secrets::set_mcp(&saved.id, &previous);
+        return Err(e);
+    }
     // Pick up the new settings on next use.
     state.mcp.disconnect(&saved.id).await;
     Ok(mcp_view(saved))
