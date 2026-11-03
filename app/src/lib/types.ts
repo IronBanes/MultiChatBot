@@ -6,6 +6,13 @@ export interface Member {
   online: boolean;
 }
 
+/** One of this user's devices that is online right now (ServerMsg "devices"). */
+export interface Device {
+  device_id: string;
+  device_name: string;
+  platform: string;
+}
+
 export interface RoomInfo {
   id: string;
   name: string;
@@ -56,7 +63,7 @@ export interface Message {
 }
 
 export type ClientMsg =
-  | { type: "hello"; user_id: string; display_name: string }
+  | { type: "hello"; user_id: string; display_name: string; device_id: string; device_name: string; platform: string }
   | { type: "create_room"; request_id: string; name: string }
   | { type: "join_room"; request_id: string; invite_code: string }
   | { type: "leave_room"; room_id: string }
@@ -70,7 +77,9 @@ export type ClientMsg =
   | { type: "get_attachment"; attachment_id: string }
   | { type: "ai_complete"; room_id: string; id: string; content: string }
   | { type: "ai_error"; room_id: string; id: string; error: string }
-  | { type: "set_room_prompt"; room_id: string; system_prompt: string };
+  | { type: "set_room_prompt"; room_id: string; system_prompt: string }
+  | { type: "create_link_code"; request_id: string }
+  | { type: "redeem_link_code"; request_id: string; code: string };
 
 export type ServerMsg =
   | { type: "welcome"; user_id: string; rooms: RoomInfo[] }
@@ -91,6 +100,9 @@ export type ServerMsg =
   | { type: "member_left"; room_id: string; user_id: string }
   | { type: "presence"; room_id: string; user_id: string; online: boolean }
   | { type: "room_updated"; room_id: string; system_prompt: string; updated_by: string }
+  | { type: "link_code"; request_id: string; code: string; expires_in_secs: number }
+  | { type: "linked"; request_id: string; user_id: string; display_name: string }
+  | { type: "devices"; devices: Device[] }
   | { type: "error"; request_id: string | null; message: string };
 
 // ---- Tauri backend ----
@@ -160,6 +172,9 @@ export interface ClientState {
   instance: string;
   user_id: string;
   display_name: string;
+  device_id: string;
+  /** True while this device acts as another device's account (device linking). */
+  linked: boolean;
   server_url: string;
   platform: Platform;
   last_profile_by_room: Record<string, string>;

@@ -766,7 +766,18 @@ function McpPanel() {
 
 // ------------------------------------------------------------------ General
 
-function CopyRow({ label, value, action }: { label: string; value: string; action?: React.ReactNode }) {
+function CopyRow({
+  label,
+  value,
+  action,
+  valueCls = "text-xs",
+}: {
+  label: string;
+  value: string;
+  action?: React.ReactNode;
+  /** Extra classes for the value, e.g. a bigger font for link codes. */
+  valueCls?: string;
+}) {
   const [copied, setCopied] = useState(false);
   const copy = async () => {
     try {
@@ -780,7 +791,7 @@ function CopyRow({ label, value, action }: { label: string; value: string; actio
   return (
     <div className="flex items-center gap-2 text-sm">
       <span className="w-24 shrink-0 text-xs text-zinc-500">{label}</span>
-      <code className="min-w-0 flex-1 truncate rounded bg-zinc-100 px-1.5 py-0.5 text-xs dark:bg-zinc-800">{value}</code>
+      <code className={`min-w-0 flex-1 truncate rounded bg-zinc-100 px-1.5 py-0.5 dark:bg-zinc-800 ${valueCls}`}>{value}</code>
       {action}
       <button onClick={copy} className="rounded-md p-1 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" title="Copy" aria-label={`Copy ${label}`}>
         {copied ? <span className="text-xs text-emerald-600">Copied</span> : <Icon name="copy" size={14} />}
@@ -897,6 +908,168 @@ function HostSection({ serverUrl, onUse }: { serverUrl: string; onUse: (url: str
   );
 }
 
+/** Device linking: let a phone (or second computer) become the same user. */
+function LinkSection() {
+  const client = useChat((s) => s.client)!;
+  const devices = useChat((s) => s.devices);
+  const createLinkCode = useChat((s) => s.createLinkCode);
+  const redeemLinkCode = useChat((s) => s.redeemLinkCode);
+  const unlink = useChat((s) => s.unlink);
+  const [code, setCode] = useState<{ text: string; expiresAt: number } | null>(null);
+  const [now, setNow] = useState(Date.now());
+  const [entered, setEntered] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Live countdown for the code; when it runs out, the create button returns.
+  useEffect(() => {
+    if (!code) return;
+    const t = window.setInterval(() => {
+      if (code.expiresAt - Date.now() <= 0) setCode(null);
+      else setNow(Date.now());
+    }, 1000);
+    return () => window.clearInterval(t);
+  }, [code]);
+
+  const start = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const { code: text, expiresInSecs } = await createLinkCode();
+      setCode({ text, expiresAt: Date.now() + expiresInSecs * 1000 });
+      setNow(Date.now());
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const link = async () => {
+    const ok = await confirmAction(
+      "Link to another device",
+      "This device will switch to the other device's account and rooms. Rooms joined on this device stay with its old account until you unlink.",
+      "Link",
+    );
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await redeemLinkCode(entered);
+      setEntered("");
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const unlinkThis = async () => {
+    const ok = await confirmAction(
+      "Unlink this device",
+      "Switch back to this device's own account and its rooms?",
+      "Unlink",
+    );
+    if (!ok) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await unlink();
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const secsLeft = code ? Math.max(0, Math.ceil((code.expiresAt - now) / 1000)) : 0;
+  const mm = Math.floor(secsLeft / 60);
+  const ss = String(secsLeft % 60).padStart(2, "0");
+
+  return (
+    <div className="space-y-3 border-t border-zinc-200 pt-5 dark:border-zinc-800">
+      <div>
+        <h3 className="text-sm font-semibold">Devices</h3>
+        <p className="mt-1 text-xs text-zinc-500">
+          Link a phone or second computer so it uses this account's rooms. Linked devices count as the same person everywhere.
+        </p>
+      </div>
+
+      {client.linked && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+          <span className="text-sm">
+            Linked to <span className="font-medium">{client.display_name}</span>'s account
+          </span>
+          <Button variant="outline" disabled={busy} onClick={unlinkThis}>
+            Unlink
+          </Button>
+        </div>
+      )}
+
+      <div className="space-y-2">
+        <span className="block text-xs font-medium text-zinc-700 dark:text-zinc-300">Link another device</span>
+        {code ? (
+          <div className="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-800">
+            <CopyRow
+              label="Code"
+              value={code.text}
+              valueCls="text-2xl tracking-widest"
+              action={<span className="shrink-0 text-sm tabular-nums text-zinc-500">{mm}:{ss}</span>}
+            />
+            <p className="text-xs text-zinc-500">
+              {"On your phone, open Settings > General > Link to another device and enter this code."}
+            </p>
+          </div>
+        ) : (
+          <Button variant="outline" disabled={busy} onClick={start}>
+            Create code
+          </Button>
+        )}
+      </div>
+
+      <div className="space-y-2">
+        <span className="block text-xs font-medium text-zinc-700 dark:text-zinc-300">Link to another device</span>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            className="w-36 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-center font-mono text-base uppercase tracking-widest outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 dark:border-zinc-700 dark:bg-zinc-950"
+            value={entered}
+            maxLength={6}
+            inputMode="text"
+            autoCapitalize="characters"
+            spellCheck={false}
+            autoComplete="off"
+            placeholder="ABC234"
+            onChange={(e) => setEntered(e.target.value.toUpperCase())}
+          />
+          <Button disabled={busy || entered.length !== 6} onClick={link}>
+            Link
+          </Button>
+        </div>
+      </div>
+
+      {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+
+      <div className="space-y-2">
+        <span className="block text-xs font-medium text-zinc-700 dark:text-zinc-300">Devices online</span>
+        {devices.length === 0 ? (
+          <p className="text-xs text-zinc-500">No devices of this account are online.</p>
+        ) : (
+          <ul className="space-y-1">
+            {devices.map((d) => (
+              <li key={d.device_id} className="flex flex-wrap items-center gap-2 text-sm">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                <span className="font-medium">{d.device_name}</span>
+                <span className="text-xs text-zinc-500">{d.platform}</span>
+                {d.device_id === client.device_id && <Badge>This device</Badge>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function GeneralPanel() {
   const client = useChat((s) => s.client)!;
   const saveIdentity = useChat((s) => s.saveIdentity);
@@ -904,6 +1077,10 @@ function GeneralPanel() {
   const [url, setUrl] = useState(client.server_url);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [appearance, setAppearance] = useAppearance();
+
+  // Linking or unlinking switches accounts, and with it the name; a stale field
+  // here would rename the other account on the next Save.
+  useEffect(() => setName(client.display_name), [client.user_id, client.display_name]);
 
   const save = async () => {
     try {
@@ -946,6 +1123,8 @@ function GeneralPanel() {
           }
         }}
       />
+
+      <LinkSection />
 
       <div className="space-y-3 border-t border-zinc-200 pt-5 dark:border-zinc-800">
         <h3 className="text-sm font-semibold">Appearance</h3>

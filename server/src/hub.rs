@@ -2,9 +2,10 @@
 
 use crate::db::{self, Db, NewMessage};
 use crate::db::AiResult;
-use crate::protocol::{Attachment, ClientMsg, Member, RoomInfo, ServerMsg, ToolActivity};
+use crate::protocol::{Attachment, ClientMsg, Device, Member, RoomInfo, ServerMsg, ToolActivity};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 const MAX_NAME: usize = 40;
@@ -20,12 +21,20 @@ const MAX_ATTACHMENT_B64: usize = 6_000_000;
 /// Reported image dimensions outside 1..=this are rejected as bogus metadata.
 const MAX_IMAGE_SIDE: u32 = 16_384;
 const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+/// How long a device-link code stays valid.
+const LINK_CODE_TTL: Duration = Duration::from_secs(10 * 60);
+/// Failed link-code redeems allowed per connection before further tries are refused.
+const MAX_FAILED_REDEEMS: u32 = 5;
 
 pub type ConnId = u64;
 
 struct Conn {
     user_id: Option<String>,
     display_name: String,
+    device_id: String,
+    device_name: String,
+    platform: String,
+    failed_redeems: u32,
     tx: UnboundedSender<String>,
     rooms: HashSet<String>,
 }
@@ -40,11 +49,19 @@ struct Stream {
     attachments: Vec<Attachment>,
 }
 
+/// A device-linking code: whoever redeems it joins the issuing user's account.
+struct LinkCode {
+    user_id: String,
+    display_name: String,
+    expires: Instant,
+}
+
 #[derive(Default)]
 struct Hub {
     next_id: ConnId,
     conns: HashMap<ConnId, Conn>,
     streams: HashMap<String, Stream>,
+    link_codes: HashMap<String, LinkCode>,
 }
 
 impl Hub {
@@ -63,6 +80,27 @@ impl Hub {
     fn broadcast(&self, room_id: &str, msg: &ServerMsg) {
         let text = serde_json::to_string(msg).expect("serializable");
         for c in self.conns.values().filter(|c| c.rooms.contains(room_id)) {
+            let _ = c.tx.send(text.clone());
+        }
+    }
+
+    /// Sends the user's currently online devices to every one of their connections.
+    fn send_devices(&self, user_id: &str) {
+        let mut seen = HashSet::new();
+        let mut devices: Vec<Device> = self
+            .conns
+            .values()
+            .filter(|c| c.user_id.as_deref() == Some(user_id) && !c.device_id.is_empty())
+            .filter(|c| seen.insert(c.device_id.clone()))
+            .map(|c| Device {
+                device_id: c.device_id.clone(),
+                device_name: c.device_name.clone(),
+                platform: c.platform.clone(),
+            })
+            .collect();
+        devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        let text = serde_json::to_string(&ServerMsg::Devices { devices }).expect("serializable");
+        for c in self.conns.values().filter(|c| c.user_id.as_deref() == Some(user_id)) {
             let _ = c.tx.send(text.clone());
         }
     }
@@ -97,7 +135,16 @@ impl State {
         let id = hub.next_id;
         hub.conns.insert(
             id,
-            Conn { user_id: None, display_name: String::new(), tx, rooms: HashSet::new() },
+            Conn {
+                user_id: None,
+                display_name: String::new(),
+                device_id: String::new(),
+                device_name: String::new(),
+                platform: String::new(),
+                failed_redeems: 0,
+                tx,
+                rooms: HashSet::new(),
+            },
         );
         id
     }
@@ -167,8 +214,8 @@ impl State {
     }
 
     async fn dispatch(&self, conn: ConnId, msg: ClientMsg) -> sqlx::Result<()> {
-        if let ClientMsg::Hello { user_id, display_name } = msg {
-            return self.hello(conn, user_id, display_name).await;
+        if let ClientMsg::Hello { user_id, display_name, device_id, device_name, platform } = msg {
+            return self.hello(conn, user_id, display_name, device_id, device_name, platform).await;
         }
         let Some((user_id, display_name)) = self.identity(conn) else {
             self.send(conn, err(None, "Send hello first"));
@@ -473,6 +520,71 @@ impl State {
                     ServerMsg::RoomUpdated { room_id: room_id.clone(), system_prompt: prompt, updated_by: user_id },
                 );
             }
+
+            ClientMsg::CreateLinkCode { request_id } => {
+                let mut hub = self.hub();
+                hub.link_codes.retain(|_, c| c.expires > Instant::now());
+                // One live code per user: a fresh code replaces the previous one.
+                hub.link_codes.retain(|_, c| c.user_id != user_id);
+                let code = db::invite_code();
+                hub.link_codes.insert(
+                    code.clone(),
+                    LinkCode {
+                        user_id: user_id.clone(),
+                        display_name: display_name.clone(),
+                        expires: Instant::now() + LINK_CODE_TTL,
+                    },
+                );
+                let msg = ServerMsg::LinkCode {
+                    request_id,
+                    code,
+                    expires_in_secs: LINK_CODE_TTL.as_secs(),
+                };
+                hub.send(conn, &msg);
+            }
+
+            ClientMsg::RedeemLinkCode { request_id, code } => {
+                let mut hub = self.hub();
+                if hub.conns.get(&conn).is_some_and(|c| c.failed_redeems >= MAX_FAILED_REDEEMS) {
+                    hub.send(
+                        conn,
+                        &err(Some(request_id), "Too many wrong codes. Close and reopen the app to try again"),
+                    );
+                    return Ok(());
+                }
+                hub.link_codes.retain(|_, c| c.expires > Instant::now());
+                let code = code.trim().to_uppercase();
+                let miss = |hub: &mut Hub| {
+                    if let Some(c) = hub.conns.get_mut(&conn) {
+                        c.failed_redeems += 1;
+                    }
+                };
+                // Clone the owner out of the map so the else branch can mutably
+                // borrow the hub (the map borrow ends with this statement).
+                let link =
+                    hub.link_codes.get(&code).map(|l| (l.user_id.clone(), l.display_name.clone()));
+                let Some((owner_id, owner_name)) = link else {
+                    miss(&mut hub);
+                    hub.send(
+                        conn,
+                        &err(Some(request_id), "That link code is wrong or has expired"),
+                    );
+                    return Ok(());
+                };
+                if owner_id == user_id {
+                    miss(&mut hub);
+                    hub.send(conn, &err(Some(request_id), "This device is already on that account"));
+                    return Ok(());
+                }
+                // A code works once: consume it on the successful redeem.
+                hub.link_codes.remove(&code);
+                let msg = ServerMsg::Linked {
+                    request_id,
+                    user_id: owner_id,
+                    display_name: owner_name,
+                };
+                hub.send(conn, &msg);
+            }
         }
         Ok(())
     }
@@ -486,8 +598,19 @@ impl State {
         }
     }
 
-    async fn hello(&self, conn: ConnId, user_id: String, display_name: String) -> sqlx::Result<()> {
+    async fn hello(
+        &self,
+        conn: ConnId,
+        user_id: String,
+        display_name: String,
+        device_id: String,
+        device_name: String,
+        platform: String,
+    ) -> sqlx::Result<()> {
         let display_name = clip(&display_name, MAX_NAME);
+        let device_name = clip(&device_name, MAX_NAME);
+        let platform = clip(&platform, 16);
+        let device_id = clip(&device_id, 64);
         if uuid::Uuid::parse_str(&user_id).is_err() || display_name.is_empty() {
             self.send(conn, err(None, "hello needs a UUID user_id and a display name"));
             return Ok(());
@@ -508,6 +631,9 @@ impl State {
             if let Some(c) = hub.conns.get_mut(&conn) {
                 c.user_id = Some(user_id.clone());
                 c.display_name = display_name.clone();
+                c.device_id = device_id;
+                c.device_name = device_name;
+                c.platform = platform;
                 c.rooms = room_ids.iter().cloned().collect();
             }
             // Keep the name current on this user's other connections too.
@@ -546,7 +672,9 @@ impl State {
                 rooms.push(info);
             }
         }
-        self.send(conn, ServerMsg::Welcome { user_id, rooms });
+        self.send(conn, ServerMsg::Welcome { user_id: user_id.clone(), rooms });
+        let hub = self.hub();
+        hub.send_devices(&user_id);
         Ok(())
     }
 
@@ -592,6 +720,7 @@ impl State {
                 };
                 hub.broadcast(room_id, &msg);
             }
+            hub.send_devices(&user_id);
         }
     }
 }

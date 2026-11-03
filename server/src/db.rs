@@ -154,7 +154,8 @@ pub async fn room(db: &Db, room_id: &str) -> sqlx::Result<Option<RoomRow>> {
     Ok(Some(RoomRow { id, name, invite_code, system_prompt, members }))
 }
 
-fn invite_code() -> String {
+/// Short human-readable code used for room invites and device linking.
+pub fn invite_code() -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
     let mut rng = rand::thread_rng();
     (0..6).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()

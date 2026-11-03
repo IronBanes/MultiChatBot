@@ -59,6 +59,11 @@ async function closeWhenRegistered(ws: WebSocket) {
   }
 }
 
+/** Name shown for this device in the other devices' "devices online" list. */
+function deviceName(platform: string): string {
+  return platform === "ios" ? "iPhone" : platform === "android" ? "Android phone" : "PC";
+}
+
 /** A short, human reason for a failed connection attempt. */
 function connectError(url: string, e: unknown): string {
   let host = url;
@@ -90,11 +95,20 @@ export class Relay {
    *  they were sent; a new connection starts with an empty queue. */
   private queue: Promise<void> = Promise.resolve();
 
+  private hello: {
+    user_id: string;
+    display_name: string;
+    device_id: string;
+    device_name: string;
+    platform: string;
+  };
+
   constructor(
     private url: string,
-    private hello: { user_id: string; display_name: string },
+    identity: { user_id: string; display_name: string; device_id: string; platform: string },
     private handlers: Handlers,
   ) {
+    this.hello = { ...identity, device_name: deviceName(identity.platform) };
     void this.connect();
   }
 

@@ -94,6 +94,16 @@ pub struct Config {
     pub user_id: String,
     #[serde(default)]
     pub display_name: String,
+    /// Stable id of this physical device, used for device linking.
+    #[serde(default = "new_device_id")]
+    pub device_id: String,
+    /// The user_id this device had before linking to another device's account.
+    /// Unlinking returns to it.
+    #[serde(default)]
+    pub linked_from: Option<String>,
+    /// This device's own display name from before linking, restored on unlink.
+    #[serde(default)]
+    pub linked_from_name: Option<String>,
     #[serde(default = "default_server_url")]
     pub server_url: String,
     #[serde(default)]
@@ -130,11 +140,18 @@ fn default_server_url() -> String {
     DEFAULT_SERVER_URL.to_string()
 }
 
+fn new_device_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             user_id: uuid::Uuid::new_v4().to_string(),
             display_name: String::new(),
+            device_id: new_device_id(),
+            linked_from: None,
+            linked_from_name: None,
             server_url: default_server_url(),
             last_profile_by_room: HashMap::new(),
             profiles: Vec::new(),
@@ -169,11 +186,19 @@ pub fn config_path(base: &Path) -> PathBuf {
 }
 
 pub fn load(path: &Path) -> Config {
-    let cfg = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Config>(&s).ok());
+    let raw = std::fs::read_to_string(path).ok();
+    let cfg = raw
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<Config>(s).ok());
     match cfg {
-        Some(c) => c,
+        Some(c) => {
+            // A config written before device ids existed gets a fresh device_id
+            // from serde's default; save it now so it stays this device's id.
+            if !raw.as_deref().is_some_and(|s| s.contains("\"device_id\"")) {
+                let _ = save(path, &c);
+            }
+            c
+        }
         None => {
             let c = Config::default();
             let _ = save(path, &c);
