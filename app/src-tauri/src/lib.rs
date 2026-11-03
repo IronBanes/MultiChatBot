@@ -18,7 +18,7 @@ use mcp::McpManager;
 use providers::{ChatRequest, ModelInfo, ProviderError, StreamEvent};
 use secrets::McpSecrets;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,6 +38,10 @@ struct AppState {
     /// Held for a whole secret-plus-settings save, so two saves can't interleave their
     /// keychain writes, settings update and rollback.
     saving: Mutex<()>,
+    /// Profiles whose stored key may belong to settings that never got saved (the save,
+    /// the key restore and the key removal all failed). They can't generate until the
+    /// profile is saved successfully again.
+    unsafe_keys: Mutex<HashSet<String>>,
 }
 
 impl AppState {
@@ -214,11 +218,19 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
             if restored.is_err() {
                 return Err(match secrets::delete_key(&id) {
                     Ok(()) => format!("{e}. The API key for this profile was removed; enter it again."),
-                    Err(_) => format!("{e}. The API key for this profile couldn't be restored; enter it again before using it."),
+                    Err(_) => {
+                        if let Ok(mut blocked) = state.unsafe_keys.lock() {
+                            blocked.insert(id.clone());
+                        }
+                        format!("{e}. The API key for this profile couldn't be restored, so the profile is disabled until you save it again.")
+                    }
                 });
             }
         }
         return Err(e);
+    }
+    if let Ok(mut blocked) = state.unsafe_keys.lock() {
+        blocked.remove(&saved.id);
     }
     Ok(view(saved))
 }
@@ -461,6 +473,9 @@ fn generate(
 ) -> Result<(), String> {
     let cfg = state.snapshot()?;
     let profile = state.profile(&profile_id)?;
+    if state.unsafe_keys.lock().map_err(|_| "lock poisoned")?.contains(&profile.id) {
+        return Err(format!("{} is disabled after a failed save. Save it again in Settings to use it.", profile.label));
+    }
     let key = secrets::get_key(&profile.id)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let prompt = context::build(&history, &room_prompt, profile.max_context_tokens);
@@ -590,6 +605,7 @@ pub fn run() {
                 mcp: Arc::new(McpManager::default()),
                 host,
                 saving: Mutex::new(()),
+                unsafe_keys: Mutex::new(HashSet::new()),
             });
             Ok(())
         })
