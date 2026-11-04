@@ -269,9 +269,29 @@ function ReactButton({ m, align = "left" }: { m: Message; align?: "left" | "righ
   );
 }
 
-/** Phones: the long-press sheet — the palette as large buttons, plus Copy text. */
-function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
+/** The composer's editing target: which message, and its text at pickup time. */
+export interface Draft {
+  id: string;
+  /** The message's current text when editing started. */
+  content: string;
+}
+
+/** Phones: the long-press sheet — the palette as large buttons, plus Copy text and
+ *  Edit/Delete on your own messages. */
+function ReactionSheet({
+  m,
+  mine,
+  onEdit,
+  onClose,
+}: {
+  m: Message;
+  /** author_id is this user (edit/delete only apply to your own messages). */
+  mine: boolean;
+  onEdit: (m: Message) => void;
+  onClose: () => void;
+}) {
   const react = useChat((s) => s.react);
+  const deleteMessage = useChat((s) => s.deleteMessage);
   const myId = useChat((s) => s.client!.user_id);
   const toast = useChat((s) => s.toast);
   const [copied, setCopied] = useState(false);
@@ -284,7 +304,14 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
       toast("Couldn't copy the text");
     }
   };
-  const mine = (emoji: string) => m.reactions.some((r) => r.emoji === emoji && r.user_ids.includes(myId));
+  const del = async () => {
+    onClose();
+    if (await confirmAction("Delete message?", "Everyone in the room will see it was deleted.", "Delete")) {
+      deleteMessage(m.room_id, m.id);
+    }
+  };
+  const mineEmoji = (emoji: string) => m.reactions.some((r) => r.emoji === emoji && r.user_ids.includes(myId));
+  const row = "flex min-h-12 w-full items-center gap-3 px-4 text-left text-[15px] active:bg-zinc-100 dark:active:bg-zinc-800";
   return (
     <div className="fixed inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={onClose}>
       <div
@@ -297,11 +324,11 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
             <button
               key={emoji}
               onClick={() => {
-                react(m.room_id, m.id, emoji, !mine(emoji));
+                react(m.room_id, m.id, emoji, !mineEmoji(emoji));
                 onClose();
               }}
               className={`mx-auto flex h-11 w-11 items-center justify-center rounded-full text-2xl leading-none transition active:bg-zinc-100 dark:active:bg-zinc-800 ${
-                mine(emoji) ? "bg-indigo-50 dark:bg-indigo-950/60" : ""
+                mineEmoji(emoji) ? "bg-indigo-50 dark:bg-indigo-950/60" : ""
               }`}
               aria-label={`React with ${emoji}`}
             >
@@ -310,12 +337,27 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
           ))}
         </div>
         {m.content && (
-          <button
-            onClick={copy}
-            className="flex min-h-12 w-full items-center gap-3 px-4 text-left text-[15px] active:bg-zinc-100 dark:active:bg-zinc-800"
-          >
+          <button onClick={copy} className={row}>
             <Icon name="copy" size={18} className="text-zinc-500" />
             <span className="flex-1">{copied ? "Copied" : "Copy text"}</span>
+          </button>
+        )}
+        {mine && m.kind === "human" && (
+          <button
+            onClick={() => {
+              onEdit(m);
+              onClose();
+            }}
+            className={row}
+          >
+            <Icon name="pencil" size={18} className="text-zinc-500" />
+            <span className="flex-1">Edit</span>
+          </button>
+        )}
+        {mine && (
+          <button onClick={del} className={`${row} text-red-600 dark:text-red-400`}>
+            <Icon name="trash" size={18} />
+            <span className="flex-1">Delete</span>
           </button>
         )}
       </div>
@@ -377,6 +419,7 @@ const MessageItem = memo(function MessageItem({
   mine,
   bubbles,
   members,
+  onEdit,
 }: {
   m: Message;
   anchor: Message | undefined;
@@ -388,9 +431,12 @@ const MessageItem = memo(function MessageItem({
   bubbles: boolean;
   /** Room members, to name who reacted (stable reference from MessageList). */
   members: Member[];
+  /** Start editing this message in the composer (own human messages). */
+  onEdit: (m: Message) => void;
 }) {
   const regenerate = useChat((s) => s.regenerate);
   const stopAi = useChat((s) => s.stopAi);
+  const deleteMessage = useChat((s) => s.deleteMessage);
   const answerToolCall = useChat((s) => s.answerToolCall);
   const generating = useChat((s) => !!s.myGenerations[m.id]);
   const localTools = useChat((s) => s.localTools[m.id]);
@@ -398,9 +444,33 @@ const MessageItem = memo(function MessageItem({
   const [sheet, setSheet] = useState(false);
   const longPress = useLongPress(() => setSheet(true));
 
+  const del = async () => {
+    if (await confirmAction("Delete message?", "Everyone in the room will see it was deleted.", "Delete")) {
+      deleteMessage(m.room_id, m.id);
+    }
+  };
+
+  if (m.deleted) {
+    return (
+      <div
+        data-message-id={m.id}
+        className={`flex gap-2 px-3 ${compact ? "pt-0.5" : "pt-3"} ${m.kind === "human" && bubbles && mine ? "justify-end" : ""}`}
+      >
+        {m.kind === "ai" && bubbles && (
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white">
+            <Icon name="sparkle" size={14} />
+          </div>
+        )}
+        <div className="max-w-[80%] px-1 py-0.5 text-[14px] leading-snug text-zinc-400 italic dark:text-zinc-500">
+          Message deleted
+        </div>
+      </div>
+    );
+  }
+
   if (m.kind === "human" && bubbles) {
     return (
-      <div className={`flex gap-2 px-3 ${mine ? "justify-end" : ""} ${compact ? "pt-0.5" : "pt-3"}`}>
+      <div data-message-id={m.id} className={`flex gap-2 px-3 ${mine ? "justify-end" : ""} ${compact ? "pt-0.5" : "pt-3"}`}>
         {!mine && <div className="w-7 shrink-0">{!compact && <Avatar userId={m.author_id} name={m.author_name} size={28} />}</div>}
         <div className={`flex min-w-0 max-w-[80%] flex-col ${mine ? "items-end" : "items-start"}`}>
           {!compact && (
@@ -411,6 +481,7 @@ const MessageItem = memo(function MessageItem({
                 </span>
               )}
               <span className="shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
+              {m.edited_at && <span className="shrink-0 text-[11px] text-zinc-400">(edited)</span>}
             </div>
           )}
           <div
@@ -429,7 +500,7 @@ const MessageItem = memo(function MessageItem({
           {/* Only on your own: on everyone else's it would repeat under every message. */}
           {mine && !m.ai_requested && <span className="mt-0.5 px-1 text-[11px] text-zinc-400">no AI reply</span>}
         </div>
-        {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
+        {sheet && <ReactionSheet m={m} mine={mine} onEdit={onEdit} onClose={() => setSheet(false)} />}
       </div>
     );
   }
@@ -445,6 +516,7 @@ const MessageItem = memo(function MessageItem({
                 {m.author_name}
               </span>
               <span className="shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
+              {m.edited_at && <span className="shrink-0 text-[11px] text-zinc-400">(edited)</span>}
             </div>
           )}
           <div
@@ -462,8 +534,18 @@ const MessageItem = memo(function MessageItem({
             Touch screens long-press instead. */}
         <div className="pointer-events-none absolute -top-3 right-4 flex rounded-md border border-zinc-200 bg-white p-0.5 text-xs text-zinc-500 opacity-0 shadow-sm transition group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100 sm:right-5 dark:border-zinc-700 dark:bg-zinc-900 [@media(hover:none)]:!hidden">
           <ReactButton m={m} align="right" />
+          {mine && (
+            <>
+              <button onClick={() => onEdit(m)} className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                <Icon name="pencil" size={12} /> Edit
+              </button>
+              <button onClick={del} className="flex items-center gap-1 rounded px-1.5 text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/50">
+                <Icon name="trash" size={12} /> Delete
+              </button>
+            </>
+          )}
         </div>
-        {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
+        {sheet && <ReactionSheet m={m} mine={mine} onEdit={onEdit} onClose={() => setSheet(false)} />}
       </div>
     );
   }
@@ -532,6 +614,11 @@ const MessageItem = memo(function MessageItem({
         </button>
       )}
       {!bubbles && <ReactButton m={m} />}
+      {mine && (
+        <button onClick={del} className={actionCls}>
+          <Icon name="trash" size={12} /> Delete
+        </button>
+      )}
       {!streaming && myProfileId && anchor && (
         <button onClick={() => regenerate(m, myProfileId)} className={actionCls}>
           <Icon name="refresh" size={12} /> {bubbles ? "Regenerate" : "Regenerate with my profile"}
@@ -554,6 +641,7 @@ const MessageItem = memo(function MessageItem({
               {m.author_name}
             </span>
             <span className="ml-1 shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
+            {m.edited_at && <span className="ml-1 shrink-0 text-[11px] text-zinc-400">(edited)</span>}
           </div>
           {showAnchor && anchor && (
             <div className="mb-1 max-w-full truncate px-1 text-xs text-zinc-500">
@@ -570,7 +658,7 @@ const MessageItem = memo(function MessageItem({
           </div>
           <ReactionChips m={m} members={members} />
           <div className="mt-0.5 flex flex-wrap text-xs text-zinc-500">{actions}</div>
-          {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
+          {sheet && <ReactionSheet m={m} mine={mine} onEdit={onEdit} onClose={() => setSheet(false)} />}
         </div>
       </div>
     );
@@ -601,6 +689,7 @@ const MessageItem = memo(function MessageItem({
             </>
           )}
           <span className="ml-1 text-[11px] text-zinc-400">{time(m.created_at)}</span>
+          {m.edited_at && <span className="ml-1 text-[11px] text-zinc-400">(edited)</span>}
         </div>
         {showAnchor && anchor && (
           <div className="mt-0.5 truncate text-xs text-zinc-500">
@@ -619,7 +708,17 @@ const MessageItem = memo(function MessageItem({
   );
 });
 
-function MessageList({ room, myProfileId, bubbles }: { room: RoomInfo; myProfileId: string | null; bubbles: boolean }) {
+function MessageList({
+  room,
+  myProfileId,
+  bubbles,
+  onEdit,
+}: {
+  room: RoomInfo;
+  myProfileId: string | null;
+  bubbles: boolean;
+  onEdit: (m: Message) => void;
+}) {
   const messages = useChat((s) => s.messages[room.id]);
   const loaded = useChat((s) => !!s.loaded[room.id]);
   const myId = useChat((s) => s.client!.user_id);
@@ -707,6 +806,7 @@ function MessageList({ room, myProfileId, bubbles }: { room: RoomInfo; myProfile
               mine={m.author_id === myId}
               bubbles={bubbles}
               members={members}
+              onEdit={onEdit}
             />
           );
         })}
@@ -885,17 +985,23 @@ function Composer({
   profileId,
   onOpenSettings,
   phone,
+  editing,
+  onClearEditing,
 }: {
   room: RoomInfo;
   profileId: string | null;
   onOpenSettings: (tab: SettingsTab) => void;
   /** Phone layout: a pill message box with the options in a sheet. */
   phone: boolean;
+  /** Set while the box is editing one of this user's own messages. */
+  editing: Draft | null;
+  onClearEditing: () => void;
 }) {
   const profiles = useChat((s) => s.client!.profiles);
   const platform = useChat((s) => s.client!.platform);
   const status = useChat((s) => s.status);
   const sendMessage = useChat((s) => s.sendMessage);
+  const editMessage = useChat((s) => s.editMessage);
   const chooseProfile = useChat((s) => s.chooseProfile);
   const [text, setText] = useState("");
   const [aiOn, setAiOn] = useState(true);
@@ -903,12 +1009,20 @@ function Composer({
   const servers = useChat((s) => s.client!.mcp_servers);
   const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
   const ta = useRef<HTMLTextAreaElement>(null);
-  const ai = aiOn && !!profileId;
+  // While editing, the AI-reply option doesn't apply: the edit goes out as-is.
+  const ai = !editing && aiOn && !!profileId;
+
+  // Entering edit mode loads the message's current text and focuses the box.
+  useEffect(() => {
+    if (!editing) return;
+    setText(editing.content);
+    ta.current?.focus();
+  }, [editing]);
 
   // On phones, focusing would pop the keyboard up as soon as a room opens.
   useEffect(() => {
-    if (!phone) ta.current?.focus();
-  }, [room.id, phone]);
+    if (!phone && !editing) ta.current?.focus();
+  }, [room.id, phone, editing]);
 
   useLayoutEffect(() => {
     const el = ta.current;
@@ -920,6 +1034,17 @@ function Composer({
   const sending = useRef(false);
   const send = async () => {
     if (!text.trim() || status !== "online" || sending.current) return;
+    if (editing) {
+      sending.current = true;
+      try {
+        editMessage(room.id, editing.id, text);
+        onClearEditing();
+        setText("");
+      } finally {
+        sending.current = false;
+      }
+      return;
+    }
     const sent = text;
     sending.current = true;
     try {
@@ -933,11 +1058,39 @@ function Composer({
     }
   };
 
+  // Escape cancels an edit from the box itself.
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape" && editing) {
+      e.preventDefault();
+      onClearEditing();
+      setText("");
+    }
+  };
+
+  // The "Editing message ✕" bar above the box.
+  const contextBar = editing && (
+    <div className="mb-1 flex items-center gap-2 px-1 text-xs text-zinc-600 dark:text-zinc-300">
+      <Icon name="pencil" size={13} className="shrink-0 text-indigo-600 dark:text-indigo-400" />
+      <span className="min-w-0 flex-1 truncate font-medium">Editing message</span>
+      <button
+        onClick={() => {
+          onClearEditing();
+          setText("");
+        }}
+        className="shrink-0 rounded-full p-1 text-zinc-400 active:bg-zinc-100 dark:active:bg-zinc-800"
+        aria-label="Cancel editing"
+      >
+        <Icon name="x" size={13} />
+      </button>
+    </div>
+  );
+
   if (phone) {
     const profile = profiles.find((p) => p.id === profileId);
     const toolsOn = servers.filter((s) => (modes?.[s.id] ?? s.default_mode) !== "off").length;
     return (
       <div className="safe-bottom border-t border-zinc-200 px-2 pt-1.5 pb-[max(0.5rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
+        {contextBar}
         <button
           onClick={() => (profiles.length ? setSheet(true) : onOpenSettings("profiles"))}
           className="mb-1 flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-xs text-zinc-500 active:bg-zinc-100 dark:active:bg-zinc-800"
@@ -962,16 +1115,17 @@ function Composer({
             rows={1}
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder={ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
+            onKeyDown={onKeyDown}
+            placeholder={editing ? "Edit your message" : ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
             className="block min-h-10 min-w-0 flex-1 resize-none rounded-[20px] border border-zinc-300 bg-white px-4 py-2 text-[16px] leading-snug outline-none placeholder:text-zinc-400 focus:border-indigo-500 dark:border-zinc-700 dark:bg-zinc-900"
           />
           <button
             onClick={send}
             disabled={!text.trim() || status !== "online"}
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-white transition active:bg-indigo-500 disabled:bg-zinc-200 disabled:text-zinc-400 dark:disabled:bg-zinc-800 dark:disabled:text-zinc-600"
-            aria-label="Send"
+            aria-label={editing ? "Save edit" : "Send"}
           >
-            <Icon name="send" size={18} className="-rotate-90" />
+            <Icon name={editing ? "check" : "send"} size={18} className={editing ? "" : "-rotate-90"} />
           </button>
         </div>
         {sheet && (
@@ -991,6 +1145,7 @@ function Composer({
   return (
     <div className="border-t border-zinc-200 px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-4 sm:pb-[max(1rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
       <div className="mx-auto max-w-4xl rounded-2xl border border-zinc-300 bg-white shadow-sm transition focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-500/20 dark:border-zinc-700 dark:bg-zinc-900">
+        {contextBar && <div className="px-4 pt-2.5">{contextBar}</div>}
         <textarea
           ref={ta}
           rows={1}
@@ -1000,9 +1155,11 @@ function Composer({
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
               send();
+            } else {
+              onKeyDown(e);
             }
           }}
-          placeholder={ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
+          placeholder={editing ? "Edit your message — Enter to save, Esc to cancel" : ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
           className="block w-full resize-none bg-transparent px-4 pt-3 pb-1 text-[15px] outline-none placeholder:text-zinc-400"
         />
         <div className="flex items-center gap-1.5 px-2 pb-2 sm:gap-2">
@@ -1046,9 +1203,9 @@ function Composer({
             onClick={send}
             disabled={!text.trim() || status !== "online"}
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-white transition hover:bg-indigo-500 disabled:bg-zinc-300 dark:disabled:bg-zinc-700"
-            aria-label="Send"
+            aria-label={editing ? "Save edit" : "Send"}
           >
-            <Icon name="send" size={16} />
+            <Icon name={editing ? "check" : "send"} size={16} />
           </button>
         </div>
       </div>
@@ -1244,7 +1401,12 @@ export function RoomView({
   const [promptOpen, setPromptOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  /** Editing target for the composer, shared with the message list. */
+  const [editing, setEditing] = useState<Draft | null>(null);
   const swipe = useSwipeBack(onBack);
+
+  const startEdit = (m: Message) => setEditing({ id: m.id, content: m.content });
+  const clearEditing = () => setEditing(null);
 
   const remembered = client.last_profile_by_room[room.id];
   const profileId = client.profiles.some((p) => p.id === remembered) ? remembered : (client.profiles[0]?.id ?? null);
@@ -1332,10 +1494,19 @@ export function RoomView({
     >
       <div className="flex min-w-0 flex-1 flex-col">
         {header}
-        <MessageList room={room} myProfileId={profileId} bubbles={phone} />
+        <MessageList room={room} myProfileId={profileId} bubbles={phone} onEdit={startEdit} />
         {/* Keyed by room: each room gets a fresh draft, and a send that finishes after
-            switching rooms can't edit the new room's text. */}
-        <Composer key={room.id} room={room} profileId={profileId} onOpenSettings={onOpenSettings} phone={phone} />
+            switching rooms can't edit the new room's text. The editing state lives here
+            so both the list and the composer reach it. */}
+        <Composer
+          key={room.id}
+          room={room}
+          profileId={profileId}
+          onOpenSettings={onOpenSettings}
+          phone={phone}
+          editing={editing}
+          onClearEditing={clearEditing}
+        />
       </div>
       {inlineMembers && membersPref && <MemberList room={room} overlay={false} onClose={() => setMembersPref(false)} />}
       {!inlineMembers && membersOverlay && <MemberList room={room} overlay onClose={() => setMembersOverlay(false)} />}

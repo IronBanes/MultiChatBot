@@ -62,6 +62,10 @@ interface ChatState {
   leaveRoom(id: string): void;
   /** Resolves true once the message was actually written to the relay. */
   sendMessage(roomId: string, content: string, aiRequested: boolean, profileId: string | null): Promise<boolean>;
+  /** Rewrites one of this user's own human messages. */
+  editMessage(roomId: string, messageId: string, content: string): void;
+  /** Soft-deletes one of this user's own messages (human, or an AI reply they generated). */
+  deleteMessage(roomId: string, messageId: string): void;
   regenerate(ai: Message, profileId: string): void;
   stopAi(id: string): void;
   /** Adds or removes this user's reaction on a message (human or AI). */
@@ -180,7 +184,7 @@ export const useChat = create<ChatState>((set, get) => {
     }
     const room = s.rooms[roomId];
     const history: HistoryItem[] = (s.messages[roomId] ?? [])
-      .filter((m) => m.seq <= anchor.seq && (m.kind === "human" || m.status === "complete"))
+      .filter((m) => m.seq <= anchor.seq && !m.deleted && (m.kind === "human" || m.status === "complete"))
       .map((m) => ({ kind: m.kind, author_name: m.author_name, content: m.content }));
 
     const id = crypto.randomUUID();
@@ -418,6 +422,18 @@ export const useChat = create<ChatState>((set, get) => {
           },
         }));
         break;
+      case "message_updated":
+        // The full row after an edit or delete; keep locally loaded image previews.
+        set((s) => ({
+          messages: {
+            ...s.messages,
+            [msg.room_id]: patchMessage(s.messages[msg.room_id], msg.message.id, (old) => ({
+              ...msg.message,
+              attachments: msg.message.attachments.length ? msg.message.attachments : old.attachments,
+            }))!,
+          },
+        }));
+        break;
       case "room_updated":
         patchRoom(msg.room_id, (r) => ({ ...r, system_prompt: msg.system_prompt }));
         break;
@@ -555,6 +571,14 @@ export const useChat = create<ChatState>((set, get) => {
 
     stopAi(id) {
       void backend.stopGeneration(id);
+    },
+
+    editMessage(roomId, messageId, content) {
+      relay?.send({ type: "edit_message", room_id: roomId, message_id: messageId, content });
+    },
+
+    deleteMessage(roomId, messageId) {
+      relay?.send({ type: "delete_message", room_id: roomId, message_id: messageId });
     },
 
     react(roomId, messageId, emoji, on) {

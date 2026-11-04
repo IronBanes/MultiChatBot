@@ -89,6 +89,15 @@ pub enum ClientMsg {
         /// true adds the reaction, false removes it.
         on: bool,
     },
+    EditMessage {
+        room_id: String,
+        message_id: String,
+        content: String,
+    },
+    DeleteMessage {
+        room_id: String,
+        message_id: String,
+    },
     CreateLinkCode {
         request_id: String,
     },
@@ -188,6 +197,11 @@ pub enum ServerMsg {
         message_id: String,
         reactions: Vec<Reaction>,
     },
+    /// A message after an edit or a delete; carries the full current row.
+    MessageUpdated {
+        room_id: String,
+        message: Message,
+    },
     LinkCode {
         request_id: String,
         code: String,
@@ -286,4 +300,8 @@ pub struct Message {
     pub status: String,
     pub error: Option<String>,
     pub created_at: i64,
+    /// Set when the text was edited; clients show "(edited)".
+    pub edited_at: Option<i64>,
+    /// Soft delete: the row stays, but the content is gone for everyone.
+    pub deleted: bool,
 }

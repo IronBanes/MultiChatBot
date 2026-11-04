@@ -82,6 +82,8 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
     for ddl in [
         "ALTER TABLE messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE messages ADD COLUMN edited_at INTEGER",
+        "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE attachments ADD COLUMN call_id TEXT",
         "ALTER TABLE attachments ADD COLUMN width INTEGER",
         "ALTER TABLE attachments ADD COLUMN height INTEGER",
@@ -239,7 +241,7 @@ pub async fn set_room_prompt(db: &Db, room_id: &str, prompt: &str) -> sqlx::Resu
 
 // `attachments` and `reactions` are filled in by `with_attachments` / `with_reactions`.
 const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, reasoning, tools, '[]' AS attachments, \
-                            '[]' AS reactions, ai_requested, anchor_id, model, status, error, created_at";
+                            '[]' AS reactions, ai_requested, anchor_id, model, status, error, created_at, edited_at, deleted";
 
 pub async fn recent_messages(db: &Db, room_id: &str, limit: i64) -> sqlx::Result<Vec<Message>> {
     let messages = sqlx::query_as(&format!(
@@ -468,6 +470,36 @@ pub struct AiResult<'a> {
     pub error: Option<&'a str>,
 }
 
+/// Rewrites a message's text and stamps `edited_at`, so clients can show "(edited)".
+pub async fn edit_message(db: &Db, id: &str, content: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE messages SET content = ?, edited_at = ? WHERE id = ?")
+        .bind(content)
+        .bind(now_ms())
+        .bind(id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// Soft-deletes a message: the row stays (AI anchors and replies still resolve) but
+/// the text, reasoning, tools, images and reactions are gone.
+pub async fn delete_message(db: &Db, id: &str) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE messages SET content = '', reasoning = '', tools = '[]', deleted = 1 \
+         WHERE id = ?",
+    )
+    .bind(id)
+    .execute(db)
+    .await?;
+    for sql in [
+        "DELETE FROM reactions WHERE message_id = ?",
+        "DELETE FROM attachments WHERE message_id = ?",
+    ] {
+        sqlx::query(sql).bind(id).execute(db).await?;
+    }
+    Ok(())
+}
+
 pub async fn finish_ai(db: &Db, id: &str, r: AiResult<'_>) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE messages SET content = ?, reasoning = ?, tools = ?, status = ?, error = ? WHERE id = ?",
@@ -544,6 +576,89 @@ mod tests {
         assert_eq!(set("b", emoji[2], true).await.unwrap(), Ok(()));
         let got: Vec<_> = reactions(&db, "m").await.unwrap().into_iter().map(|r| (r.emoji, r.user_ids.len())).collect();
         assert_eq!(got, vec![("😀".to_string(), 2), ("😂".to_string(), 1)]);
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_message_rewrites_content_and_stamps_edited_at() {
+        let dir = std::env::temp_dir().join(format!("mc-edit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users VALUES ('a', 'A', 0);
+             INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
+             INSERT INTO members VALUES ('r', 'a', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let m1 = insert_message(
+            &db,
+            NewMessage {
+                id: "m1",
+                room_id: "r",
+                kind: "human",
+                author_id: "a",
+                author_name: "A",
+                content: "first take",
+                ai_requested: false,
+                anchor_id: None,
+                model: None,
+                status: "complete",
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(m1.edited_at, None);
+        edit_message(&db, "m1", "second take").await.unwrap();
+        let m = message(&db, "m1").await.unwrap().unwrap();
+        assert_eq!(m.content, "second take");
+        assert!(m.edited_at.is_some_and(|t| t > 0));
+        assert!(!m.deleted);
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn delete_message_clears_content_and_reactions_but_keeps_the_row() {
+        let dir = std::env::temp_dir().join(format!("mc-del-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users VALUES ('a', 'A', 0), ('b', 'B', 0);
+             INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
+             INSERT INTO members VALUES ('r', 'a', 0), ('r', 'b', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        insert_message(
+            &db,
+            NewMessage {
+                id: "m1",
+                room_id: "r",
+                kind: "human",
+                author_id: "a",
+                author_name: "A",
+                content: "vanishing",
+                ai_requested: false,
+                anchor_id: None,
+                model: None,
+                status: "complete",
+            },
+        )
+        .await
+        .unwrap();
+        set_reaction(&db, "r", "m1", "b", "😀", true, 20).await.unwrap().unwrap();
+        delete_message(&db, "m1").await.unwrap();
+        let m = message(&db, "m1").await.unwrap().unwrap();
+        assert_eq!(m.content, "");
+        assert_eq!(m.reasoning, "");
+        assert!(m.tools.is_empty());
+        assert!(m.deleted);
+        // Reactions were removed with the content; the row itself stays.
+        assert!(reactions(&db, "m1").await.unwrap().is_empty());
         db.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

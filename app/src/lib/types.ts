@@ -67,6 +67,10 @@ export interface Message {
   status: MessageStatus;
   error: string | null;
   created_at: number;
+  /** Set when the text was edited; shown as "(edited)". */
+  edited_at: number | null;
+  /** Soft delete: the row stays but the content is gone for everyone. */
+  deleted: boolean;
 }
 
 export type ClientMsg =
@@ -86,6 +90,8 @@ export type ClientMsg =
   | { type: "ai_error"; room_id: string; id: string; error: string }
   | { type: "set_room_prompt"; room_id: string; system_prompt: string }
   | { type: "react"; room_id: string; message_id: string; emoji: string; on: boolean }
+  | { type: "edit_message"; room_id: string; message_id: string; content: string }
+  | { type: "delete_message"; room_id: string; message_id: string }
   | { type: "create_link_code"; request_id: string }
   | { type: "redeem_link_code"; request_id: string; code: string };
 
@@ -95,6 +101,7 @@ export type ServerMsg =
   | { type: "room_left"; room_id: string }
   | { type: "room_history"; room_id: string; messages: Message[] }
   | { type: "message"; room_id: string; message: Message }
+  | { type: "message_updated"; room_id: string; message: Message }
   | { type: "ai_delta"; room_id: string; id: string; delta: string }
   | { type: "ai_reasoning"; room_id: string; id: string; delta: string }
   | { type: "ai_tool"; room_id: string; id: string; activity: ToolActivity }

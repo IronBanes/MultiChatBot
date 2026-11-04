@@ -566,6 +566,71 @@ impl State {
                 );
             }
 
+            ClientMsg::EditMessage { room_id, message_id, content } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(None, "Not a member of that room"));
+                    return Ok(());
+                }
+                let Some(m) = db::message(&self.db, &message_id).await? else {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                };
+                if m.room_id != room_id {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                }
+                if m.deleted {
+                    self.send(conn, err(None, "That message was deleted"));
+                    return Ok(());
+                }
+                // Human messages only: AI replies belong to whoever ran the model.
+                if m.kind != "human" || m.author_id != user_id {
+                    self.send(conn, err(None, "You can only edit your own messages"));
+                    return Ok(());
+                }
+                if content.trim().is_empty() || content.len() > MAX_CONTENT {
+                    self.send(conn, err(None, "Message is empty or too long"));
+                    return Ok(());
+                }
+                db::edit_message(&self.db, &message_id, &content).await?;
+                let message = db::message(&self.db, &message_id).await?.expect("row still there");
+                self.broadcast(&room_id, ServerMsg::MessageUpdated { room_id: room_id.clone(), message });
+            }
+
+            ClientMsg::DeleteMessage { room_id, message_id } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(None, "Not a member of that room"));
+                    return Ok(());
+                }
+                let Some(m) = db::message(&self.db, &message_id).await? else {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                };
+                if m.room_id != room_id {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                }
+                if m.deleted {
+                    self.send(conn, err(None, "That message was deleted"));
+                    return Ok(());
+                }
+                // Both human messages and AI replies count as the author's own: an AI
+                // reply's author_id is the member whose profile generated it.
+                if m.author_id != user_id {
+                    self.send(conn, err(None, "You can only delete your own messages"));
+                    return Ok(());
+                }
+                // A streaming reply is still being written; deleting it mid-stream would
+                // race the finish that follows.
+                if m.kind == "ai" && self.hub().streams.contains_key(&message_id) {
+                    self.send(conn, err(None, "Stop the reply first"));
+                    return Ok(());
+                }
+                db::delete_message(&self.db, &message_id).await?;
+                let message = db::message(&self.db, &message_id).await?.expect("row still there");
+                self.broadcast(&room_id, ServerMsg::MessageUpdated { room_id: room_id.clone(), message });
+            }
+
             ClientMsg::CreateLinkCode { request_id } => {
                 let mut hub = self.hub();
                 hub.link_codes.retain(|_, c| c.expires > Instant::now());
