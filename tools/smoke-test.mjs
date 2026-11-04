@@ -124,12 +124,20 @@ ok(human.message.author_name === "Bob" && !human.message.ai_requested, "human-on
   alice2.send({ type: "typing", room_id: room.id, typing: true });
   await bob.wait(type("typing", (m) => m.user_id === alice.userId && m.typing), "typing true (second device)");
   alice2.send({ type: "typing", room_id: room.id, typing: false });
-  alice.send({ type: "typing", room_id: room.id, typing: false });
-  await bob.wait(type("typing", (m) => m.user_id === alice.userId && !m.typing), "typing false (last device)");
+  // Barrier: a reaction alice2 sends after its stop reaches Bob after anything that
+  // stop would have broadcast, so by then Bob must have seen no typing false.
+  const barrier = { type: "react", room_id: room.id, message_id: human.message.id, emoji: "👀" };
+  alice2.send({ ...barrier, on: true });
+  await bob.wait(type("reactions", (m) => m.message_id === human.message.id), "barrier reaction");
   ok(
     !bob.inbox.some((m) => m.type === "typing" && m.user_id === alice.userId),
     "one device stopping while another types sends no typing false",
   );
+  alice2.send({ ...barrier, on: false });
+  await bob.wait(type("reactions", (m) => m.message_id === human.message.id), "barrier reaction removed");
+  alice.send({ type: "typing", room_id: room.id, typing: false });
+  const last = await bob.wait(type("typing", (m) => m.user_id === alice.userId), "typing false (last device)");
+  ok(last.typing === false, "the last device stopping sends typing false");
   alice2.close();
   // By now Mallory's frames (sent first) have long been handled.
   ok(!mallory.inbox.some((m) => m.type === "error"), "typing from a non-member gets no error frame");
