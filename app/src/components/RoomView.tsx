@@ -1187,6 +1187,8 @@ function Composer({
   const active = useRef(false);
   /** Silence timer: 5 s without a keystroke ends the indicator. */
   const idleTimer = useRef<number | undefined>(undefined);
+  /** Bumped on every text change, so a send finishing late can tell newer typing apart. */
+  const typingGeneration = useRef(0);
   const stopTyping = () => {
     window.clearTimeout(idleTimer.current);
     idleTimer.current = undefined;
@@ -1214,6 +1216,7 @@ function Composer({
   useEffect(() => stopTyping, []);
   /** Called on every text change. */
   const onTextChange = (value: string) => {
+    typingGeneration.current++;
     setText(value);
     if (editing) return; // an edit isn't a new message
     if (!value.trim()) {
@@ -1297,6 +1300,7 @@ ${before}` : t);
     }
     const sent = text;
     const reply = replyTo?.id ?? null;
+    const typingAtSend = typingGeneration.current;
     sending.current = true;
     try {
       // Only clear the box once the message really went out. Text typed after the sent
@@ -1304,7 +1308,8 @@ ${before}` : t);
       if (await sendMessage(room.id, sent, ai, ai ? profileId : null, reply)) {
         setText((t) => (t.startsWith(sent) ? t.slice(sent.length).trimStart() : t));
         if (reply) onClearReply();
-        stopTyping();
+        // Only if nothing was typed while it sent: newer text is still being typed.
+        if (typingGeneration.current === typingAtSend) stopTyping();
       }
     } finally {
       sending.current = false;

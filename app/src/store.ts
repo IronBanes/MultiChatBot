@@ -437,6 +437,8 @@ export const useChat = create<ChatState>((set, get) => {
         break;
       case "member_left":
         patchRoom(msg.room_id, (r) => ({ ...r, members: r.members.filter((m) => m.user_id !== msg.user_id) }));
+        // They left: no "… is typing" lingering until it expires.
+        set((s) => dropTyping(s, msg.room_id, msg.user_id));
         break;
       case "presence":
         patchRoom(msg.room_id, (r) => ({
