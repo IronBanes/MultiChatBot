@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
 import type { Attachment, McpMode, Member, Message, RoomInfo, ToolActivity } from "../lib/types";
@@ -272,6 +272,7 @@ function ReactButton({ m, align = "left" }: { m: Message; align?: "left" | "righ
 /** The composer's editing/replying target: which message, and its text at pickup time. */
 export interface Draft {
   mode: "edit" | "reply";
+  room_id: string;
   id: string;
   /** Edit: the message's current text when editing started. */
   content: string;
@@ -527,7 +528,6 @@ const MessageItem = memo(function MessageItem({
                 </span>
               )}
               <span className="shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
-              {m.edited_at && <span className="shrink-0 text-[11px] text-zinc-400">(edited)</span>}
             </div>
           )}
           {m.reply_to && <ReplyQuote orig={replyOriginal} onJump={onJump} />}
@@ -544,8 +544,12 @@ const MessageItem = memo(function MessageItem({
             <Markdown text={m.content} />
           </div>
           <ReactionChips m={m} members={members} />
-          {/* Only on your own: on everyone else's it would repeat under every message. */}
-          {mine && !m.ai_requested && <span className="mt-0.5 px-1 text-[11px] text-zinc-400">no AI reply</span>}
+          {/* "no AI reply" only on your own: on everyone else's it would repeat under every message. */}
+          {(m.edited_at || (mine && !m.ai_requested)) && (
+            <span className="mt-0.5 px-1 text-[11px] text-zinc-400">
+              {[m.edited_at && "edited", mine && !m.ai_requested && "no AI reply"].filter(Boolean).join(" · ")}
+            </span>
+          )}
         </div>
         {sheet && (
           <ReactionSheet m={m} mine={mine} onReply={onReply} onEdit={onEdit} onClose={() => setSheet(false)} />
@@ -565,10 +569,9 @@ const MessageItem = memo(function MessageItem({
                 {m.author_name}
               </span>
               <span className="shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
-              {m.edited_at && <span className="shrink-0 text-[11px] text-zinc-400">(edited)</span>}
             </div>
           )}
-          <ReplyQuote orig={replyOriginal} onJump={onJump} />
+          {m.reply_to && <ReplyQuote orig={replyOriginal} onJump={onJump} />}
           <div
             {...longPress.handlers}
             className={`text-[15px] leading-relaxed break-words text-zinc-800 dark:text-zinc-200 ${
@@ -578,12 +581,19 @@ const MessageItem = memo(function MessageItem({
             <Markdown text={m.content} />
           </div>
           <ReactionChips m={m} members={members} />
-          {!m.ai_requested && <span className="mt-0.5 inline-block text-[11px] text-zinc-400">humans only · no AI reply</span>}
+          {(m.edited_at || !m.ai_requested) && (
+            <span className="mt-0.5 inline-block text-[11px] text-zinc-400">
+              {[m.edited_at && "(edited)", !m.ai_requested && "humans only · no AI reply"].filter(Boolean).join(" · ")}
+            </span>
+          )}
         </div>
         {/* Floats over the message's top edge on hover, so it adds no height to the chat.
             Touch screens long-press instead. */}
         <div className="pointer-events-none absolute -top-3 right-4 flex rounded-md border border-zinc-200 bg-white p-0.5 text-xs text-zinc-500 opacity-0 shadow-sm transition group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100 sm:right-5 dark:border-zinc-700 dark:bg-zinc-900 [@media(hover:none)]:!hidden">
           <ReactButton m={m} align="right" />
+          <button onClick={() => onReply(m)} className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+            <Icon name="reply" size={12} /> Reply
+          </button>
           {mine && (
             <>
               <button onClick={() => onEdit(m)} className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
@@ -666,12 +676,17 @@ const MessageItem = memo(function MessageItem({
         </button>
       )}
       {!bubbles && <ReactButton m={m} />}
-      {mine && (
+      {!bubbles && !streaming && (
+        <button onClick={() => onReply(m)} className={actionCls}>
+          <Icon name="reply" size={12} /> Reply
+        </button>
+      )}
+      {mine && !streaming && (
         <button onClick={del} className={actionCls}>
           <Icon name="trash" size={12} /> Delete
         </button>
       )}
-      {!streaming && myProfileId && anchor && (
+      {!streaming && myProfileId && anchor && !anchor.deleted && (
         <button onClick={() => regenerate(m, myProfileId)} className={actionCls}>
           <Icon name="refresh" size={12} /> {bubbles ? "Regenerate" : "Regenerate with my profile"}
         </button>
@@ -693,11 +708,11 @@ const MessageItem = memo(function MessageItem({
               {m.author_name}
             </span>
             <span className="ml-1 shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
-            {m.edited_at && <span className="ml-1 shrink-0 text-[11px] text-zinc-400">(edited)</span>}
           </div>
           {showAnchor && anchor && (
             <div className="mb-1 max-w-full truncate px-1 text-xs text-zinc-500">
-              ↪ <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>: “{snippet(anchor.content, 50)}”
+              ↪ <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>:{" "}
+              {anchor.deleted ? <i>message deleted</i> : `“${snippet(anchor.content, 50)}”`}
             </div>
           )}
           {m.reply_to && <ReplyQuote orig={replyOriginal} onJump={onJump} />}
@@ -712,7 +727,7 @@ const MessageItem = memo(function MessageItem({
           <ReactionChips m={m} members={members} />
           <div className="mt-0.5 flex flex-wrap text-xs text-zinc-500">{actions}</div>
           {sheet && (
-            <ReactionSheet m={m} mine={mine} onReply={onReply} onEdit={onEdit} onClose={() => setSheet(false)} />
+            <ReactionSheet m={m} mine={mine && !streaming} onReply={onReply} onEdit={onEdit} onClose={() => setSheet(false)} />
           )}
         </div>
       </div>
@@ -744,11 +759,11 @@ const MessageItem = memo(function MessageItem({
             </>
           )}
           <span className="ml-1 text-[11px] text-zinc-400">{time(m.created_at)}</span>
-          {m.edited_at && <span className="ml-1 text-[11px] text-zinc-400">(edited)</span>}
         </div>
         {showAnchor && anchor && (
           <div className="mt-0.5 truncate text-xs text-zinc-500">
-            ↪ answering <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>: “{snippet(anchor.content)}”
+            ↪ answering <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>:{" "}
+            {anchor.deleted ? <i>message deleted</i> : `“${snippet(anchor.content)}”`}
           </div>
         )}
         {m.reply_to && (
@@ -836,7 +851,7 @@ function MessageList({
   };
 
   /** Scrolls a reply's quote to its original and flashes it. */
-  const onJump = (id: string) => {
+  const onJump = useCallback((id: string) => {
     const root = ref.current;
     const el = root?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
     if (!el) return;
@@ -849,7 +864,7 @@ function MessageList({
     void el.offsetWidth;
     el.classList.add("flash-highlight");
     window.setTimeout(() => el.classList.remove("flash-highlight"), 1500);
-  };
+  }, []);
 
   const list = messages ?? [];
   return (
@@ -1098,11 +1113,20 @@ function Composer({
   // While editing, the AI-reply option doesn't apply: the edit goes out as-is.
   const ai = !editing && aiOn && !!profileId;
 
-  // Entering edit mode loads the message's current text and focuses the box.
+  // Entering edit mode loads the message's text (setting aside what was being typed) and
+  // focuses the box; leaving it, by saving or cancelling, brings that draft back.
+  const draftBeforeEdit = useRef<string | null>(null);
   useEffect(() => {
-    if (!editing) return;
-    setText(editing.content);
-    ta.current?.focus();
+    if (editing) {
+      setText((t) => {
+        if (draftBeforeEdit.current === null) draftBeforeEdit.current = t;
+        return editing.content;
+      });
+      ta.current?.focus();
+    } else if (draftBeforeEdit.current !== null) {
+      setText(draftBeforeEdit.current);
+      draftBeforeEdit.current = null;
+    }
   }, [editing]);
 
   // On phones, focusing would pop the keyboard up as soon as a room opens.
@@ -1121,14 +1145,8 @@ function Composer({
   const send = async () => {
     if (!text.trim() || status !== "online" || sending.current) return;
     if (editing) {
-      sending.current = true;
-      try {
-        editMessage(room.id, editing.id, text);
-        onClearEditing();
-        setText("");
-      } finally {
-        sending.current = false;
-      }
+      if (text !== editing.content) editMessage(room.id, editing.id, text);
+      onClearEditing();
       return;
     }
     const sent = text;
@@ -1152,7 +1170,6 @@ function Composer({
     if (editing) {
       e.preventDefault();
       onClearEditing();
-      setText("");
     } else if (replyTo) {
       e.preventDefault();
       onClearReply();
@@ -1166,10 +1183,7 @@ function Composer({
       <Icon name="pencil" size={13} className="shrink-0 text-indigo-600 dark:text-indigo-400" />
       <span className="min-w-0 flex-1 truncate font-medium">Editing message</span>
       <button
-        onClick={() => {
-          onClearEditing();
-          setText("");
-        }}
+        onClick={onClearEditing}
         className="shrink-0 rounded-full p-1 text-zinc-400 active:bg-zinc-100 dark:active:bg-zinc-800"
         aria-label="Cancel editing"
       >
@@ -1513,18 +1527,22 @@ export function RoomView({
   const [replyTo, setReplyTo] = useState<Message | null>(null);
   const swipe = useSwipeBack(onBack);
 
-  // Starting one clears the other: the composer bar shows only one at a time.
-  const startEdit = (m: Message) => {
+  // Starting one clears the other: the composer bar shows only one at a time. Stable
+  // callbacks keep the memoized message rows from re-rendering.
+  const startEdit = useCallback((m: Message) => {
     setReplyTo(null);
-    setEditing({ mode: "edit", id: m.id, content: m.content });
-  };
-  const startReply = (m: Message) => {
+    setEditing({ mode: "edit", room_id: m.room_id, id: m.id, content: m.content });
+  }, []);
+  const startReply = useCallback((m: Message) => {
     if (m.deleted) return;
     setEditing(null);
     setReplyTo(m);
-  };
-  const clearEditing = () => setEditing(null);
-  const clearReply = () => setReplyTo(null);
+  }, []);
+  const clearEditing = useCallback(() => setEditing(null), []);
+  const clearReply = useCallback(() => setReplyTo(null), []);
+  // The desktop view isn't remounted per room, so ignore a target from another room.
+  const editingHere = editing?.room_id === room.id ? editing : null;
+  const replyHere = replyTo?.room_id === room.id ? replyTo : null;
 
   const remembered = client.last_profile_by_room[room.id];
   const profileId = client.profiles.some((p) => p.id === remembered) ? remembered : (client.profiles[0]?.id ?? null);
@@ -1622,8 +1640,8 @@ export function RoomView({
           profileId={profileId}
           onOpenSettings={onOpenSettings}
           phone={phone}
-          editing={editing}
-          replyTo={replyTo}
+          editing={editingHere}
+          replyTo={replyHere}
           onClearEditing={clearEditing}
           onClearReply={clearReply}
         />

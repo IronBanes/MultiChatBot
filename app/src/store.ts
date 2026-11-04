@@ -435,13 +435,14 @@ export const useChat = create<ChatState>((set, get) => {
         }));
         break;
       case "message_updated":
-        // The full row after an edit or delete; keep locally loaded image previews.
+        // The full row after an edit or delete; keep locally loaded image previews, unless
+        // the message was deleted (its images go with it).
         set((s) => ({
           messages: {
             ...s.messages,
             [msg.room_id]: patchMessage(s.messages[msg.room_id], msg.message.id, (old) => ({
               ...msg.message,
-              attachments: msg.message.attachments.length ? msg.message.attachments : old.attachments,
+              attachments: msg.message.attachments.length || msg.message.deleted ? msg.message.attachments : old.attachments,
             }))!,
           },
         }));

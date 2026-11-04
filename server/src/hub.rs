@@ -541,12 +541,19 @@ impl State {
                 if !self.in_room(conn, &room_id) {
                     return Ok(());
                 }
+                // Held from the read through the broadcast: a delete takes it too, so a
+                // reaction can't land on a message while it's being deleted.
+                let _ordered = self.reactions_lock.lock().await;
                 let Some(message) = db::message(&self.db, &message_id).await? else {
                     self.send(conn, err(None, "That message isn't in this room"));
                     return Ok(());
                 };
                 if message.room_id != room_id {
                     self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                }
+                if message.deleted {
+                    self.send(conn, err(None, "That message was deleted"));
                     return Ok(());
                 }
                 let emoji = emoji.trim();
@@ -556,7 +563,6 @@ impl State {
                     self.send(conn, err(None, "Not a valid reaction"));
                     return Ok(());
                 }
-                let _ordered = self.reactions_lock.lock().await;
                 match db::set_reaction(&self.db, &room_id, &message_id, &user_id, emoji, on, MAX_REACTION_EMOJI).await? {
                     Ok(()) => {}
                     Err(db::ReactionRefused::TooMany) => {
@@ -630,11 +636,13 @@ impl State {
                     return Ok(());
                 }
                 // A streaming reply is still being written; deleting it mid-stream would
-                // race the finish that follows.
-                if m.kind == "ai" && self.hub().streams.contains_key(&message_id) {
+                // race the finish that follows. (Rows left "streaming" by a crash are
+                // marked interrupted at startup.)
+                if m.status == "streaming" || self.hub().streams.contains_key(&message_id) {
                     self.send(conn, err(None, "Stop the reply first"));
                     return Ok(());
                 }
+                let _ordered = self.reactions_lock.lock().await;
                 db::delete_message(&self.db, &message_id).await?;
                 let message = db::message(&self.db, &message_id).await?.expect("row still there");
                 self.broadcast(&room_id, ServerMsg::MessageUpdated { room_id: room_id.clone(), message });

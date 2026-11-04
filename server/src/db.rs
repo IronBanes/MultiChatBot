@@ -82,7 +82,6 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
     for ddl in [
         "ALTER TABLE messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'",
-        "ALTER TABLE messages ADD COLUMN attachments_stub TEXT",
         "ALTER TABLE messages ADD COLUMN edited_at INTEGER",
         "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE messages ADD COLUMN reply_to TEXT",
@@ -468,8 +467,9 @@ pub async fn insert_message(db: &Db, m: NewMessage<'_>) -> sqlx::Result<Message>
 }
 
 /// Rewrites a message's text and stamps `edited_at`, so clients can show "(edited)".
+/// A message deleted in the meantime stays deleted.
 pub async fn edit_message(db: &Db, id: &str, content: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE messages SET content = ?, edited_at = ? WHERE id = ?")
+    sqlx::query("UPDATE messages SET content = ?, edited_at = ? WHERE id = ? AND deleted = 0")
         .bind(content)
         .bind(now_ms())
         .bind(id)
