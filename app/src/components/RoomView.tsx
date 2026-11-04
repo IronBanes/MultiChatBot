@@ -1310,6 +1310,9 @@ ${before}` : t);
         if (reply) onClearReply();
         // Only if nothing was typed while it sent: newer text is still being typed.
         if (typingGeneration.current === typingAtSend) stopTyping();
+        // Receivers drop our typing entry when the sent message lands, so re-announce
+        // the text typed meanwhile (after the message, waiting out the relay's window).
+        else if (active.current && trueTimer.current === undefined) sendTrue();
       }
     } finally {
       sending.current = false;
