@@ -3,8 +3,11 @@ target/
 # Node / Vite
 node_modules/
 app/dist/
-# Tauri generated schemas
-app/src-tauri/gen/
+# Tauri generated projects. gen/android is committed because it carries our own
+# changes (local-network permission, ws:// in release builds, icons); gen/apple is
+# generated on the CI runner.
+app/src-tauri/gen/*
+!app/src-tauri/gen/android/
 # Local relay databases
 *.db
 *.db-shm

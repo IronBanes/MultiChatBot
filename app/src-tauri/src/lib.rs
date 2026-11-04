@@ -611,6 +611,7 @@ pub fn run() {
         .setup(|app| {
             let base = app.path().app_config_dir()?;
             let config_path = config::config_path(&base);
+            secrets::init(config_path.with_file_name("secrets.json"));
             let config = config::load(&config_path);
             let host = Arc::new(host::Host::new(config_path.with_file_name("relay.db")));
             if let Some(port) = config.host_relay_port {

@@ -20,7 +20,7 @@ keys or endpoints.
 | Path | What |
 |---|---|
 | `server/` | Relay: Rust, axum, tokio, WebSockets, SQLite (sqlx). Syncs rooms, members, presence and messages. |
-| `app/` | Desktop and iOS client: Tauri v2, React, TypeScript, Vite, Tailwind. |
+| `app/` | Desktop, iOS and Android client: Tauri v2, React, TypeScript, Vite, Tailwind. |
 | `app/src-tauri/` | Rust backend: profiles, keychain, providers, context building, streaming. |
 | `docs/PLAN.md` | WebSocket protocol, data models and context-building rules. |
 | `tools/smoke-test.mjs` | Two scripted clients that exercise the relay protocol end to end. |
@@ -263,6 +263,44 @@ Free-account installs **expire after 7 days**; re-sign by repeating step 3 (AltS
 refresh automatically over Wi-Fi). The relay must be reachable from the phone: a
 `ws://<LAN IP>:8787/ws` relay on the same Wi-Fi, otherwise a `wss://` tunnel.
 
+## Android
+
+The same `app/` also builds for Android, and it works like the iOS app: the phone
+layout, no local command (stdio) MCP servers, and every LLM call made by the Rust
+backend. Android has no keychain the app can use, so **API keys and MCP secrets are
+kept in `secrets.json` in the app's private storage**, which other apps can't read.
+
+On Android 17 the app asks to find and connect to **nearby devices** the first time it
+opens. That's Android's local-network permission, and it's needed to reach a relay on
+your home network (for example one hosted from the desktop app). The app connects as
+soon as you allow it. Plain `ws://` relays are allowed.
+
+### Getting the APK (no Android tools needed)
+
+The **Android build** GitHub Action builds `multichat.apk` for 64-bit ARM phones
+(artifact `multichat-android`) on every pull request that touches `app/`, on `v*` tags
+and on manual runs. Copy it to the phone and open it; Android asks you to allow
+installs from that app once.
+
+Without signing secrets, each run signs with a throwaway key, so to update you have to
+uninstall the old build first. To keep updates installing over the top, add two repo
+secrets: `ANDROID_KEYSTORE` (a `.jks` keystore, base64-encoded) and
+`ANDROID_KEYSTORE_PASSWORD`.
+
+### Building locally
+
+You need Android Studio (for the SDK, an emulator and its bundled Java), the NDK
+(SDK Manager → SDK Tools → NDK), `ANDROID_HOME`, `NDK_HOME` and `JAVA_HOME` set, and
+`rustup target add aarch64-linux-android x86_64-linux-android`. Then, from `app/`:
+
+```bash
+npm run tauri android dev                                  # run on an emulator or phone
+npm run tauri android build -- --apk --target aarch64      # release APK for phones
+```
+
+On Windows, Tauri links the built library into the Gradle project with a symlink, which
+needs **Developer Mode** (Settings → System → For developers).
+
 ## Profiles
 
 A profile is a label, provider type, base URL, model, API key, max context tokens, an
@@ -378,6 +416,9 @@ message, generated with your own model.
   looks like a key or URL, removed before it is shown or broadcast.
 - On iOS the same guarantees hold: keys live in the iOS Keychain and every LLM/MCP call is
   made by the Rust backend inside the app, never by the relay.
+- On Android keys are not in a hardware-backed keystore: they sit in plain JSON in the
+  app's private storage. Other apps can't read that, but a rooted phone or a debug build
+  can.
 - v1 has no accounts. Anyone with an invite code can join that room, and a user id is
   just a locally generated UUID. Run the relay only where you trust the network, or put
   it behind TLS (`wss://`) and a reverse proxy.
