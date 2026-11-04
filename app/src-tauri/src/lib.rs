@@ -219,6 +219,28 @@ fn resolve_key(profile: &Profile, api_key: Option<String>) -> Result<Option<Stri
 }
 
 /// `api_key`: `None` keeps the stored key, `Some("")` removes it, otherwise replaces it.
+/// Puts a profile's previous API key back after a save failed part-way, so the new key
+/// is never sent to the endpoint it wasn't meant for. If the old key can't come back,
+/// the key is removed; if even that fails, the profile is disabled until saved again.
+fn restore_key(state: &AppState, id: &str, previous_key: Option<String>, e: String) -> String {
+    let restored = match &previous_key {
+        Some(k) => secrets::set_key(id, k),
+        None => secrets::delete_key(id),
+    };
+    if restored.is_ok() {
+        return e;
+    }
+    match secrets::delete_key(id) {
+        Ok(()) => format!("{e}. The API key for this profile was removed; enter it again."),
+        Err(_) => {
+            if let Ok(mut blocked) = state.unsafe_keys.lock() {
+                blocked.insert(id.to_string());
+            }
+            format!("{e}. The API key for this profile couldn't be restored, so the profile is disabled until you save it again.")
+        }
+    }
+}
+
 #[tauri::command]
 fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Option<String>) -> Result<ProfileView, String> {
     validate(&profile)?;
@@ -231,10 +253,15 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
     let changing_key = api_key.is_some();
     let previous_key = if changing_key { secrets::get_key(&profile.id)? } else { None };
-    match api_key.as_deref().map(str::trim) {
-        Some("") => secrets::delete_key(&profile.id)?,
-        Some(k) => secrets::set_key(&profile.id, k)?,
-        None => {}
+    let written = match api_key.as_deref().map(str::trim) {
+        Some("") => secrets::delete_key(&profile.id),
+        Some(k) => secrets::set_key(&profile.id, k),
+        None => Ok(()),
+    };
+    // A failed write may still have replaced the stored key (it can fail after the
+    // new value is in place), so undo it just like a failed settings save.
+    if let Err(e) = written {
+        return Err(restore_key(&state, &profile.id, previous_key, e));
     }
     let saved = profile.clone();
     let id = profile.id.clone();
@@ -243,28 +270,7 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
         None => c.profiles.push(profile),
     });
     if let Err(e) = updated {
-        // The old endpoint is still in effect, so put its key back: the new key must
-        // never be sent to the endpoint it wasn't meant for.
-        if changing_key {
-            let restored = match &previous_key {
-                Some(k) => secrets::set_key(&id, k),
-                None => secrets::delete_key(&id),
-            };
-            // If the old key can't come back, remove the key entirely rather than leave
-            // the new one paired with the old endpoint.
-            if restored.is_err() {
-                return Err(match secrets::delete_key(&id) {
-                    Ok(()) => format!("{e}. The API key for this profile was removed; enter it again."),
-                    Err(_) => {
-                        if let Ok(mut blocked) = state.unsafe_keys.lock() {
-                            blocked.insert(id.clone());
-                        }
-                        format!("{e}. The API key for this profile couldn't be restored, so the profile is disabled until you save it again.")
-                    }
-                });
-            }
-        }
-        return Err(e);
+        return Err(if changing_key { restore_key(&state, &id, previous_key, e) } else { e });
     }
     // Only a new or removed key, saved together with the settings, repairs the pairing.
     if changing_key && let Ok(mut blocked) = state.unsafe_keys.lock() {
