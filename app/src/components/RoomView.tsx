@@ -868,7 +868,8 @@ function MessageList({
 
   const list = messages ?? [];
   return (
-    <div ref={ref} onScroll={onScroll} className={`min-h-0 flex-1 overflow-y-auto ${bubbles ? "overscroll-contain pb-2" : "pb-4"}`}>
+    <div ref={ref} onScroll={onScroll} className={`min-h-0 flex-1 overflow-y-auto ${bubbles ? "overscroll-contain pb-9" : "pb-8"}`}>
+      {/* The bottom padding keeps the last row clear of the floating typing indicator. */}
       {/* Phones keep the newest message at the bottom, so a short chat starts there and
           older messages move up as new ones arrive. */}
       <div ref={content} className={`mx-auto max-w-4xl ${bubbles ? "flex min-h-full flex-col justify-end" : ""}`}>
@@ -1177,6 +1178,8 @@ function Composer({
     idleTimer.current = undefined;
     if (!active.current) return;
     active.current = false;
+    // Typing again starts a fresh indicator right away rather than waiting out the 3 s.
+    lastTrue.current = 0;
     setTyping(room.id, false);
   };
   // Unmount (also covers switching rooms, since the Composer is keyed by room).
