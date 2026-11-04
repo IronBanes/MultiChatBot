@@ -299,8 +299,18 @@ async fn with_attachments(db: &Db, mut messages: Vec<Message>) -> sqlx::Result<V
     Ok(messages)
 }
 
+/// Why a reaction wasn't added.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReactionRefused {
+    /// The user isn't (or is no longer) a member of the room.
+    NotMember,
+    /// The emoji is new to the message and it already has `max_emoji` distinct ones.
+    TooMany,
+}
+
 /// Adds or removes one user's reaction. Adding one that already exists is a no-op.
-/// Returns false only when adding a new emoji would exceed `max_emoji` distinct emoji.
+/// The membership and cap checks run inside the insert, so a concurrent leave or a
+/// concurrent new emoji can't slip past them.
 pub async fn set_reaction(
     db: &Db,
     room_id: &str,
@@ -309,21 +319,22 @@ pub async fn set_reaction(
     emoji: &str,
     on: bool,
     max_emoji: usize,
-) -> sqlx::Result<bool> {
+) -> sqlx::Result<Result<(), ReactionRefused>> {
     if on {
-        // The cap check is part of the insert, so two people adding different new
-        // emoji at once can't both slip past it.
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO reactions (message_id, room_id, user_id, emoji, created_at)
              SELECT ?, ?, ?, ?, ?
-             WHERE EXISTS (SELECT 1 FROM reactions WHERE message_id = ? AND emoji = ?)
-                OR (SELECT COUNT(DISTINCT emoji) FROM reactions WHERE message_id = ?) < ?",
+             WHERE EXISTS (SELECT 1 FROM members WHERE room_id = ? AND user_id = ?)
+               AND (EXISTS (SELECT 1 FROM reactions WHERE message_id = ? AND emoji = ?)
+                    OR (SELECT COUNT(DISTINCT emoji) FROM reactions WHERE message_id = ?) < ?)",
         )
         .bind(message_id)
         .bind(room_id)
         .bind(user_id)
         .bind(emoji)
         .bind(now_ms())
+        .bind(room_id)
+        .bind(user_id)
         .bind(message_id)
         .bind(emoji)
         .bind(message_id)
@@ -332,15 +343,25 @@ pub async fn set_reaction(
         .await?
         .rows_affected();
         if inserted == 0 {
-            // Nothing written: either this person already had this reaction (fine), or
-            // the emoji is new to the message and the cap stopped it.
-            let present: bool =
-                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM reactions WHERE message_id = ? AND emoji = ?)")
-                    .bind(message_id)
-                    .bind(emoji)
-                    .fetch_one(db)
-                    .await?;
-            return Ok(present);
+            // Nothing written: not a member, already had this reaction (fine), or the
+            // emoji is new to the message and the cap stopped it.
+            let (member, present): (bool, bool) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM members WHERE room_id = ? AND user_id = ?),
+                        EXISTS (SELECT 1 FROM reactions WHERE message_id = ? AND emoji = ?)",
+            )
+            .bind(room_id)
+            .bind(user_id)
+            .bind(message_id)
+            .bind(emoji)
+            .fetch_one(db)
+            .await?;
+            return Ok(if !member {
+                Err(ReactionRefused::NotMember)
+            } else if present {
+                Ok(())
+            } else {
+                Err(ReactionRefused::TooMany)
+            });
         }
     } else {
         sqlx::query("DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?")
@@ -350,7 +371,7 @@ pub async fn set_reaction(
             .execute(db)
             .await?;
     }
-    Ok(true)
+    Ok(Ok(()))
 }
 
 /// A message's reactions grouped by emoji, every message kind included.
@@ -498,18 +519,29 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mc-react-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users VALUES ('a', 'A', 0), ('b', 'B', 0), ('c', 'C', 0);
+             INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
+             INSERT INTO members VALUES ('r', 'a', 0), ('r', 'b', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let set = |u: &'static str, e: &'static str, on: bool| set_reaction(&db, "r", "m", u, e, on, 2);
         let emoji = ["😀", "😁", "😂"];
         for e in &emoji[..2] {
-            assert!(set_reaction(&db, "r", "m", "a", e, true, 2).await.unwrap());
+            assert_eq!(set("a", e, true).await.unwrap(), Ok(()));
         }
         // A third distinct emoji is over the cap of 2.
-        assert!(!set_reaction(&db, "r", "m", "b", emoji[2], true, 2).await.unwrap());
+        assert_eq!(set("b", emoji[2], true).await.unwrap(), Err(ReactionRefused::TooMany));
         // Joining an emoji that is already there, or repeating your own, still works.
-        assert!(set_reaction(&db, "r", "m", "b", emoji[0], true, 2).await.unwrap());
-        assert!(set_reaction(&db, "r", "m", "b", emoji[0], true, 2).await.unwrap());
+        assert_eq!(set("b", emoji[0], true).await.unwrap(), Ok(()));
+        assert_eq!(set("b", emoji[0], true).await.unwrap(), Ok(()));
+        // Someone outside the room can't react, even with an existing emoji.
+        assert_eq!(set("c", emoji[0], true).await.unwrap(), Err(ReactionRefused::NotMember));
         // Removing one frees a slot.
-        assert!(set_reaction(&db, "r", "m", "a", emoji[1], false, 2).await.unwrap());
-        assert!(set_reaction(&db, "r", "m", "b", emoji[2], true, 2).await.unwrap());
+        assert_eq!(set("a", emoji[1], false).await.unwrap(), Ok(()));
+        assert_eq!(set("b", emoji[2], true).await.unwrap(), Ok(()));
         let got: Vec<_> = reactions(&db, "m").await.unwrap().into_iter().map(|r| (r.emoji, r.user_ids.len())).collect();
         assert_eq!(got, vec![("😀".to_string(), 2), ("😂".to_string(), 1)]);
         db.close().await;

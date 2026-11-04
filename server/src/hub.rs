@@ -548,9 +548,16 @@ impl State {
                     return Ok(());
                 }
                 let _ordered = self.reactions_lock.lock().await;
-                if !db::set_reaction(&self.db, &room_id, &message_id, &user_id, emoji, on, MAX_REACTION_EMOJI).await? {
-                    self.send(conn, err(None, "Too many different reactions on this message"));
-                    return Ok(());
+                match db::set_reaction(&self.db, &room_id, &message_id, &user_id, emoji, on, MAX_REACTION_EMOJI).await? {
+                    Ok(()) => {}
+                    Err(db::ReactionRefused::TooMany) => {
+                        self.send(conn, err(None, "Too many different reactions on this message"));
+                        return Ok(());
+                    }
+                    Err(db::ReactionRefused::NotMember) => {
+                        self.send(conn, err(None, "You're not in that room"));
+                        return Ok(());
+                    }
                 }
                 let reactions = db::reactions(&self.db, &message_id).await?;
                 self.broadcast(
