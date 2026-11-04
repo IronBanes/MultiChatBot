@@ -47,9 +47,21 @@ mod file_store {
             std::fs::create_dir_all(dir).map_err(|e| format!("Could not save secret: {e}"))?;
         }
         // Write then rename, so a crash mid-write can't leave half a file.
+        // Each step is synced, so a power cut can't lose a save that already
+        // reported success.
+        let fail = |e: std::io::Error| format!("Could not save secret: {e}");
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, json).map_err(|e| format!("Could not save secret: {e}"))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("Could not save secret: {e}"))
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp).map_err(fail)?;
+            f.write_all(&json).map_err(fail)?;
+            f.sync_all().map_err(fail)?;
+        }
+        std::fs::rename(&tmp, path).map_err(fail)?;
+        if let Some(dir) = path.parent() {
+            std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(fail)?;
+        }
+        Ok(())
     }
 
     pub fn get(account: &str) -> Result<Option<String>, String> {

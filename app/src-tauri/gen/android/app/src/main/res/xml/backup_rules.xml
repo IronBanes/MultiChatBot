@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and older (fullBackupContent). API keys and MCP secrets are stored
+     in plain JSON, so they must never leave the device in a backup. -->
+<full-backup-content>
+    <exclude domain="root" path="instances/default/secrets.json" />
+    <exclude domain="root" path="instances/default/secrets.json.tmp" />
+</full-backup-content>

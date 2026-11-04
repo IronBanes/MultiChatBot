@@ -63,21 +63,33 @@ jobs:
 
       # Android only installs signed APKs. With the ANDROID_KEYSTORE secret
       # (base64 .jks) and ANDROID_KEYSTORE_PASSWORD, every build is signed with the
-      # same key, so new versions install over old ones. Without them, a throwaway
+      # same key, so new versions install over old ones. ANDROID_KEY_ALIAS picks a
+      # key when the keystore holds several, and ANDROID_KEY_PASSWORD is for a key
+      # whose password differs from the keystore's. Without any of them, a throwaway
       # key is made per run: the APK installs fine, but updating means uninstalling
-      # the previous build first.
+      # the previous build, which deletes the app's data.
       - name: Sign the APK
         working-directory: app/src-tauri/gen/android
         env:
           ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           unsigned=$(find app/build/outputs/apk -name '*-unsigned.apk' | head -n 1)
           [ -n "$unsigned" ] || { echo "::error::no unsigned APK was built"; exit 1; }
           tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          key_args=()
           if [ -n "$ANDROID_KEYSTORE" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ]; then
             echo "$ANDROID_KEYSTORE" | base64 -d > release.jks
             pass="$ANDROID_KEYSTORE_PASSWORD"
+            [ -n "$ANDROID_KEY_ALIAS" ] && key_args+=(--ks-key-alias "$ANDROID_KEY_ALIAS")
+            [ -n "$ANDROID_KEY_PASSWORD" ] && key_args+=(--key-pass "pass:$ANDROID_KEY_PASSWORD")
+          elif [ -n "$ANDROID_KEYSTORE" ] || [ -n "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            # A half-configured key must not silently fall back to a throwaway one:
+            # that APK couldn't update installs signed with the real key.
+            echo "::error::Set both ANDROID_KEYSTORE and ANDROID_KEYSTORE_PASSWORD, or neither."
+            exit 1
           else
             echo "::notice title=Throwaway signing key::ANDROID_KEYSTORE secrets are not set; uninstall the previous build before installing this one."
             pass=$(openssl rand -hex 16)
@@ -85,7 +97,7 @@ jobs:
               -alias multichat -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Multichat" -noprompt
           fi
           "$tools/zipalign" -f -p 4 "$unsigned" aligned.apk
-          "$tools/apksigner" sign --ks release.jks --ks-pass "pass:$pass" --out multichat.apk aligned.apk
+          "$tools/apksigner" sign --ks release.jks --ks-pass "pass:$pass" "${key_args[@]}" --out multichat.apk aligned.apk
           "$tools/apksigner" verify multichat.apk
           rm -f release.jks
 

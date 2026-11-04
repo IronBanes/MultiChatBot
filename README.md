@@ -282,10 +282,16 @@ The **Android build** GitHub Action builds `multichat.apk` for 64-bit ARM phones
 and on manual runs. Copy it to the phone and open it; Android asks you to allow
 installs from that app once.
 
-Without signing secrets, each run signs with a throwaway key, so to update you have to
-uninstall the old build first. To keep updates installing over the top, add two repo
-secrets: `ANDROID_KEYSTORE` (a `.jks` keystore, base64-encoded) and
-`ANDROID_KEYSTORE_PASSWORD`.
+**Set up a signing key before sharing builds.** Android only installs an update signed
+with the same key as the installed app. Add two repo secrets: `ANDROID_KEYSTORE` (a
+`.jks` keystore, base64-encoded) and `ANDROID_KEYSTORE_PASSWORD`. If the keystore holds
+several keys, or the key has its own password, also add `ANDROID_KEY_ALIAS` and
+`ANDROID_KEY_PASSWORD`. Keep a backup of the keystore and password: without them, no
+future build can update the app.
+
+Without those secrets, each run signs with a throwaway key, so an update only installs
+after uninstalling the old build. **Uninstalling deletes the app's data**: your name,
+profiles, saved API keys and MCP secrets. Note them down first.
 
 ### Building locally
 

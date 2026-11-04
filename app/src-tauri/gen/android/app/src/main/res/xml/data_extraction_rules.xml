@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12 and newer: cloud backups and device-to-device transfers. API keys and
+     MCP secrets are stored in plain JSON, so they must never leave the device. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="root" path="instances/default/secrets.json" />
+        <exclude domain="root" path="instances/default/secrets.json.tmp" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="root" path="instances/default/secrets.json" />
+        <exclude domain="root" path="instances/default/secrets.json.tmp" />
+    </device-transfer>
+</data-extraction-rules>
