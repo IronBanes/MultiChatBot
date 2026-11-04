@@ -96,7 +96,7 @@ all rooms. The first client frame must be `hello`.
 | `ai_error` | `room_id, id, error` | short, sanitized reason |
 | `set_room_prompt` | `room_id, system_prompt` | any member |
 | `react` | `room_id, message_id, emoji, on` | add (`on` true) or remove a reaction; any member, any message; ≤ 20 distinct emoji per message |
-| `typing` | `room_id, typing` | live "I'm typing" state; members only, relayed as `typing` and never stored; the relay passes at most one `typing: true` per second per connection |
+| `typing` | `room_id, typing` | live "I'm typing" state; members only, relayed as `typing` and never stored; the relay passes at most one `typing: true` per second per connection, and a `typing: false` only when it ends a relayed `true` |
 | `edit_message` | `room_id, message_id, content` | edit your own human message; same empty/length rule as `send_message` → `message_updated` |
 | `delete_message` | `room_id, message_id` | soft-delete your own message (human, or an AI reply you generated; not while streaming) → `message_updated` |
 | `create_link_code` | `request_id` | → `link_code`; one live code per user, valid 10 min, single use |

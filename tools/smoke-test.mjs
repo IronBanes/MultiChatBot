@@ -104,11 +104,17 @@ ok(human.message.author_name === "Bob" && !human.message.ai_requested, "human-on
     !bob.inbox.some((m) => m.type === "typing" && m.user_id === alice.userId),
     "second typing true within 1s was not delivered",
   );
+  // A repeated `false` (nothing to end) is dropped.
+  alice.send({ type: "typing", room_id: room.id, typing: false });
   // After 1.1s the throttle window has passed and a `true` goes through again.
   await new Promise((r) => setTimeout(r, 1100));
   alice.send({ type: "typing", room_id: room.id, typing: true });
   await bob.wait(type("typing", (m) => m.user_id === alice.userId && m.typing), "typing true after throttle window");
   ok(true, "typing true accepted again after the 1s window");
+  ok(
+    !bob.inbox.some((m) => m.type === "typing" && m.user_id === alice.userId),
+    "a repeated typing false is not relayed",
+  );
   // By now Mallory's frames (sent first) have long been handled.
   ok(!mallory.inbox.some((m) => m.type === "error"), "typing from a non-member gets no error frame");
   ok(

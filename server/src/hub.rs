@@ -43,6 +43,9 @@ struct Conn {
     failed_redeems: u32,
     /// When this connection last had a `typing: true` accepted (server-side throttle).
     last_typing: Option<Instant>,
+    /// Rooms where this connection's last broadcast typing state was `true`, so a
+    /// `typing: false` is only relayed when it changes something.
+    typing_rooms: HashSet<String>,
     tx: UnboundedSender<String>,
     rooms: HashSet<String>,
 }
@@ -156,6 +159,7 @@ impl State {
                 platform: String::new(),
                 failed_redeems: 0,
                 last_typing: None,
+                typing_rooms: HashSet::new(),
                 tx,
                 rooms: HashSet::new(),
             },
@@ -607,12 +611,16 @@ impl State {
                     return Ok(());
                 }
                 // Sent on every keystroke, so throttle: one `true` broadcast per second
-                // per connection. A `false` always passes through.
+                // per connection. A `false` passes only when it ends a `true` this
+                // connection broadcast in that room, so repeated `false`s can't flood it.
                 if typing {
                     if c.last_typing.is_some_and(|t| t.elapsed() < TYPING_MIN_INTERVAL) {
                         return Ok(());
                     }
                     c.last_typing = Some(Instant::now());
+                    c.typing_rooms.insert(room_id.clone());
+                } else if !c.typing_rooms.remove(&room_id) {
+                    return Ok(());
                 }
                 hub.broadcast(
                     &room_id,

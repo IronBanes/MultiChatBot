@@ -932,29 +932,36 @@ function TypingIndicator({ roomId, phone }: { roomId: string; phone: boolean }) 
     return () => window.clearInterval(t);
   }, [names.length]);
 
-  if (names.length === 0) return null;
   const rest = names.length - 2;
   const label =
-    names.length === 1
+    names.length === 0
+      ? ""
+      : names.length === 1
       ? `${names[0]} is typing…`
       : names.length === 2
         ? `${names[0]} and ${names[1]} are typing…`
         : `${names[0]}, ${names[1]} and ${rest} other${rest === 1 ? "" : "s"} are typing…`;
 
   // Floated over the list's bottom edge, outside the flow, so the layout never jumps.
+  // The live region stays mounted (empty when nobody types) so screen readers announce
+  // the first "… is typing" too; only the visible pill comes and goes.
   return (
-    <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-3 pb-1.5">
-      <div
-        className={`flex max-w-full items-center gap-1.5 rounded-full bg-white/90 px-3 py-0.5 text-zinc-500 shadow-sm backdrop-blur-sm dark:bg-zinc-900/90 ${phone ? "text-[13px]" : "text-xs"}`}
-        aria-live="polite"
-      >
-        <span className="typing-dots shrink-0" aria-hidden>
-          <i />
-          <i />
-          <i />
-        </span>
-        <span className="truncate">{label}</span>
-      </div>
+    <div
+      className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-3 pb-1.5"
+      aria-live="polite"
+    >
+      {label && (
+        <div
+          className={`flex max-w-full items-center gap-1.5 rounded-full bg-white/90 px-3 py-0.5 text-zinc-500 shadow-sm backdrop-blur-sm dark:bg-zinc-900/90 ${phone ? "text-[13px]" : "text-xs"}`}
+        >
+          <span className="typing-dots shrink-0" aria-hidden>
+            <i />
+            <i />
+            <i />
+          </span>
+          <span className="truncate">{label}</span>
+        </div>
+      )}
     </div>
   );
 }
