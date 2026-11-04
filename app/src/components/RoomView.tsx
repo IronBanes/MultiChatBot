@@ -1114,20 +1114,44 @@ function Composer({
   const ai = !editing && aiOn && !!profileId;
 
   // Entering edit mode loads the message's text (setting aside what was being typed) and
-  // focuses the box; leaving it, by saving or cancelling, brings that draft back.
+  // focuses the box; leaving it, by saving or cancelling, brings that draft back. If edit
+  // mode ends some other way (the message was deleted, or Reply was picked) with unsaved
+  // changes, those stay in the box, ahead of the earlier draft.
+  const toast = useChat((s) => s.toast);
   const draftBeforeEdit = useRef<string | null>(null);
+  const lastEdit = useRef<Draft | null>(null);
+  const textNow = useRef(text);
+  textNow.current = text;
+  const leaving = useRef(false);
+  const leaveEdit = () => {
+    leaving.current = true;
+    onClearEditing();
+  };
   useEffect(() => {
     if (editing) {
+      lastEdit.current = editing;
       setText((t) => {
         if (draftBeforeEdit.current === null) draftBeforeEdit.current = t;
         return editing.content;
       });
       ta.current?.focus();
     } else if (draftBeforeEdit.current !== null) {
-      setText(draftBeforeEdit.current);
+      const before = draftBeforeEdit.current;
+      const original = lastEdit.current?.content;
+      const t = textNow.current;
+      if (leaving.current || t === original) {
+        setText(before);
+      } else {
+        setText(before.trim() ? `${t}
+
+${before}` : t);
+        toast("Edit not saved. Your changes are still in the box.");
+      }
       draftBeforeEdit.current = null;
+      lastEdit.current = null;
+      leaving.current = false;
     }
-  }, [editing]);
+  }, [editing, toast]);
 
   // On phones, focusing would pop the keyboard up as soon as a room opens.
   useEffect(() => {
@@ -1145,8 +1169,14 @@ function Composer({
   const send = async () => {
     if (!text.trim() || status !== "online" || sending.current) return;
     if (editing) {
-      if (text !== editing.content) editMessage(room.id, editing.id, text);
-      onClearEditing();
+      if (text === editing.content) return leaveEdit();
+      sending.current = true;
+      try {
+        // Stay in edit mode (keeping the text) if the edit couldn't be sent.
+        if (await editMessage(room.id, editing.id, text)) leaveEdit();
+      } finally {
+        sending.current = false;
+      }
       return;
     }
     const sent = text;
@@ -1169,7 +1199,7 @@ function Composer({
     if (e.key !== "Escape") return;
     if (editing) {
       e.preventDefault();
-      onClearEditing();
+      leaveEdit();
     } else if (replyTo) {
       e.preventDefault();
       onClearReply();
@@ -1183,7 +1213,7 @@ function Composer({
       <Icon name="pencil" size={13} className="shrink-0 text-indigo-600 dark:text-indigo-400" />
       <span className="min-w-0 flex-1 truncate font-medium">Editing message</span>
       <button
-        onClick={onClearEditing}
+        onClick={leaveEdit}
         className="shrink-0 rounded-full p-1 text-zinc-400 active:bg-zinc-100 dark:active:bg-zinc-800"
         aria-label="Cancel editing"
       >

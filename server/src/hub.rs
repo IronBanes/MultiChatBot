@@ -333,6 +333,9 @@ impl State {
                     self.send(conn, err(None, "Message is empty or too long"));
                     return Ok(());
                 }
+                // From the reply check through the broadcast: a delete can't slip in
+                // between, so clients never get the deletion before the message itself.
+                let _ordered = self.updates_lock.lock().await;
                 if let Some(reply_to) = reply_to.as_deref() {
                     let target = db::message(&self.db, reply_to).await?;
                     if !target.is_some_and(|t| t.room_id == room_id && !t.deleted) {

@@ -484,7 +484,7 @@ pub async fn edit_message(db: &Db, id: &str, content: &str) -> sqlx::Result<()> 
 pub async fn delete_message(db: &Db, id: &str) -> sqlx::Result<()> {
     let mut tx = db.begin().await?;
     sqlx::query(
-        "UPDATE messages SET content = '', reasoning = '', tools = '[]', deleted = 1 \
+        "UPDATE messages SET content = '', reasoning = '', tools = '[]', error = NULL, deleted = 1 \
          WHERE id = ?",
     )
     .bind(id)

@@ -63,9 +63,9 @@ interface ChatState {
   /** Resolves true once the message was actually written to the relay. */
   sendMessage(roomId: string, content: string, aiRequested: boolean, profileId: string | null, replyTo?: string | null): Promise<boolean>;
   /** Rewrites one of this user's own human messages. */
-  editMessage(roomId: string, messageId: string, content: string): void;
+  editMessage(roomId: string, messageId: string, content: string): Promise<boolean>;
   /** Soft-deletes one of this user's own messages (human, or an AI reply they generated). */
-  deleteMessage(roomId: string, messageId: string): void;
+  deleteMessage(roomId: string, messageId: string): Promise<boolean>;
   regenerate(ai: Message, profileId: string): void;
   stopAi(id: string): void;
   /** Adds or removes this user's reaction on a message (human or AI). */
@@ -573,16 +573,17 @@ export const useChat = create<ChatState>((set, get) => {
       return ok;
     },
 
-    editMessage(roomId, messageId, content) {
-      if (!relay?.send({ type: "edit_message", room_id: roomId, message_id: messageId, content })) {
-        get().toast("Edit not sent: not connected to the server");
-      }
+    // Both resolve true once the frame was actually written to the relay.
+    async editMessage(roomId, messageId, content) {
+      const ok = relay ? await relay.sendConfirmed({ type: "edit_message", room_id: roomId, message_id: messageId, content }) : false;
+      if (!ok) get().toast("Edit not sent: not connected to the server");
+      return ok;
     },
 
-    deleteMessage(roomId, messageId) {
-      if (!relay?.send({ type: "delete_message", room_id: roomId, message_id: messageId })) {
-        get().toast("Not deleted: not connected to the server");
-      }
+    async deleteMessage(roomId, messageId) {
+      const ok = relay ? await relay.sendConfirmed({ type: "delete_message", room_id: roomId, message_id: messageId }) : false;
+      if (!ok) get().toast("Not deleted: not connected to the server");
+      return ok;
     },
 
     regenerate(ai, profileId) {
