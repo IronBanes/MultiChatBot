@@ -210,11 +210,45 @@ fn validate_base_url(p: &Profile) -> Result<(), String> {
 }
 
 /// The key typed into the form if any, else the stored one.
-fn resolve_key(profile: &Profile, api_key: Option<String>) -> Result<Option<String>, String> {
+fn resolve_key(state: &AppState, profile: &Profile, api_key: Option<String>) -> Result<Option<String>, String> {
     match api_key.filter(|k| !k.trim().is_empty()) {
         Some(k) => Ok(Some(k)),
-        None if !profile.id.is_empty() => secrets::get_key(&profile.id),
+        None if !profile.id.is_empty() => {
+            // A key typed into the form still works, so the user can test and recover.
+            check_not_blocked(state, profile)?;
+            secrets::get_key(&profile.id)
+        }
         None => Ok(None),
+    }
+}
+
+/// A profile whose key rollback failed must not use its stored key until it's saved again.
+fn check_not_blocked(state: &AppState, profile: &Profile) -> Result<(), String> {
+    if state.unsafe_keys.lock().map_err(|_| "lock poisoned")?.contains(&profile.id) {
+        return Err(format!("{} is disabled after a failed save. Save it again in Settings to use it.", profile.label));
+    }
+    Ok(())
+}
+
+/// Puts a profile's previous API key back after a save failed part-way, so the new key
+/// is never sent to the endpoint it wasn't meant for. If the old key can't come back,
+/// the key is removed; if even that fails, the profile is disabled until saved again.
+fn restore_key(state: &AppState, id: &str, previous_key: Option<String>, e: String) -> String {
+    let restored = match &previous_key {
+        Some(k) => secrets::set_key(id, k),
+        None => secrets::delete_key(id),
+    };
+    if restored.is_ok() {
+        return e;
+    }
+    match secrets::delete_key(id) {
+        Ok(()) => format!("{e}. The API key for this profile was removed; enter it again."),
+        Err(_) => {
+            if let Ok(mut blocked) = state.unsafe_keys.lock() {
+                blocked.insert(id.to_string());
+            }
+            format!("{e}. The API key for this profile couldn't be restored, so the profile is disabled until you save it again.")
+        }
     }
 }
 
@@ -231,10 +265,15 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
     let changing_key = api_key.is_some();
     let previous_key = if changing_key { secrets::get_key(&profile.id)? } else { None };
-    match api_key.as_deref().map(str::trim) {
-        Some("") => secrets::delete_key(&profile.id)?,
-        Some(k) => secrets::set_key(&profile.id, k)?,
-        None => {}
+    let written = match api_key.as_deref().map(str::trim) {
+        Some("") => secrets::delete_key(&profile.id),
+        Some(k) => secrets::set_key(&profile.id, k),
+        None => Ok(()),
+    };
+    // A failed write may still have replaced the stored key (it can fail after the
+    // new value is in place), so undo it just like a failed settings save.
+    if let Err(e) = written {
+        return Err(restore_key(&state, &profile.id, previous_key, e));
     }
     let saved = profile.clone();
     let id = profile.id.clone();
@@ -243,28 +282,7 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
         None => c.profiles.push(profile),
     });
     if let Err(e) = updated {
-        // The old endpoint is still in effect, so put its key back: the new key must
-        // never be sent to the endpoint it wasn't meant for.
-        if changing_key {
-            let restored = match &previous_key {
-                Some(k) => secrets::set_key(&id, k),
-                None => secrets::delete_key(&id),
-            };
-            // If the old key can't come back, remove the key entirely rather than leave
-            // the new one paired with the old endpoint.
-            if restored.is_err() {
-                return Err(match secrets::delete_key(&id) {
-                    Ok(()) => format!("{e}. The API key for this profile was removed; enter it again."),
-                    Err(_) => {
-                        if let Ok(mut blocked) = state.unsafe_keys.lock() {
-                            blocked.insert(id.clone());
-                        }
-                        format!("{e}. The API key for this profile couldn't be restored, so the profile is disabled until you save it again.")
-                    }
-                });
-            }
-        }
-        return Err(e);
+        return Err(if changing_key { restore_key(&state, &id, previous_key, e) } else { e });
     }
     // Only a new or removed key, saved together with the settings, repairs the pairing.
     if changing_key && let Ok(mut blocked) = state.unsafe_keys.lock() {
@@ -293,7 +311,7 @@ fn set_last_profile(state: State<'_, AppState>, room_id: String, profile_id: Str
 #[tauri::command]
 async fn test_profile(state: State<'_, AppState>, profile: Profile, api_key: Option<String>) -> Result<String, String> {
     validate(&profile)?;
-    let key = resolve_key(&profile, api_key)?;
+    let key = resolve_key(&state, &profile, api_key)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let req = ChatRequest {
         model: profile.model.clone(),
@@ -339,7 +357,7 @@ async fn test_profile(state: State<'_, AppState>, profile: Profile, api_key: Opt
 #[tauri::command]
 async fn list_models(state: State<'_, AppState>, profile: Profile, api_key: Option<String>) -> Result<Vec<ModelInfo>, String> {
     validate_base_url(&profile)?;
-    let key = resolve_key(&profile, api_key)?;
+    let key = resolve_key(&state, &profile, api_key)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     tokio::time::timeout(Duration::from_secs(30), provider.list_models())
         .await
@@ -511,9 +529,7 @@ fn generate(
 ) -> Result<(), String> {
     let cfg = state.snapshot()?;
     let profile = state.profile(&profile_id)?;
-    if state.unsafe_keys.lock().map_err(|_| "lock poisoned")?.contains(&profile.id) {
-        return Err(format!("{} is disabled after a failed save. Save it again in Settings to use it.", profile.label));
-    }
+    check_not_blocked(&state, &profile)?;
     let key = secrets::get_key(&profile.id)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let prompt = context::build(&history, &room_prompt, profile.max_context_tokens);
@@ -611,6 +627,7 @@ pub fn run() {
         .setup(|app| {
             let base = app.path().app_config_dir()?;
             let config_path = config::config_path(&base);
+            secrets::init(config_path.with_file_name("secrets.json"));
             let config = config::load(&config_path);
             let host = Arc::new(host::Host::new(config_path.with_file_name("relay.db")));
             if let Some(port) = config.host_relay_port {

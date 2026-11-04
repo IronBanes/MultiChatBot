@@ -1,0 +1,109 @@
+# Builds an installable Multichat APK on a Linux runner, so nobody needs the
+# Android SDK locally to get the app onto a phone. Download the
+# multichat-android artifact, copy the .apk to the phone and open it
+# (allow "install unknown apps" for your file manager or browser when asked).
+name: Android build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "app/**"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # 64-bit ARM covers every phone from the last several years.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "app/src-tauri -> target"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: npm ci
+        working-directory: app
+        run: npm ci
+
+      # The runner image ships the SDK (ANDROID_HOME) and an NDK; Tauri wants NDK_HOME.
+      - name: Point Tauri at the NDK
+        run: echo "NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+
+      # gen/android (the Gradle project) is committed, with our changes: the
+      # local-network permission prompt, ws:// allowed in release builds, and icons.
+      - name: Build the release APK
+        working-directory: app
+        run: npm run tauri -- android build --ci --apk --target aarch64
+
+      # Android only installs signed APKs. With the ANDROID_KEYSTORE secret
+      # (base64 .jks) and ANDROID_KEYSTORE_PASSWORD, every build is signed with the
+      # same key, so new versions install over old ones. ANDROID_KEY_ALIAS picks a
+      # key when the keystore holds several, and ANDROID_KEY_PASSWORD is for a key
+      # whose password differs from the keystore's. Without any of them, a throwaway
+      # key is made per run: the APK installs fine, but updating means uninstalling
+      # the previous build, which deletes the app's data.
+      - name: Sign the APK
+        working-directory: app/src-tauri/gen/android
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          unsigned=$(find app/build/outputs/apk -name '*-unsigned.apk' | head -n 1)
+          [ -n "$unsigned" ] || { echo "::error::no unsigned APK was built"; exit 1; }
+          tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          key_args=()
+          if [ -n "$ANDROID_KEYSTORE" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            echo "$ANDROID_KEYSTORE" | base64 -d > release.jks
+            pass="$ANDROID_KEYSTORE_PASSWORD"
+            [ -n "$ANDROID_KEY_ALIAS" ] && key_args+=(--ks-key-alias "$ANDROID_KEY_ALIAS")
+            [ -n "$ANDROID_KEY_PASSWORD" ] && key_args+=(--key-pass "pass:$ANDROID_KEY_PASSWORD")
+          elif [ -n "$ANDROID_KEYSTORE" ] || [ -n "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            # A half-configured key must not silently fall back to a throwaway one:
+            # that APK couldn't update installs signed with the real key.
+            echo "::error::Set both ANDROID_KEYSTORE and ANDROID_KEYSTORE_PASSWORD, or neither."
+            exit 1
+          else
+            echo "::notice title=Throwaway signing key::ANDROID_KEYSTORE secrets are not set; uninstall the previous build before installing this one."
+            pass=$(openssl rand -hex 16)
+            keytool -genkeypair -keystore release.jks -storepass "$pass" -keypass "$pass" \
+              -alias multichat -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Multichat" -noprompt
+          fi
+          "$tools/zipalign" -f -p 4 "$unsigned" aligned.apk
+          "$tools/apksigner" sign --ks release.jks --ks-pass "pass:$pass" "${key_args[@]}" --out multichat.apk aligned.apk
+          "$tools/apksigner" verify multichat.apk
+          rm -f release.jks
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: multichat-android
+          path: app/src-tauri/gen/android/multichat.apk
+          if-no-files-found: error
