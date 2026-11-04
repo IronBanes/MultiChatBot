@@ -273,6 +273,7 @@ function ReactButton({ m, align = "left" }: { m: Message; align?: "left" | "righ
 function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
   const react = useChat((s) => s.react);
   const myId = useChat((s) => s.client!.user_id);
+  const toast = useChat((s) => s.toast);
   const [copied, setCopied] = useState(false);
   const copy = async () => {
     try {
@@ -280,7 +281,7 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
       setCopied(true);
       window.setTimeout(onClose, 800);
     } catch {
-      /* clipboard unavailable */
+      toast("Couldn't copy the text");
     }
   };
   const mine = (emoji: string) => m.reactions.some((r) => r.emoji === emoji && r.user_ids.includes(myId));
@@ -459,7 +460,7 @@ const MessageItem = memo(function MessageItem({
         </div>
         {/* Floats over the message's top edge on hover, so it adds no height to the chat.
             Touch screens long-press instead. */}
-        <div className="absolute -top-3 right-4 hidden rounded-md border border-zinc-200 bg-white p-0.5 text-xs text-zinc-500 shadow-sm group-hover:flex focus-within:flex sm:right-5 dark:border-zinc-700 dark:bg-zinc-900 [@media(hover:none)]:!hidden">
+        <div className="pointer-events-none absolute -top-3 right-4 flex rounded-md border border-zinc-200 bg-white p-0.5 text-xs text-zinc-500 opacity-0 shadow-sm transition group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100 sm:right-5 dark:border-zinc-700 dark:bg-zinc-900 [@media(hover:none)]:!hidden">
           <ReactButton m={m} align="right" />
         </div>
         {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}

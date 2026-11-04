@@ -300,6 +300,7 @@ async fn with_attachments(db: &Db, mut messages: Vec<Message>) -> sqlx::Result<V
 }
 
 /// Adds or removes one user's reaction. Adding one that already exists is a no-op.
+/// Returns false only when adding a new emoji would exceed `max_emoji` distinct emoji.
 pub async fn set_reaction(
     db: &Db,
     room_id: &str,
@@ -307,19 +308,40 @@ pub async fn set_reaction(
     user_id: &str,
     emoji: &str,
     on: bool,
-) -> sqlx::Result<()> {
+    max_emoji: usize,
+) -> sqlx::Result<bool> {
     if on {
-        sqlx::query(
+        // The cap check is part of the insert, so two people adding different new
+        // emoji at once can't both slip past it.
+        let inserted = sqlx::query(
             "INSERT OR IGNORE INTO reactions (message_id, room_id, user_id, emoji, created_at)
-             VALUES (?, ?, ?, ?, ?)",
+             SELECT ?, ?, ?, ?, ?
+             WHERE EXISTS (SELECT 1 FROM reactions WHERE message_id = ? AND emoji = ?)
+                OR (SELECT COUNT(DISTINCT emoji) FROM reactions WHERE message_id = ?) < ?",
         )
         .bind(message_id)
         .bind(room_id)
         .bind(user_id)
         .bind(emoji)
         .bind(now_ms())
+        .bind(message_id)
+        .bind(emoji)
+        .bind(message_id)
+        .bind(max_emoji as i64)
         .execute(db)
-        .await?;
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            // Nothing written: either this person already had this reaction (fine), or
+            // the emoji is new to the message and the cap stopped it.
+            let present: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM reactions WHERE message_id = ? AND emoji = ?)")
+                    .bind(message_id)
+                    .bind(emoji)
+                    .fetch_one(db)
+                    .await?;
+            return Ok(present);
+        }
     } else {
         sqlx::query("DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?")
             .bind(message_id)
@@ -328,7 +350,7 @@ pub async fn set_reaction(
             .execute(db)
             .await?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// A message's reactions grouped by emoji, every message kind included.
@@ -465,4 +487,32 @@ pub async fn attachment(db: &Db, id: &str) -> sqlx::Result<Option<(String, Strin
         .bind(id)
         .fetch_optional(db)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reaction_cap_holds_but_existing_emoji_still_join() {
+        let dir = std::env::temp_dir().join(format!("mc-react-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        let emoji = ["😀", "😁", "😂"];
+        for e in &emoji[..2] {
+            assert!(set_reaction(&db, "r", "m", "a", e, true, 2).await.unwrap());
+        }
+        // A third distinct emoji is over the cap of 2.
+        assert!(!set_reaction(&db, "r", "m", "b", emoji[2], true, 2).await.unwrap());
+        // Joining an emoji that is already there, or repeating your own, still works.
+        assert!(set_reaction(&db, "r", "m", "b", emoji[0], true, 2).await.unwrap());
+        assert!(set_reaction(&db, "r", "m", "b", emoji[0], true, 2).await.unwrap());
+        // Removing one frees a slot.
+        assert!(set_reaction(&db, "r", "m", "a", emoji[1], false, 2).await.unwrap());
+        assert!(set_reaction(&db, "r", "m", "b", emoji[2], true, 2).await.unwrap());
+        let got: Vec<_> = reactions(&db, "m").await.unwrap().into_iter().map(|r| (r.emoji, r.user_ids.len())).collect();
+        assert_eq!(got, vec![("😀".to_string(), 2), ("😂".to_string(), 1)]);
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

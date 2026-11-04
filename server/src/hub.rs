@@ -539,16 +539,15 @@ impl State {
                 }
                 let emoji = emoji.trim();
                 let ok_emoji = (1..=MAX_EMOJI).contains(&emoji.chars().count())
-                    && emoji.chars().all(|c| !c.is_whitespace() && !c.is_ascii_alphanumeric());
+                    && emoji.chars().all(|c| !c.is_whitespace() && !c.is_alphanumeric());
                 if !ok_emoji {
                     self.send(conn, err(None, "Not a valid reaction"));
                     return Ok(());
                 }
-                if on && !message.reactions.iter().any(|r| r.emoji == emoji) && message.reactions.len() >= MAX_REACTION_EMOJI {
+                if !db::set_reaction(&self.db, &room_id, &message_id, &user_id, emoji, on, MAX_REACTION_EMOJI).await? {
                     self.send(conn, err(None, "Too many different reactions on this message"));
                     return Ok(());
                 }
-                db::set_reaction(&self.db, &room_id, &message_id, &user_id, &emoji, on).await?;
                 let reactions = db::reactions(&self.db, &message_id).await?;
                 self.broadcast(
                     &room_id,
