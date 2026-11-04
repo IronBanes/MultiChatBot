@@ -911,6 +911,53 @@ function MessageList({
   );
 }
 
+/** "Sam is typing…" — live relay state, subscribed on its own so typing updates never
+ *  re-render the memoized message rows. Entries expire on their own, so a lost
+ *  `typing: false` frame just makes the line vanish a few seconds later. */
+function TypingIndicator({ roomId, phone }: { roomId: string; phone: boolean }) {
+  const typing = useChat((s) => s.typing[roomId]);
+  const [now, setNow] = useState(() => Date.now());
+  // Only entries whose expiry is still in the future.
+  const names = useMemo(
+    () => Object.values(typing ?? {}).filter((e) => e.until > now).map((e) => e.name),
+    [typing, now],
+  );
+
+  // Tick once a second while anyone is shown, so stale entries disappear on time.
+  // The interval is cleared when the line is hidden.
+  useEffect(() => {
+    if (names.length === 0) return;
+    const t = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(t);
+  }, [names.length]);
+
+  if (names.length === 0) return null;
+  const rest = names.length - 2;
+  const label =
+    names.length === 1
+      ? `${names[0]} is typing…`
+      : names.length === 2
+        ? `${names[0]} and ${names[1]} are typing…`
+        : `${names[0]}, ${names[1]} and ${rest} other${rest === 1 ? "" : "s"} are typing…`;
+
+  // Floated over the list's bottom edge, outside the flow, so the layout never jumps.
+  return (
+    <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 flex justify-center px-3 pb-1.5">
+      <div
+        className={`flex max-w-full items-center gap-1.5 rounded-full bg-white/90 px-3 py-0.5 text-zinc-500 shadow-sm backdrop-blur-sm dark:bg-zinc-900/90 ${phone ? "text-[13px]" : "text-xs"}`}
+        aria-live="polite"
+      >
+        <span className="typing-dots shrink-0" aria-hidden>
+          <i />
+          <i />
+          <i />
+        </span>
+        <span className="truncate">{label}</span>
+      </div>
+    </div>
+  );
+}
+
 /** The Off / Ask / Auto switch for each MCP server, in this room. */
 function ToolsList({ room }: { room: RoomInfo }) {
   const servers = useChat((s) => s.client!.mcp_servers);
@@ -1113,6 +1160,45 @@ function Composer({
   // While editing, the AI-reply option doesn't apply: the edit goes out as-is.
   const ai = !editing && aiOn && !!profileId;
 
+  // --- Typing indicator broadcast ------------------------------------------
+  // `true` goes out at most every 3 s while typing continues; `false` when the text
+  // empties, on send, after 5 s of silence, and on unmount (the Composer is keyed by
+  // room, so that also covers switching rooms). A `false` is only sent if a `true`
+  // went out since the last `false`. Timers live in refs and are cleared on unmount.
+  const setTyping = useChat((s) => s.setTyping);
+  /** When the last `typing: true` was sent (0 = never). */
+  const lastTrue = useRef(0);
+  /** True once a `true` went out and no `false` has followed. */
+  const active = useRef(false);
+  /** Silence timer: 5 s without a keystroke ends the indicator. */
+  const idleTimer = useRef<number | undefined>(undefined);
+  const stopTyping = () => {
+    window.clearTimeout(idleTimer.current);
+    idleTimer.current = undefined;
+    if (!active.current) return;
+    active.current = false;
+    setTyping(room.id, false);
+  };
+  // Unmount (also covers switching rooms, since the Composer is keyed by room).
+  useEffect(() => stopTyping, []);
+  /** Called on every text change. */
+  const onTextChange = (value: string) => {
+    setText(value);
+    if (editing) return; // an edit isn't a new message
+    if (!value.trim()) {
+      stopTyping();
+      return;
+    }
+    const now = Date.now();
+    window.clearTimeout(idleTimer.current);
+    idleTimer.current = window.setTimeout(stopTyping, 5000);
+    if (now - lastTrue.current >= 3000) {
+      lastTrue.current = now;
+      active.current = true;
+      setTyping(room.id, true);
+    }
+  };
+
   // Entering edit mode loads the message's text (setting aside what was being typed) and
   // focuses the box; leaving it, by saving or cancelling, brings that draft back. If edit
   // mode ends some other way (the message was deleted, or Reply was picked) with unsaved
@@ -1129,6 +1215,8 @@ function Composer({
   };
   useEffect(() => {
     if (editing) {
+      // An edit isn't a new message: end any typing broadcast still pending.
+      stopTyping();
       lastEdit.current = editing;
       setText((t) => {
         if (draftBeforeEdit.current === null) draftBeforeEdit.current = t;
@@ -1188,6 +1276,7 @@ ${before}` : t);
       if (await sendMessage(room.id, sent, ai, ai ? profileId : null, reply)) {
         setText((t) => (t.startsWith(sent) ? t.slice(sent.length).trimStart() : t));
         if (reply) onClearReply();
+        stopTyping();
       }
     } finally {
       sending.current = false;
@@ -1265,7 +1354,7 @@ ${before}` : t);
             ref={ta}
             rows={1}
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => onTextChange(e.target.value)}
             onKeyDown={onKeyDown}
             placeholder={editing ? "Edit your message" : ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
             className="block min-h-10 min-w-0 flex-1 resize-none rounded-[20px] border border-zinc-300 bg-white px-4 py-2 text-[16px] leading-snug outline-none placeholder:text-zinc-400 focus:border-indigo-500 dark:border-zinc-700 dark:bg-zinc-900"
@@ -1301,7 +1390,7 @@ ${before}` : t);
           ref={ta}
           rows={1}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => onTextChange(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
@@ -1663,7 +1752,12 @@ export function RoomView({
     >
       <div className="flex min-w-0 flex-1 flex-col">
         {header}
-        <MessageList room={room} myProfileId={profileId} bubbles={phone} onEdit={startEdit} onReply={startReply} />
+        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+          <MessageList room={room} myProfileId={profileId} bubbles={phone} onEdit={startEdit} onReply={startReply} />
+          {/* Floats over the list's bottom edge, outside the flow, so it appears and
+              disappears without moving the messages. */}
+          <TypingIndicator roomId={room.id} phone={phone} />
+        </div>
         {/* Keyed by room: each room gets a fresh draft, and a send that finishes after
             switching rooms can't edit the new room's text. The editing/replying state
             lives here so both the list and the composer reach it. */}

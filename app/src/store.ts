@@ -41,6 +41,8 @@ interface ChatState {
   localTools: Record<string, Record<string, LocalTool>>;
   /** attachment id → data URL ("" while loading). */
   images: Record<string, string>;
+  /** Room id → user id → who is typing and when that expires (never persisted). */
+  typing: Record<string, Record<string, { name: string; until: number }>>;
   toasts: Toast[];
 
   init(): Promise<void>;
@@ -70,6 +72,8 @@ interface ChatState {
   stopAi(id: string): void;
   /** Adds or removes this user's reaction on a message (human or AI). */
   react(roomId: string, messageId: string, emoji: string, on: boolean): void;
+  /** Best-effort "I'm typing" broadcast; never persisted by the relay. */
+  setTyping(roomId: string, typing: boolean): void;
   setRoomPrompt(roomId: string, prompt: string): void;
   chooseProfile(roomId: string, profileId: string): void;
   setRoomMcpMode(roomId: string, serverId: string, mode: McpMode): void;
@@ -124,6 +128,18 @@ function patchMessage(list: Message[] | undefined, id: string, f: (m: Message) =
   const next = list.slice();
   next[i] = f(next[i]);
   return next;
+}
+
+/** How long a `typing: true` stays believable without a repeat frame (ms). */
+const TYPING_TTL = 6000;
+
+/** Drops one user's typing entry from a room, keeping the object identity when it
+ *  wasn't there (so unrelated rooms' components don't re-render). */
+function dropTyping(s: ChatState, roomId: string, userId: string) {
+  const room = s.typing[roomId];
+  if (!room || !(userId in room)) return {};
+  const { [userId]: _, ...rest } = room;
+  return { typing: { ...s.typing, [roomId]: rest } };
 }
 
 function request<T>(build: (requestId: string) => Parameters<Relay["send"]>[0]): Promise<T> {
@@ -322,12 +338,15 @@ export const useChat = create<ChatState>((set, get) => {
       case "message": {
         const m = withAttachments(msg.message);
         const mine = m.author_id === get().client?.user_id;
+        // Their message arrived: they're not typing anymore.
+        const typingGone = m.kind === "human" ? dropTyping(get(), m.room_id, m.author_id) : {};
         set((s) => ({
           messages: { ...s.messages, [m.room_id]: upsert(s.messages[m.room_id], m) },
           unread:
             s.activeRoomId === m.room_id || (mine && m.kind === "human")
               ? s.unread
               : { ...s.unread, [m.room_id]: (s.unread[m.room_id] ?? 0) + 1 },
+          ...typingGone,
         }));
         const profileId = pendingAi.get(m.id);
         if (profileId && m.kind === "human") {
@@ -424,7 +443,28 @@ export const useChat = create<ChatState>((set, get) => {
           ...r,
           members: r.members.map((m) => (m.user_id === msg.user_id ? { ...m, online: msg.online } : m)),
         }));
+        // Gone offline: their typing entry (if any) is stale immediately.
+        if (!msg.online) set((s) => dropTyping(s, msg.room_id, msg.user_id));
         break;
+      case "typing": {
+        // Other devices of this same account: nothing to show.
+        if (msg.user_id === get().client?.user_id) break;
+        set((s) => {
+          const room = s.typing[msg.room_id] ?? {};
+          if (!msg.typing) {
+            if (!(msg.user_id in room)) return {};
+            const { [msg.user_id]: _, ...rest } = room;
+            return { typing: { ...s.typing, [msg.room_id]: rest } };
+          }
+          return {
+            typing: {
+              ...s.typing,
+              [msg.room_id]: { ...room, [msg.user_id]: { name: msg.display_name, until: Date.now() + TYPING_TTL } },
+            },
+          };
+        });
+        break;
+      }
       case "reactions":
         // The frame always carries the message's full current list, so replace.
         set((s) => ({
@@ -493,6 +533,7 @@ export const useChat = create<ChatState>((set, get) => {
     myGenerations: {},
     localTools: {},
     images: {},
+    typing: {},
     toasts: [],
 
     async init() {
@@ -601,6 +642,11 @@ export const useChat = create<ChatState>((set, get) => {
 
     react(roomId, messageId, emoji, on) {
       relay?.send({ type: "react", room_id: roomId, message_id: messageId, emoji, on });
+    },
+
+    setTyping(roomId, typing) {
+      // Best effort: if it doesn't go out, others just see the indicator expire.
+      relay?.send({ type: "typing", room_id: roomId, typing });
     },
 
     setRoomPrompt(roomId, prompt) {

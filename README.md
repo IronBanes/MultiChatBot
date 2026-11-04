@@ -17,6 +17,7 @@ keys or endpoints.
 
 You can edit or delete your own messages (deleting leaves a "Message deleted" placeholder
 for everyone) and reply to any message, with a quote that jumps back to the original.
+While someone is writing, the chat shows who is typing.
 
 ## Layout
 
