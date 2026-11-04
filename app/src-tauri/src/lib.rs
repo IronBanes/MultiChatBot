@@ -210,15 +210,26 @@ fn validate_base_url(p: &Profile) -> Result<(), String> {
 }
 
 /// The key typed into the form if any, else the stored one.
-fn resolve_key(profile: &Profile, api_key: Option<String>) -> Result<Option<String>, String> {
+fn resolve_key(state: &AppState, profile: &Profile, api_key: Option<String>) -> Result<Option<String>, String> {
     match api_key.filter(|k| !k.trim().is_empty()) {
         Some(k) => Ok(Some(k)),
-        None if !profile.id.is_empty() => secrets::get_key(&profile.id),
+        None if !profile.id.is_empty() => {
+            // A key typed into the form still works, so the user can test and recover.
+            check_not_blocked(state, profile)?;
+            secrets::get_key(&profile.id)
+        }
         None => Ok(None),
     }
 }
 
-/// `api_key`: `None` keeps the stored key, `Some("")` removes it, otherwise replaces it.
+/// A profile whose key rollback failed must not use its stored key until it's saved again.
+fn check_not_blocked(state: &AppState, profile: &Profile) -> Result<(), String> {
+    if state.unsafe_keys.lock().map_err(|_| "lock poisoned")?.contains(&profile.id) {
+        return Err(format!("{} is disabled after a failed save. Save it again in Settings to use it.", profile.label));
+    }
+    Ok(())
+}
+
 /// Puts a profile's previous API key back after a save failed part-way, so the new key
 /// is never sent to the endpoint it wasn't meant for. If the old key can't come back,
 /// the key is removed; if even that fails, the profile is disabled until saved again.
@@ -241,6 +252,7 @@ fn restore_key(state: &AppState, id: &str, previous_key: Option<String>, e: Stri
     }
 }
 
+/// `api_key`: `None` keeps the stored key, `Some("")` removes it, otherwise replaces it.
 #[tauri::command]
 fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Option<String>) -> Result<ProfileView, String> {
     validate(&profile)?;
@@ -299,7 +311,7 @@ fn set_last_profile(state: State<'_, AppState>, room_id: String, profile_id: Str
 #[tauri::command]
 async fn test_profile(state: State<'_, AppState>, profile: Profile, api_key: Option<String>) -> Result<String, String> {
     validate(&profile)?;
-    let key = resolve_key(&profile, api_key)?;
+    let key = resolve_key(&state, &profile, api_key)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let req = ChatRequest {
         model: profile.model.clone(),
@@ -345,7 +357,7 @@ async fn test_profile(state: State<'_, AppState>, profile: Profile, api_key: Opt
 #[tauri::command]
 async fn list_models(state: State<'_, AppState>, profile: Profile, api_key: Option<String>) -> Result<Vec<ModelInfo>, String> {
     validate_base_url(&profile)?;
-    let key = resolve_key(&profile, api_key)?;
+    let key = resolve_key(&state, &profile, api_key)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     tokio::time::timeout(Duration::from_secs(30), provider.list_models())
         .await
@@ -517,9 +529,7 @@ fn generate(
 ) -> Result<(), String> {
     let cfg = state.snapshot()?;
     let profile = state.profile(&profile_id)?;
-    if state.unsafe_keys.lock().map_err(|_| "lock poisoned")?.contains(&profile.id) {
-        return Err(format!("{} is disabled after a failed save. Save it again in Settings to use it.", profile.label));
-    }
+    check_not_blocked(&state, &profile)?;
     let key = secrets::get_key(&profile.id)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let prompt = context::build(&history, &room_prompt, profile.max_context_tokens);
