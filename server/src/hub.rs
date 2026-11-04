@@ -506,6 +506,9 @@ impl State {
             }
 
             ClientMsg::AiComplete { room_id, id, content } => {
+                // Ordered with deletes: the finished row can't be deleted and announced
+                // before this completion goes out.
+                let _ordered = self.updates_lock.lock().await;
                 let Some(stream) = self.take_stream(conn, &room_id, &id) else { return Ok(()) };
                 let content: String = content.chars().take(MAX_CONTENT).collect();
                 let result = AiResult {
@@ -520,6 +523,7 @@ impl State {
             }
 
             ClientMsg::AiError { room_id, id, error } => {
+                let _ordered = self.updates_lock.lock().await;
                 let Some(stream) = self.take_stream(conn, &room_id, &id) else { return Ok(()) };
                 let error = clip(&error, MAX_ERROR);
                 let result = AiResult {
@@ -828,6 +832,8 @@ impl State {
         };
 
         for (id, s) in orphaned {
+            // Like AiComplete: a delete can't be announced between the write and this.
+            let _ordered = self.updates_lock.lock().await;
             if let Err(e) = db::finish_ai(
                 &self.db,
                 &id,
