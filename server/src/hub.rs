@@ -16,6 +16,10 @@ const MAX_ERROR: usize = 300;
 const HISTORY_LIMIT: i64 = 1000;
 const MAX_TOOL_CALLS: usize = 100;
 const MAX_ATTACHMENTS: usize = 8;
+/// Distinct emoji one message accepts across all members.
+const MAX_REACTION_EMOJI: usize = 20;
+/// Reaction emoji length cap; single emoji are a few chars of UTF-16.
+const MAX_EMOJI: usize = 16;
 /// Base64 length cap (~4.5 MB of image); clients downscale before sending.
 const MAX_ATTACHMENT_B64: usize = 6_000_000;
 /// Reported image dimensions outside 1..=this are rejected as bogus metadata.
@@ -110,6 +114,9 @@ impl Hub {
 pub struct State {
     pub db: Db,
     hub: Arc<Mutex<Hub>>,
+    /// Held across a reaction's write, re-read and broadcast, so snapshots go out in
+    /// the order they were written and a slower handler can't send a stale list last.
+    reactions_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -122,7 +129,7 @@ fn err(request_id: Option<String>, message: impl Into<String>) -> ServerMsg {
 
 impl State {
     pub fn new(db: Db) -> Self {
-        Self { db, hub: Arc::new(Mutex::new(Hub::default())) }
+        Self { db, hub: Arc::new(Mutex::new(Hub::default())), reactions_lock: Default::default() }
     }
 
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
@@ -518,6 +525,44 @@ impl State {
                 self.broadcast(
                     &room_id,
                     ServerMsg::RoomUpdated { room_id: room_id.clone(), system_prompt: prompt, updated_by: user_id },
+                );
+            }
+
+            ClientMsg::React { room_id, message_id, emoji, on } => {
+                if !self.in_room(conn, &room_id) {
+                    return Ok(());
+                }
+                let Some(message) = db::message(&self.db, &message_id).await? else {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                };
+                if message.room_id != room_id {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                }
+                let emoji = emoji.trim();
+                let ok_emoji = (1..=MAX_EMOJI).contains(&emoji.chars().count())
+                    && emoji.chars().all(|c| !c.is_whitespace() && !c.is_alphanumeric());
+                if !ok_emoji {
+                    self.send(conn, err(None, "Not a valid reaction"));
+                    return Ok(());
+                }
+                let _ordered = self.reactions_lock.lock().await;
+                match db::set_reaction(&self.db, &room_id, &message_id, &user_id, emoji, on, MAX_REACTION_EMOJI).await? {
+                    Ok(()) => {}
+                    Err(db::ReactionRefused::TooMany) => {
+                        self.send(conn, err(None, "Too many different reactions on this message"));
+                        return Ok(());
+                    }
+                    Err(db::ReactionRefused::NotMember) => {
+                        self.send(conn, err(None, "You're not in that room"));
+                        return Ok(());
+                    }
+                }
+                let reactions = db::reactions(&self.db, &message_id).await?;
+                self.broadcast(
+                    &room_id,
+                    ServerMsg::Reactions { room_id: room_id.clone(), message_id, reactions },
                 );
             }
 

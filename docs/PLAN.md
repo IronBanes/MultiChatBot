@@ -41,6 +41,8 @@ attachments (id TEXT PK, message_id TEXT, room_id TEXT, mime TEXT,
              data TEXT,                      -- base64 image
              created_at INTEGER)        -- source of truth for a reply's images,
                                         -- written at upload so they survive disconnects
+reactions (message_id TEXT, room_id TEXT, user_id TEXT, emoji TEXT,
+           created_at INTEGER, PRIMARY KEY(message_id, user_id, emoji))  -- emoji reactions
 ```
 
 On startup any leftover `streaming` rows become `interrupted`.
@@ -90,6 +92,7 @@ all rooms. The first client frame must be `hello`.
 | `ai_complete` | `room_id, id, content` | full final text, persisted with reasoning, tool activity and attachments |
 | `ai_error` | `room_id, id, error` | short, sanitized reason |
 | `set_room_prompt` | `room_id, system_prompt` | any member |
+| `react` | `room_id, message_id, emoji, on` | add (`on` true) or remove a reaction; any member, any message; ≤ 20 distinct emoji per message |
 | `create_link_code` | `request_id` | → `link_code`; one live code per user, valid 10 min, single use |
 | `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
 
@@ -114,6 +117,7 @@ all rooms. The first client frame must be `hello`.
 | `member_left` | `room_id, user_id` |
 | `presence` | `room_id, user_id, online` |
 | `room_updated` | `room_id, system_prompt, updated_by` |
+| `reactions` | `room_id, message_id, reactions: Reaction[]` (the message's full current list) |
 | `link_code` | `request_id, code, expires_in_secs` |
 | `linked` | `request_id, user_id, display_name` |
 | `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline) |
@@ -122,6 +126,9 @@ all rooms. The first client frame must be `hello`.
 `RoomInfo = {id, name, invite_code, system_prompt, members: Member[]}`
 `Member = {user_id, display_name, online}`
 `Device = {device_id, device_name, platform}`
+`Reaction = {emoji, user_ids}` (grouped per emoji, in first-use order)
+`Message = {id, room_id, seq, kind, author_id, author_name, content, reasoning, tools,
+            attachments, reactions, ai_requested, anchor_id, model, status, error, created_at}`
 
 ### AI reply lifecycle
 

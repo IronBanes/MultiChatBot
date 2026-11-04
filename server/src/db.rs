@@ -1,6 +1,6 @@
 //! SQLite persistence for users, rooms, members and messages.
 
-use crate::protocol::{Attachment, Message, ToolActivity};
+use crate::protocol::{Attachment, Message, Reaction, ToolActivity};
 use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::collections::HashMap;
@@ -60,6 +60,15 @@ CREATE TABLE IF NOT EXISTS attachments (
     created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attachments_message ON attachments(message_id);
+CREATE TABLE IF NOT EXISTS reactions (
+    message_id TEXT NOT NULL,
+    room_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    emoji TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (message_id, user_id, emoji)
+);
+CREATE INDEX IF NOT EXISTS reactions_message ON reactions(message_id);
 "#;
 
 pub async fn connect(path: &str) -> anyhow::Result<Db> {
@@ -228,9 +237,9 @@ pub async fn set_room_prompt(db: &Db, room_id: &str, prompt: &str) -> sqlx::Resu
     Ok(())
 }
 
-// `attachments` is filled in from the attachments table by `with_attachments`.
-const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, reasoning, tools, '[]' AS attachments, ai_requested, \
-                            anchor_id, model, status, error, created_at";
+// `attachments` and `reactions` are filled in by `with_attachments` / `with_reactions`.
+const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, reasoning, tools, '[]' AS attachments, \
+                            '[]' AS reactions, ai_requested, anchor_id, model, status, error, created_at";
 
 pub async fn recent_messages(db: &Db, room_id: &str, limit: i64) -> sqlx::Result<Vec<Message>> {
     let messages = sqlx::query_as(&format!(
@@ -241,7 +250,7 @@ pub async fn recent_messages(db: &Db, room_id: &str, limit: i64) -> sqlx::Result
     .bind(limit)
     .fetch_all(db)
     .await?;
-    with_attachments(db, messages).await
+    with_reactions(db, with_attachments(db, messages).await?).await
 }
 
 pub async fn message(db: &Db, id: &str) -> sqlx::Result<Option<Message>> {
@@ -250,7 +259,7 @@ pub async fn message(db: &Db, id: &str) -> sqlx::Result<Option<Message>> {
         .fetch_optional(db)
         .await?;
     Ok(match m {
-        Some(m) => with_attachments(db, vec![m]).await?.pop(),
+        Some(m) => with_reactions(db, with_attachments(db, vec![m]).await?).await?.pop(),
         None => None,
     })
 }
@@ -285,6 +294,132 @@ async fn with_attachments(db: &Db, mut messages: Vec<Message>) -> sqlx::Result<V
     for m in &mut messages {
         if let Some(list) = by_message.remove(&m.id) {
             m.attachments = list;
+        }
+    }
+    Ok(messages)
+}
+
+/// Why a reaction wasn't added.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReactionRefused {
+    /// The user isn't (or is no longer) a member of the room.
+    NotMember,
+    /// The emoji is new to the message and it already has `max_emoji` distinct ones.
+    TooMany,
+}
+
+/// Adds or removes one user's reaction. Adding one that already exists is a no-op.
+/// The membership and cap checks run inside the insert, so a concurrent leave or a
+/// concurrent new emoji can't slip past them.
+pub async fn set_reaction(
+    db: &Db,
+    room_id: &str,
+    message_id: &str,
+    user_id: &str,
+    emoji: &str,
+    on: bool,
+    max_emoji: usize,
+) -> sqlx::Result<Result<(), ReactionRefused>> {
+    if on {
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO reactions (message_id, room_id, user_id, emoji, created_at)
+             SELECT ?, ?, ?, ?, ?
+             WHERE EXISTS (SELECT 1 FROM members WHERE room_id = ? AND user_id = ?)
+               AND (EXISTS (SELECT 1 FROM reactions WHERE message_id = ? AND emoji = ?)
+                    OR (SELECT COUNT(DISTINCT emoji) FROM reactions WHERE message_id = ?) < ?)",
+        )
+        .bind(message_id)
+        .bind(room_id)
+        .bind(user_id)
+        .bind(emoji)
+        .bind(now_ms())
+        .bind(room_id)
+        .bind(user_id)
+        .bind(message_id)
+        .bind(emoji)
+        .bind(message_id)
+        .bind(max_emoji as i64)
+        .execute(db)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            // Nothing written: not a member, already had this reaction (fine), or the
+            // emoji is new to the message and the cap stopped it.
+            let (member, present): (bool, bool) = sqlx::query_as(
+                "SELECT EXISTS (SELECT 1 FROM members WHERE room_id = ? AND user_id = ?),
+                        EXISTS (SELECT 1 FROM reactions WHERE message_id = ? AND emoji = ?)",
+            )
+            .bind(room_id)
+            .bind(user_id)
+            .bind(message_id)
+            .bind(emoji)
+            .fetch_one(db)
+            .await?;
+            return Ok(if !member {
+                Err(ReactionRefused::NotMember)
+            } else if present {
+                Ok(())
+            } else {
+                Err(ReactionRefused::TooMany)
+            });
+        }
+    } else {
+        sqlx::query("DELETE FROM reactions WHERE message_id = ? AND user_id = ? AND emoji = ?")
+            .bind(message_id)
+            .bind(user_id)
+            .bind(emoji)
+            .execute(db)
+            .await?;
+    }
+    Ok(Ok(()))
+}
+
+/// A message's reactions grouped by emoji, every message kind included.
+pub async fn reactions(db: &Db, message_id: &str) -> sqlx::Result<Vec<Reaction>> {
+    let mut groups: Vec<Reaction> = Vec::new();
+    for (user_id, emoji) in
+        sqlx::query_as::<_, (String, String)>(
+            "SELECT user_id, emoji FROM reactions WHERE message_id = ? ORDER BY created_at, rowid",
+        )
+        .bind(message_id)
+        .fetch_all(db)
+        .await?
+    {
+        push_reaction(&mut groups, emoji, user_id);
+    }
+    Ok(groups)
+}
+
+/// Appends to a reaction group, creating it where the emoji first appears.
+fn push_reaction(groups: &mut Vec<Reaction>, emoji: String, user_id: String) {
+    match groups.iter_mut().find(|r| r.emoji == emoji) {
+        Some(r) => r.user_ids.push(user_id),
+        None => groups.push(Reaction { emoji, user_ids: vec![user_id] }),
+    }
+}
+
+/// Fills `reactions` for all messages in one query, ordered per emoji by first use.
+async fn with_reactions(db: &Db, mut messages: Vec<Message>) -> sqlx::Result<Vec<Message>> {
+    let ids: Vec<&str> = messages.iter().map(|m| m.id.as_str()).collect();
+    if ids.is_empty() {
+        return Ok(messages);
+    }
+    let sql = format!(
+        "SELECT message_id, user_id, emoji FROM reactions
+         WHERE message_id IN ({}) ORDER BY created_at, rowid",
+        vec!["?"; ids.len()].join(", ")
+    );
+    let mut query = sqlx::query_as::<_, (String, String, String)>(&sql);
+    for id in &ids {
+        query = query.bind(*id);
+    }
+    let mut by_message: HashMap<String, Vec<Reaction>> = HashMap::new();
+    for (message_id, user_id, emoji) in query.fetch_all(db).await? {
+        push_reaction(by_message.entry(message_id).or_default(), emoji, user_id);
+    }
+    for m in &mut messages {
+        if let Some(list) = by_message.remove(&m.id) {
+            m.reactions = list;
         }
     }
     Ok(messages)
@@ -373,4 +508,43 @@ pub async fn attachment(db: &Db, id: &str) -> sqlx::Result<Option<(String, Strin
         .bind(id)
         .fetch_optional(db)
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reaction_cap_holds_but_existing_emoji_still_join() {
+        let dir = std::env::temp_dir().join(format!("mc-react-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users VALUES ('a', 'A', 0), ('b', 'B', 0), ('c', 'C', 0);
+             INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
+             INSERT INTO members VALUES ('r', 'a', 0), ('r', 'b', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let set = |u: &'static str, e: &'static str, on: bool| set_reaction(&db, "r", "m", u, e, on, 2);
+        let emoji = ["😀", "😁", "😂"];
+        for e in &emoji[..2] {
+            assert_eq!(set("a", e, true).await.unwrap(), Ok(()));
+        }
+        // A third distinct emoji is over the cap of 2.
+        assert_eq!(set("b", emoji[2], true).await.unwrap(), Err(ReactionRefused::TooMany));
+        // Joining an emoji that is already there, or repeating your own, still works.
+        assert_eq!(set("b", emoji[0], true).await.unwrap(), Ok(()));
+        assert_eq!(set("b", emoji[0], true).await.unwrap(), Ok(()));
+        // Someone outside the room can't react, even with an existing emoji.
+        assert_eq!(set("c", emoji[0], true).await.unwrap(), Err(ReactionRefused::NotMember));
+        // Removing one frees a slot.
+        assert_eq!(set("a", emoji[1], false).await.unwrap(), Ok(()));
+        assert_eq!(set("b", emoji[2], true).await.unwrap(), Ok(()));
+        let got: Vec<_> = reactions(&db, "m").await.unwrap().into_iter().map(|r| (r.emoji, r.user_ids.len())).collect();
+        assert_eq!(got, vec![("😀".to_string(), 2), ("😂".to_string(), 1)]);
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

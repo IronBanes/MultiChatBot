@@ -1,7 +1,7 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
-import type { Attachment, McpMode, Message, RoomInfo, ToolActivity } from "../lib/types";
+import type { Attachment, McpMode, Member, Message, RoomInfo, ToolActivity } from "../lib/types";
 import { useChat, type LocalTool } from "../store";
 import { confirmAction } from "./Confirm";
 import { Markdown } from "./Markdown";
@@ -180,6 +180,194 @@ function Gallery({ attachments }: { attachments: Attachment[] }) {
   );
 }
 
+/** Quick palette shared by the desktop popover and the phone's long-press sheet. */
+const REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🔥", "🎉", "👀"];
+
+/** Emoji pills under a message body: emoji + count, highlighted while yours is in it. */
+function ReactionChips({ m, members }: { m: Message; members: Member[] }) {
+  const react = useChat((s) => s.react);
+  const myId = useChat((s) => s.client!.user_id);
+  if (m.reactions.length === 0) return null;
+  const nameOf = (id: string) => members.find((x) => x.user_id === id)?.display_name || "Someone";
+  return (
+    <div className="mt-1 flex flex-wrap gap-1">
+      {m.reactions.map((r) => {
+        const mine = r.user_ids.includes(myId);
+        const who = r.user_ids.map(nameOf).join(", ");
+        return (
+          <button
+            key={r.emoji}
+            onClick={() => react(m.room_id, m.id, r.emoji, !mine)}
+            title={`${r.emoji} — ${who}`}
+            aria-label={`${r.emoji} reaction from ${who}. Click to ${mine ? "remove it" : "add it"}.`}
+            className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs leading-none transition active:scale-95 ${
+              mine
+                ? "border-indigo-400 bg-indigo-50 text-indigo-700 dark:border-indigo-500 dark:bg-indigo-950/60 dark:text-indigo-300"
+                : "border-zinc-300 bg-white text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+            }`}
+          >
+            <span className="text-sm leading-none">{r.emoji}</span>
+            <span className="font-medium tabular-nums">{r.user_ids.length}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Desktop hover action: opens the quick palette right above the button. `align` is the
+ *  side the palette lines up with, so it stays on screen near the right edge. */
+function ReactButton({ m, align = "left" }: { m: Message; align?: "left" | "right" }) {
+  const react = useChat((s) => s.react);
+  const myId = useChat((s) => s.client!.user_id);
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+    };
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", esc);
+    };
+  }, [open]);
+
+  const mine = (emoji: string) => m.reactions.some((r) => r.emoji === emoji && r.user_ids.includes(myId));
+  return (
+    <div ref={box} className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+      >
+        <Icon name="smile" size={12} /> React
+      </button>
+      {open && (
+        <div className={`absolute bottom-full ${align === "right" ? "right-0" : "left-0"} z-20 mb-1.5 flex gap-0.5 rounded-full border border-zinc-200 bg-white p-1 shadow-xl dark:border-zinc-700 dark:bg-zinc-900`}>
+          {REACTIONS.map((emoji) => (
+            <button
+              key={emoji}
+              onClick={() => {
+                react(m.room_id, m.id, emoji, !mine(emoji));
+                setOpen(false);
+              }}
+              className={`flex h-8 w-8 items-center justify-center rounded-full text-lg leading-none transition hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
+                mine(emoji) ? "bg-indigo-50 dark:bg-indigo-950/60" : ""
+              }`}
+              aria-label={`React with ${emoji}`}
+            >
+              {emoji}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Phones: the long-press sheet — the palette as large buttons, plus Copy text. */
+function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
+  const react = useChat((s) => s.react);
+  const myId = useChat((s) => s.client!.user_id);
+  const toast = useChat((s) => s.toast);
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(m.content);
+      setCopied(true);
+      window.setTimeout(onClose, 800);
+    } catch {
+      toast("Couldn't copy the text");
+    }
+  };
+  const mine = (emoji: string) => m.reactions.some((r) => r.emoji === emoji && r.user_ids.includes(myId));
+  return (
+    <div className="fixed inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={onClose}>
+      <div
+        className="animate-[sheet-up_180ms_ease-out] rounded-t-3xl bg-white pt-2 pb-[max(1rem,env(safe-area-inset-bottom))] dark:bg-zinc-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="mx-auto mb-2 h-1 w-10 rounded-full bg-zinc-300 dark:bg-zinc-700" />
+        <div className="grid grid-cols-8 px-2 pb-1">
+          {REACTIONS.map((emoji) => (
+            <button
+              key={emoji}
+              onClick={() => {
+                react(m.room_id, m.id, emoji, !mine(emoji));
+                onClose();
+              }}
+              className={`mx-auto flex h-11 w-11 items-center justify-center rounded-full text-2xl leading-none transition active:bg-zinc-100 dark:active:bg-zinc-800 ${
+                mine(emoji) ? "bg-indigo-50 dark:bg-indigo-950/60" : ""
+              }`}
+              aria-label={`React with ${emoji}`}
+            >
+              {emoji}
+            </button>
+          ))}
+        </div>
+        {m.content && (
+          <button
+            onClick={copy}
+            className="flex min-h-12 w-full items-center gap-3 px-4 text-left text-[15px] active:bg-zinc-100 dark:active:bg-zinc-800"
+          >
+            <Icon name="copy" size={18} className="text-zinc-500" />
+            <span className="flex-1">{copied ? "Copied" : "Copy text"}</span>
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Long-press (500 ms) that opens the phone's reaction sheet. A finger moved over
+ *  10 px cancels, so scrolling and the swipe-back gesture keep working. */
+function useLongPress(onLongPress: () => void) {
+  const timer = useRef<number | undefined>(undefined);
+  const start = useRef<{ x: number; y: number } | null>(null);
+  /** Set once the press fired, so lifting the finger isn't also taken as a tap. */
+  const fired = useRef(false);
+  const [pressing, setPressing] = useState(false);
+  const cancel = () => {
+    window.clearTimeout(timer.current);
+    start.current = null;
+    setPressing(false);
+  };
+  return {
+    /** True while a finger rests on the bubble: suppress text selection and the
+     *  native callout menu for that time (only on the bubble). */
+    pressing,
+    handlers: {
+      onTouchStart: (e: React.TouchEvent) => {
+        const t = e.touches[0];
+        start.current = { x: t.clientX, y: t.clientY };
+        fired.current = false;
+        setPressing(true);
+        timer.current = window.setTimeout(() => {
+          cancel();
+          fired.current = true;
+          onLongPress();
+        }, 500);
+      },
+      onTouchMove: (e: React.TouchEvent) => {
+        if (!start.current) return;
+        const t = e.touches[0];
+        if (Math.hypot(t.clientX - start.current.x, t.clientY - start.current.y) > 10) cancel();
+      },
+      onTouchEnd: (e: React.TouchEvent) => {
+        // The lift would otherwise click whatever is now under the finger: the
+        // sheet's backdrop, which closes it again.
+        if (fired.current) e.preventDefault();
+        cancel();
+      },
+      onTouchCancel: cancel,
+    },
+  };
+}
+
 const MessageItem = memo(function MessageItem({
   m,
   anchor,
@@ -188,6 +376,7 @@ const MessageItem = memo(function MessageItem({
   myProfileId,
   mine,
   bubbles,
+  members,
 }: {
   m: Message;
   anchor: Message | undefined;
@@ -197,6 +386,8 @@ const MessageItem = memo(function MessageItem({
   mine: boolean;
   /** Phone layout: chat bubbles, yours on the right. */
   bubbles: boolean;
+  /** Room members, to name who reacted (stable reference from MessageList). */
+  members: Member[];
 }) {
   const regenerate = useChat((s) => s.regenerate);
   const stopAi = useChat((s) => s.stopAi);
@@ -204,6 +395,8 @@ const MessageItem = memo(function MessageItem({
   const generating = useChat((s) => !!s.myGenerations[m.id]);
   const localTools = useChat((s) => s.localTools[m.id]);
   const [copied, setCopied] = useState(false);
+  const [sheet, setSheet] = useState(false);
+  const longPress = useLongPress(() => setSheet(true));
 
   if (m.kind === "human" && bubbles) {
     return (
@@ -221,7 +414,10 @@ const MessageItem = memo(function MessageItem({
             </div>
           )}
           <div
+            {...longPress.handlers}
             className={`rounded-[20px] px-3.5 py-2 text-[16px] leading-snug break-words ${
+              longPress.pressing ? "select-none [-webkit-touch-callout:none]" : ""
+            } ${
               mine
                 ? "md-on-accent rounded-br-md bg-indigo-600 text-white"
                 : "rounded-bl-md bg-zinc-100 text-zinc-900 dark:bg-zinc-800 dark:text-zinc-100"
@@ -229,16 +425,18 @@ const MessageItem = memo(function MessageItem({
           >
             <Markdown text={m.content} />
           </div>
+          <ReactionChips m={m} members={members} />
           {/* Only on your own: on everyone else's it would repeat under every message. */}
           {mine && !m.ai_requested && <span className="mt-0.5 px-1 text-[11px] text-zinc-400">no AI reply</span>}
         </div>
+        {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
       </div>
     );
   }
 
   if (m.kind === "human") {
     return (
-      <div className={`group flex gap-3 px-4 sm:px-5 ${compact ? "pt-0.5" : "pt-3"}`}>
+      <div className={`group relative flex gap-3 px-4 sm:px-5 ${compact ? "pt-0.5" : "pt-3"}`}>
         <div className="w-8 shrink-0">{!compact && <Avatar userId={m.author_id} name={m.author_name} />}</div>
         <div className="min-w-0 flex-1">
           {!compact && (
@@ -249,11 +447,23 @@ const MessageItem = memo(function MessageItem({
               <span className="shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
             </div>
           )}
-          <div className="text-[15px] leading-relaxed break-words text-zinc-800 dark:text-zinc-200">
+          <div
+            {...longPress.handlers}
+            className={`text-[15px] leading-relaxed break-words text-zinc-800 dark:text-zinc-200 ${
+              longPress.pressing ? "select-none [-webkit-touch-callout:none]" : ""
+            }`}
+          >
             <Markdown text={m.content} />
           </div>
+          <ReactionChips m={m} members={members} />
           {!m.ai_requested && <span className="mt-0.5 inline-block text-[11px] text-zinc-400">humans only · no AI reply</span>}
         </div>
+        {/* Floats over the message's top edge on hover, so it adds no height to the chat.
+            Touch screens long-press instead. */}
+        <div className="pointer-events-none absolute -top-3 right-4 flex rounded-md border border-zinc-200 bg-white p-0.5 text-xs text-zinc-500 opacity-0 shadow-sm transition group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100 sm:right-5 dark:border-zinc-700 dark:bg-zinc-900 [@media(hover:none)]:!hidden">
+          <ReactButton m={m} align="right" />
+        </div>
+        {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
       </div>
     );
   }
@@ -321,6 +531,7 @@ const MessageItem = memo(function MessageItem({
           <Icon name="copy" size={12} /> {copied ? "Copied" : "Copy"}
         </button>
       )}
+      {!bubbles && <ReactButton m={m} />}
       {!streaming && myProfileId && anchor && (
         <button onClick={() => regenerate(m, myProfileId)} className={actionCls}>
           <Icon name="refresh" size={12} /> {bubbles ? "Regenerate" : "Regenerate with my profile"}
@@ -349,10 +560,17 @@ const MessageItem = memo(function MessageItem({
               ↪ <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>: “{snippet(anchor.content, 50)}”
             </div>
           )}
-          <div className="max-w-full rounded-[20px] rounded-bl-md bg-indigo-50 px-3.5 py-2 text-[16px] leading-snug break-words text-zinc-900 dark:bg-indigo-950/60 dark:text-zinc-100">
+          <div
+            {...longPress.handlers}
+            className={`max-w-full rounded-[20px] rounded-bl-md bg-indigo-50 px-3.5 py-2 text-[16px] leading-snug break-words text-zinc-900 dark:bg-indigo-950/60 dark:text-zinc-100 ${
+              longPress.pressing ? "select-none [-webkit-touch-callout:none]" : ""
+            }`}
+          >
             {body}
           </div>
+          <ReactionChips m={m} members={members} />
           <div className="mt-0.5 flex flex-wrap text-xs text-zinc-500">{actions}</div>
+          {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
         </div>
       </div>
     );
@@ -392,6 +610,7 @@ const MessageItem = memo(function MessageItem({
         <div className="mt-1 rounded-xl rounded-tl-sm border border-zinc-200 bg-white px-3.5 py-2.5 text-[15px] leading-relaxed break-words shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
           {body}
         </div>
+        <ReactionChips m={m} members={members} />
         <div className="mt-1 flex h-6 flex-wrap gap-1 text-xs text-zinc-500 opacity-0 transition group-hover:opacity-100 [@media(hover:none)]:opacity-100 focus-within:opacity-100">
           {actions}
         </div>
@@ -404,6 +623,8 @@ function MessageList({ room, myProfileId, bubbles }: { room: RoomInfo; myProfile
   const messages = useChat((s) => s.messages[room.id]);
   const loaded = useChat((s) => !!s.loaded[room.id]);
   const myId = useChat((s) => s.client!.user_id);
+  // Stable reference: MessageItem is memo'd, so it must not see a new array each render.
+  const members = useMemo(() => room.members, [room.members]);
   const ref = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -485,6 +706,7 @@ function MessageList({ room, myProfileId, bubbles }: { room: RoomInfo; myProfile
               myProfileId={myProfileId}
               mine={m.author_id === myId}
               bubbles={bubbles}
+              members={members}
             />
           );
         })}

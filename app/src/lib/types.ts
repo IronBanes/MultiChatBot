@@ -40,6 +40,12 @@ export interface Attachment {
   height: number | null;
 }
 
+/** One emoji and everyone who used it on a message, in reaction order. */
+export interface Reaction {
+  emoji: string;
+  user_ids: string[];
+}
+
 export type MessageStatus = "complete" | "streaming" | "error" | "interrupted";
 
 export interface Message {
@@ -54,6 +60,7 @@ export interface Message {
   reasoning: string;
   tools: ToolActivity[];
   attachments: Attachment[];
+  reactions: Reaction[];
   ai_requested: boolean;
   anchor_id: string | null;
   model: string | null;
@@ -78,6 +85,7 @@ export type ClientMsg =
   | { type: "ai_complete"; room_id: string; id: string; content: string }
   | { type: "ai_error"; room_id: string; id: string; error: string }
   | { type: "set_room_prompt"; room_id: string; system_prompt: string }
+  | { type: "react"; room_id: string; message_id: string; emoji: string; on: boolean }
   | { type: "create_link_code"; request_id: string }
   | { type: "redeem_link_code"; request_id: string; code: string };
 
@@ -100,6 +108,7 @@ export type ServerMsg =
   | { type: "member_left"; room_id: string; user_id: string }
   | { type: "presence"; room_id: string; user_id: string; online: boolean }
   | { type: "room_updated"; room_id: string; system_prompt: string; updated_by: string }
+  | { type: "reactions"; room_id: string; message_id: string; reactions: Reaction[] }
   | { type: "link_code"; request_id: string; code: string; expires_in_secs: number }
   | { type: "linked"; request_id: string; user_id: string; display_name: string }
   | { type: "devices"; devices: Device[] }

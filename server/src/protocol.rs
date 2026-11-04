@@ -82,6 +82,13 @@ pub enum ClientMsg {
         room_id: String,
         system_prompt: String,
     },
+    React {
+        room_id: String,
+        message_id: String,
+        emoji: String,
+        /// true adds the reaction, false removes it.
+        on: bool,
+    },
     CreateLinkCode {
         request_id: String,
     },
@@ -175,6 +182,12 @@ pub enum ServerMsg {
         system_prompt: String,
         updated_by: String,
     },
+    /// The message's full current reaction list; clients just replace.
+    Reactions {
+        room_id: String,
+        message_id: String,
+        reactions: Vec<Reaction>,
+    },
     LinkCode {
         request_id: String,
         code: String,
@@ -244,6 +257,13 @@ pub struct Attachment {
     pub height: Option<u32>,
 }
 
+/// One emoji and everyone who used it on a message, in reaction order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reaction {
+    pub emoji: String,
+    pub user_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Message {
     pub id: String,
@@ -258,6 +278,8 @@ pub struct Message {
     pub tools: Vec<ToolActivity>,
     #[sqlx(json)]
     pub attachments: Vec<Attachment>,
+    #[sqlx(json)]
+    pub reactions: Vec<Reaction>,
     pub ai_requested: bool,
     pub anchor_id: Option<String>,
     pub model: Option<String>,
