@@ -574,11 +574,15 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     editMessage(roomId, messageId, content) {
-      relay?.send({ type: "edit_message", room_id: roomId, message_id: messageId, content });
+      if (!relay?.send({ type: "edit_message", room_id: roomId, message_id: messageId, content })) {
+        get().toast("Edit not sent: not connected to the server");
+      }
     },
 
     deleteMessage(roomId, messageId) {
-      relay?.send({ type: "delete_message", room_id: roomId, message_id: messageId });
+      if (!relay?.send({ type: "delete_message", room_id: roomId, message_id: messageId })) {
+        get().toast("Not deleted: not connected to the server");
+      }
     },
 
     regenerate(ai, profileId) {

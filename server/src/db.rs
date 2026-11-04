@@ -479,22 +479,24 @@ pub async fn edit_message(db: &Db, id: &str, content: &str) -> sqlx::Result<()> 
 }
 
 /// Soft-deletes a message: the row stays (AI anchors and replies still resolve) but
-/// the text, reasoning, tools, images and reactions are gone.
+/// the text, reasoning, tools, images and reactions are gone. One transaction, so a
+/// failed cleanup can't leave a "deleted" message whose images are still served.
 pub async fn delete_message(db: &Db, id: &str) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
     sqlx::query(
         "UPDATE messages SET content = '', reasoning = '', tools = '[]', deleted = 1 \
          WHERE id = ?",
     )
     .bind(id)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
     for sql in [
         "DELETE FROM reactions WHERE message_id = ?",
         "DELETE FROM attachments WHERE message_id = ?",
     ] {
-        sqlx::query(sql).bind(id).execute(db).await?;
+        sqlx::query(sql).bind(id).execute(&mut *tx).await?;
     }
-    Ok(())
+    tx.commit().await
 }
 
 pub struct AiResult<'a> {

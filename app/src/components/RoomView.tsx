@@ -1540,9 +1540,12 @@ export function RoomView({
   }, []);
   const clearEditing = useCallback(() => setEditing(null), []);
   const clearReply = useCallback(() => setReplyTo(null), []);
-  // The desktop view isn't remounted per room, so ignore a target from another room.
-  const editingHere = editing?.room_id === room.id ? editing : null;
-  const replyHere = replyTo?.room_id === room.id ? replyTo : null;
+  // The desktop view isn't remounted per room, so ignore a target from another room,
+  // and drop one that was deleted (from another device or by its author) meanwhile.
+  const liveEdit = useChat((s) => (editing ? s.messages[editing.room_id]?.find((m) => m.id === editing.id) : undefined));
+  const liveReply = useChat((s) => (replyTo ? s.messages[replyTo.room_id]?.find((m) => m.id === replyTo.id) : undefined));
+  const editingHere = editing?.room_id === room.id && liveEdit && !liveEdit.deleted ? editing : null;
+  const replyHere = replyTo?.room_id === room.id && liveReply && !liveReply.deleted ? liveReply : null;
 
   const remembered = client.last_profile_by_room[room.id];
   const profileId = client.profiles.some((p) => p.id === remembered) ? remembered : (client.profiles[0]?.id ?? null);

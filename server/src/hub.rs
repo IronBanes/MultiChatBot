@@ -114,9 +114,11 @@ impl Hub {
 pub struct State {
     pub db: Db,
     hub: Arc<Mutex<Hub>>,
-    /// Held across a reaction's write, re-read and broadcast, so snapshots go out in
-    /// the order they were written and a slower handler can't send a stale list last.
-    reactions_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held across a reaction, edit or delete (check, write, re-read, broadcast) and
+    /// across a room-history read and send. Sends are queued in order, so updates reach
+    /// every client in the order they were written, and a history snapshot read before
+    /// an update is always delivered before it, never after.
+    updates_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -129,7 +131,7 @@ fn err(request_id: Option<String>, message: impl Into<String>) -> ServerMsg {
 
 impl State {
     pub fn new(db: Db) -> Self {
-        Self { db, hub: Arc::new(Mutex::new(Hub::default())), reactions_lock: Default::default() }
+        Self { db, hub: Arc::new(Mutex::new(Hub::default())), updates_lock: Default::default() }
     }
 
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
@@ -300,6 +302,9 @@ impl State {
                     self.send(conn, err(None, "Not a member of that room"));
                     return Ok(());
                 }
+                // Read and send under the updates lock, so an edit, delete or reaction
+                // can't be overtaken by this older snapshot.
+                let _ordered = self.updates_lock.lock().await;
                 let mut messages = db::recent_messages(&self.db, &room_id, HISTORY_LIMIT).await?;
                 {
                     // Late joiners get the partial text of in-flight streams.
@@ -543,7 +548,7 @@ impl State {
                 }
                 // Held from the read through the broadcast: a delete takes it too, so a
                 // reaction can't land on a message while it's being deleted.
-                let _ordered = self.reactions_lock.lock().await;
+                let _ordered = self.updates_lock.lock().await;
                 let Some(message) = db::message(&self.db, &message_id).await? else {
                     self.send(conn, err(None, "That message isn't in this room"));
                     return Ok(());
@@ -586,6 +591,9 @@ impl State {
                     self.send(conn, err(None, "Not a member of that room"));
                     return Ok(());
                 }
+                // From the check through the broadcast, so an edit and a delete of the
+                // same message can't broadcast out of order.
+                let _ordered = self.updates_lock.lock().await;
                 let Some(m) = db::message(&self.db, &message_id).await? else {
                     self.send(conn, err(None, "That message isn't in this room"));
                     return Ok(());
@@ -617,6 +625,7 @@ impl State {
                     self.send(conn, err(None, "Not a member of that room"));
                     return Ok(());
                 }
+                let _ordered = self.updates_lock.lock().await;
                 let Some(m) = db::message(&self.db, &message_id).await? else {
                     self.send(conn, err(None, "That message isn't in this room"));
                     return Ok(());
@@ -642,7 +651,6 @@ impl State {
                     self.send(conn, err(None, "Stop the reply first"));
                     return Ok(());
                 }
-                let _ordered = self.reactions_lock.lock().await;
                 db::delete_message(&self.db, &message_id).await?;
                 let message = db::message(&self.db, &message_id).await?.expect("row still there");
                 self.broadcast(&room_id, ServerMsg::MessageUpdated { room_id: room_id.clone(), message });
