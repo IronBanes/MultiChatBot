@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[cfg(not(target_os = "android"))]
 const SERVICE: &str = "multichat-bot";
 
 /// Tells the Android file store where to keep secrets; does nothing elsewhere.
