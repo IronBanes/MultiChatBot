@@ -114,6 +114,9 @@ impl Hub {
 pub struct State {
     pub db: Db,
     hub: Arc<Mutex<Hub>>,
+    /// Held across a reaction's write, re-read and broadcast, so snapshots go out in
+    /// the order they were written and a slower handler can't send a stale list last.
+    reactions_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -126,7 +129,7 @@ fn err(request_id: Option<String>, message: impl Into<String>) -> ServerMsg {
 
 impl State {
     pub fn new(db: Db) -> Self {
-        Self { db, hub: Arc::new(Mutex::new(Hub::default())) }
+        Self { db, hub: Arc::new(Mutex::new(Hub::default())), reactions_lock: Default::default() }
     }
 
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
@@ -544,6 +547,7 @@ impl State {
                     self.send(conn, err(None, "Not a valid reaction"));
                     return Ok(());
                 }
+                let _ordered = self.reactions_lock.lock().await;
                 if !db::set_reaction(&self.db, &room_id, &message_id, &user_id, emoji, on, MAX_REACTION_EMOJI).await? {
                     self.send(conn, err(None, "Too many different reactions on this message"));
                     return Ok(());
