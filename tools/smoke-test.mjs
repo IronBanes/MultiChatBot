@@ -115,6 +115,22 @@ ok(human.message.author_name === "Bob" && !human.message.ai_requested, "human-on
     !bob.inbox.some((m) => m.type === "typing" && m.user_id === alice.userId),
     "a repeated typing false is not relayed",
   );
+  // A second device of Alice's account: one device stopping while the other still
+  // types doesn't end Alice's indicator; the last one stopping does.
+  const alice2 = new Client("Alice");
+  alice2.userId = alice.userId;
+  await alice2.open();
+  await alice2.wait(type("welcome"), "welcome (second device)");
+  alice2.send({ type: "typing", room_id: room.id, typing: true });
+  await bob.wait(type("typing", (m) => m.user_id === alice.userId && m.typing), "typing true (second device)");
+  alice2.send({ type: "typing", room_id: room.id, typing: false });
+  alice.send({ type: "typing", room_id: room.id, typing: false });
+  await bob.wait(type("typing", (m) => m.user_id === alice.userId && !m.typing), "typing false (last device)");
+  ok(
+    !bob.inbox.some((m) => m.type === "typing" && m.user_id === alice.userId),
+    "one device stopping while another types sends no typing false",
+  );
+  alice2.close();
   // By now Mallory's frames (sent first) have long been handled.
   ok(!mallory.inbox.some((m) => m.type === "error"), "typing from a non-member gets no error frame");
   ok(

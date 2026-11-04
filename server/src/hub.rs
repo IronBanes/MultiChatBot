@@ -298,6 +298,7 @@ impl State {
                     hub.send(*id, &ServerMsg::RoomLeft { room_id: room_id.clone() });
                     if let Some(c) = hub.conns.get_mut(id) {
                         c.rooms.remove(&room_id);
+                        c.typing_rooms.remove(&room_id);
                     }
                 }
                 hub.broadcast(
@@ -619,8 +620,18 @@ impl State {
                     }
                     c.last_typing = Some(Instant::now());
                     c.typing_rooms.insert(room_id.clone());
-                } else if !c.typing_rooms.remove(&room_id) {
-                    return Ok(());
+                } else {
+                    if !c.typing_rooms.remove(&room_id) {
+                        return Ok(());
+                    }
+                    // Others see typing per account: while another device of this user
+                    // is still typing here, this one stopping changes nothing for them.
+                    let still_typing = hub.conns.values().any(|o| {
+                        o.user_id.as_deref() == Some(user_id.as_str()) && o.typing_rooms.contains(&room_id)
+                    });
+                    if still_typing {
+                        return Ok(());
+                    }
                 }
                 hub.broadcast(
                     &room_id,

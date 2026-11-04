@@ -912,6 +912,11 @@ function MessageList({
   );
 }
 
+/** When this app last sent `typing: true`, across all rooms: the relay accepts one per
+ *  second per connection, so a Composer waits out that window instead of being dropped. */
+let lastTypingTrueAt = 0;
+const RELAY_TYPING_GAP = 1100;
+
 /** "Sam is typing…" — live relay state, subscribed on its own so typing updates never
  *  re-render the memoized message rows. Entries expire on their own, so a lost
  *  `typing: false` frame just makes the line vanish a few seconds later. */
@@ -1174,8 +1179,10 @@ function Composer({
   // room, so that also covers switching rooms). A `false` is only sent if a `true`
   // went out since the last `false`. Timers live in refs and are cleared on unmount.
   const setTyping = useChat((s) => s.setTyping);
-  /** When the last `typing: true` was sent (0 = never). */
+  /** When this Composer last sent `typing: true` (0 = never). */
   const lastTrue = useRef(0);
+  /** A `true` waiting for the relay's 1 s window to pass, so it isn't dropped there. */
+  const trueTimer = useRef<number | undefined>(undefined);
   /** True once a `true` went out and no `false` has followed. */
   const active = useRef(false);
   /** Silence timer: 5 s without a keystroke ends the indicator. */
@@ -1183,11 +1190,25 @@ function Composer({
   const stopTyping = () => {
     window.clearTimeout(idleTimer.current);
     idleTimer.current = undefined;
+    window.clearTimeout(trueTimer.current);
+    trueTimer.current = undefined;
     if (!active.current) return;
     active.current = false;
-    // Typing again starts a fresh indicator right away rather than waiting out the 3 s.
-    lastTrue.current = 0;
     setTyping(room.id, false);
+  };
+  /** Sends `true` now, or as soon as the relay's per-connection window allows. */
+  const sendTrue = () => {
+    trueTimer.current = undefined;
+    const now = Date.now();
+    const wait = lastTypingTrueAt + RELAY_TYPING_GAP - now;
+    if (wait > 0) {
+      trueTimer.current = window.setTimeout(sendTrue, wait);
+      return;
+    }
+    lastTypingTrueAt = now;
+    lastTrue.current = now;
+    active.current = true;
+    setTyping(room.id, true);
   };
   // Unmount (also covers switching rooms, since the Composer is keyed by room).
   useEffect(() => stopTyping, []);
@@ -1202,11 +1223,8 @@ function Composer({
     const now = Date.now();
     window.clearTimeout(idleTimer.current);
     idleTimer.current = window.setTimeout(stopTyping, 5000);
-    if (now - lastTrue.current >= 3000) {
-      lastTrue.current = now;
-      active.current = true;
-      setTyping(room.id, true);
-    }
+    // Start right away after a stop; otherwise refresh every 3 s.
+    if (trueTimer.current === undefined && (!active.current || now - lastTrue.current >= 3000)) sendTrue();
   };
 
   // Entering edit mode loads the message's text (setting aside what was being typed) and
