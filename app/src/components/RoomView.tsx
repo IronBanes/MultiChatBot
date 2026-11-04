@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
 import type { Attachment, McpMode, Member, Message, RoomInfo, ToolActivity } from "../lib/types";
@@ -269,9 +269,33 @@ function ReactButton({ m, align = "left" }: { m: Message; align?: "left" | "righ
   );
 }
 
-/** Phones: the long-press sheet — the palette as large buttons, plus Copy text. */
-function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
+/** The composer's editing/replying target: which message, and its text at pickup time. */
+export interface Draft {
+  mode: "edit" | "reply";
+  room_id: string;
+  id: string;
+  /** Edit: the message's current text when editing started. */
+  content: string;
+}
+
+/** Phones: the long-press sheet — the palette as large buttons, plus Copy text,
+ *  Reply, and Edit/Delete on your own messages. */
+function ReactionSheet({
+  m,
+  mine,
+  onReply,
+  onEdit,
+  onClose,
+}: {
+  m: Message;
+  /** author_id is this user (edit/delete only apply to your own messages). */
+  mine: boolean;
+  onReply: (m: Message) => void;
+  onEdit: (m: Message) => void;
+  onClose: () => void;
+}) {
   const react = useChat((s) => s.react);
+  const deleteMessage = useChat((s) => s.deleteMessage);
   const myId = useChat((s) => s.client!.user_id);
   const toast = useChat((s) => s.toast);
   const [copied, setCopied] = useState(false);
@@ -284,7 +308,14 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
       toast("Couldn't copy the text");
     }
   };
-  const mine = (emoji: string) => m.reactions.some((r) => r.emoji === emoji && r.user_ids.includes(myId));
+  const del = async () => {
+    onClose();
+    if (await confirmAction("Delete message?", "Everyone in the room will see it was deleted.", "Delete")) {
+      deleteMessage(m.room_id, m.id);
+    }
+  };
+  const mineEmoji = (emoji: string) => m.reactions.some((r) => r.emoji === emoji && r.user_ids.includes(myId));
+  const row = "flex min-h-12 w-full items-center gap-3 px-4 text-left text-[15px] active:bg-zinc-100 dark:active:bg-zinc-800";
   return (
     <div className="fixed inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={onClose}>
       <div
@@ -297,11 +328,11 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
             <button
               key={emoji}
               onClick={() => {
-                react(m.room_id, m.id, emoji, !mine(emoji));
+                react(m.room_id, m.id, emoji, !mineEmoji(emoji));
                 onClose();
               }}
               className={`mx-auto flex h-11 w-11 items-center justify-center rounded-full text-2xl leading-none transition active:bg-zinc-100 dark:active:bg-zinc-800 ${
-                mine(emoji) ? "bg-indigo-50 dark:bg-indigo-950/60" : ""
+                mineEmoji(emoji) ? "bg-indigo-50 dark:bg-indigo-950/60" : ""
               }`}
               aria-label={`React with ${emoji}`}
             >
@@ -310,12 +341,37 @@ function ReactionSheet({ m, onClose }: { m: Message; onClose: () => void }) {
           ))}
         </div>
         {m.content && (
-          <button
-            onClick={copy}
-            className="flex min-h-12 w-full items-center gap-3 px-4 text-left text-[15px] active:bg-zinc-100 dark:active:bg-zinc-800"
-          >
+          <button onClick={copy} className={row}>
             <Icon name="copy" size={18} className="text-zinc-500" />
             <span className="flex-1">{copied ? "Copied" : "Copy text"}</span>
+          </button>
+        )}
+        <button
+          onClick={() => {
+            onReply(m);
+            onClose();
+          }}
+          className={row}
+        >
+          <Icon name="reply" size={18} className="text-zinc-500" />
+          <span className="flex-1">Reply</span>
+        </button>
+        {mine && m.kind === "human" && (
+          <button
+            onClick={() => {
+              onEdit(m);
+              onClose();
+            }}
+            className={row}
+          >
+            <Icon name="pencil" size={18} className="text-zinc-500" />
+            <span className="flex-1">Edit</span>
+          </button>
+        )}
+        {mine && (
+          <button onClick={del} className={`${row} text-red-600 dark:text-red-400`}>
+            <Icon name="trash" size={18} />
+            <span className="flex-1">Delete</span>
           </button>
         )}
       </div>
@@ -368,6 +424,30 @@ function useLongPress(onLongPress: () => void) {
   };
 }
 
+/** The small "↪ name: snippet" line above a reply. Clicking it jumps to the original
+ *  and flashes it; a deleted or unloaded original says so and isn't clickable. */
+function ReplyQuote({
+  orig,
+  onJump,
+}: {
+  /** The original message, when it's loaded in the room. */
+  orig: Message | undefined;
+  onJump: (id: string) => void;
+}) {
+  if (orig?.deleted) return <div className="mb-1 max-w-full truncate px-1 text-xs text-zinc-400 dark:text-zinc-500">↪ Message deleted</div>;
+  if (!orig)
+    return <div className="mb-1 max-w-full truncate px-1 text-xs text-zinc-400 dark:text-zinc-500">↪ Earlier message</div>;
+  return (
+    <button
+      onClick={() => onJump(orig.id)}
+      className="mb-1 max-w-full truncate px-1 text-left text-xs text-zinc-500 hover:text-zinc-800 dark:text-zinc-400 dark:hover:text-zinc-200"
+      title="Jump to the message"
+    >
+      ↪ <span style={{ color: memberColor(orig.author_id) }}>{orig.author_name}</span>: {snippet(orig.content, 80)}
+    </button>
+  );
+}
+
 const MessageItem = memo(function MessageItem({
   m,
   anchor,
@@ -377,9 +457,15 @@ const MessageItem = memo(function MessageItem({
   mine,
   bubbles,
   members,
+  onEdit,
+  onReply,
+  onJump,
+  replyOriginal,
 }: {
   m: Message;
   anchor: Message | undefined;
+  /** The message `reply_to` points at, when it's loaded (stable ref from MessageList). */
+  replyOriginal: Message | undefined;
   showAnchor: boolean;
   compact: boolean;
   myProfileId: string | null;
@@ -388,9 +474,16 @@ const MessageItem = memo(function MessageItem({
   bubbles: boolean;
   /** Room members, to name who reacted (stable reference from MessageList). */
   members: Member[];
+  /** Start editing this message in the composer (own human messages). */
+  onEdit: (m: Message) => void;
+  /** Start a reply to this message in the composer (any message). */
+  onReply: (m: Message) => void;
+  /** Scroll a reply's quote to the message it answers. */
+  onJump: (id: string) => void;
 }) {
   const regenerate = useChat((s) => s.regenerate);
   const stopAi = useChat((s) => s.stopAi);
+  const deleteMessage = useChat((s) => s.deleteMessage);
   const answerToolCall = useChat((s) => s.answerToolCall);
   const generating = useChat((s) => !!s.myGenerations[m.id]);
   const localTools = useChat((s) => s.localTools[m.id]);
@@ -398,9 +491,33 @@ const MessageItem = memo(function MessageItem({
   const [sheet, setSheet] = useState(false);
   const longPress = useLongPress(() => setSheet(true));
 
+  const del = async () => {
+    if (await confirmAction("Delete message?", "Everyone in the room will see it was deleted.", "Delete")) {
+      deleteMessage(m.room_id, m.id);
+    }
+  };
+
+  if (m.deleted) {
+    return (
+      <div
+        data-message-id={m.id}
+        className={`flex gap-2 px-3 ${compact ? "pt-0.5" : "pt-3"} ${m.kind === "human" && bubbles && mine ? "justify-end" : ""}`}
+      >
+        {m.kind === "ai" && bubbles && (
+          <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white">
+            <Icon name="sparkle" size={14} />
+          </div>
+        )}
+        <div className="max-w-[80%] px-1 py-0.5 text-[14px] leading-snug text-zinc-400 italic dark:text-zinc-500">
+          Message deleted
+        </div>
+      </div>
+    );
+  }
+
   if (m.kind === "human" && bubbles) {
     return (
-      <div className={`flex gap-2 px-3 ${mine ? "justify-end" : ""} ${compact ? "pt-0.5" : "pt-3"}`}>
+      <div data-message-id={m.id} className={`flex gap-2 px-3 ${mine ? "justify-end" : ""} ${compact ? "pt-0.5" : "pt-3"}`}>
         {!mine && <div className="w-7 shrink-0">{!compact && <Avatar userId={m.author_id} name={m.author_name} size={28} />}</div>}
         <div className={`flex min-w-0 max-w-[80%] flex-col ${mine ? "items-end" : "items-start"}`}>
           {!compact && (
@@ -413,6 +530,7 @@ const MessageItem = memo(function MessageItem({
               <span className="shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
             </div>
           )}
+          {m.reply_to && <ReplyQuote orig={replyOriginal} onJump={onJump} />}
           <div
             {...longPress.handlers}
             className={`rounded-[20px] px-3.5 py-2 text-[16px] leading-snug break-words ${
@@ -426,17 +544,23 @@ const MessageItem = memo(function MessageItem({
             <Markdown text={m.content} />
           </div>
           <ReactionChips m={m} members={members} />
-          {/* Only on your own: on everyone else's it would repeat under every message. */}
-          {mine && !m.ai_requested && <span className="mt-0.5 px-1 text-[11px] text-zinc-400">no AI reply</span>}
+          {/* "no AI reply" only on your own: on everyone else's it would repeat under every message. */}
+          {(m.edited_at || (mine && !m.ai_requested)) && (
+            <span className="mt-0.5 px-1 text-[11px] text-zinc-400">
+              {[m.edited_at && "edited", mine && !m.ai_requested && "no AI reply"].filter(Boolean).join(" · ")}
+            </span>
+          )}
         </div>
-        {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
+        {sheet && (
+          <ReactionSheet m={m} mine={mine} onReply={onReply} onEdit={onEdit} onClose={() => setSheet(false)} />
+        )}
       </div>
     );
   }
 
   if (m.kind === "human") {
     return (
-      <div className={`group relative flex gap-3 px-4 sm:px-5 ${compact ? "pt-0.5" : "pt-3"}`}>
+      <div data-message-id={m.id} className={`group relative flex gap-3 px-4 sm:px-5 ${compact ? "pt-0.5" : "pt-3"}`}>
         <div className="w-8 shrink-0">{!compact && <Avatar userId={m.author_id} name={m.author_name} />}</div>
         <div className="min-w-0 flex-1">
           {!compact && (
@@ -447,6 +571,7 @@ const MessageItem = memo(function MessageItem({
               <span className="shrink-0 text-[11px] text-zinc-400">{time(m.created_at)}</span>
             </div>
           )}
+          {m.reply_to && <ReplyQuote orig={replyOriginal} onJump={onJump} />}
           <div
             {...longPress.handlers}
             className={`text-[15px] leading-relaxed break-words text-zinc-800 dark:text-zinc-200 ${
@@ -456,14 +581,33 @@ const MessageItem = memo(function MessageItem({
             <Markdown text={m.content} />
           </div>
           <ReactionChips m={m} members={members} />
-          {!m.ai_requested && <span className="mt-0.5 inline-block text-[11px] text-zinc-400">humans only · no AI reply</span>}
+          {(m.edited_at || !m.ai_requested) && (
+            <span className="mt-0.5 inline-block text-[11px] text-zinc-400">
+              {[m.edited_at && "(edited)", !m.ai_requested && "humans only · no AI reply"].filter(Boolean).join(" · ")}
+            </span>
+          )}
         </div>
         {/* Floats over the message's top edge on hover, so it adds no height to the chat.
             Touch screens long-press instead. */}
         <div className="pointer-events-none absolute -top-3 right-4 flex rounded-md border border-zinc-200 bg-white p-0.5 text-xs text-zinc-500 opacity-0 shadow-sm transition group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100 sm:right-5 dark:border-zinc-700 dark:bg-zinc-900 [@media(hover:none)]:!hidden">
           <ReactButton m={m} align="right" />
+          <button onClick={() => onReply(m)} className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+            <Icon name="reply" size={12} /> Reply
+          </button>
+          {mine && (
+            <>
+              <button onClick={() => onEdit(m)} className="flex items-center gap-1 rounded px-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                <Icon name="pencil" size={12} /> Edit
+              </button>
+              <button onClick={del} className="flex items-center gap-1 rounded px-1.5 text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/50">
+                <Icon name="trash" size={12} /> Delete
+              </button>
+            </>
+          )}
         </div>
-        {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
+        {sheet && (
+          <ReactionSheet m={m} mine={mine} onReply={onReply} onEdit={onEdit} onClose={() => setSheet(false)} />
+        )}
       </div>
     );
   }
@@ -532,7 +676,17 @@ const MessageItem = memo(function MessageItem({
         </button>
       )}
       {!bubbles && <ReactButton m={m} />}
-      {!streaming && myProfileId && anchor && (
+      {!bubbles && !streaming && (
+        <button onClick={() => onReply(m)} className={actionCls}>
+          <Icon name="reply" size={12} /> Reply
+        </button>
+      )}
+      {mine && !streaming && (
+        <button onClick={del} className={actionCls}>
+          <Icon name="trash" size={12} /> Delete
+        </button>
+      )}
+      {!streaming && myProfileId && anchor && !anchor.deleted && (
         <button onClick={() => regenerate(m, myProfileId)} className={actionCls}>
           <Icon name="refresh" size={12} /> {bubbles ? "Regenerate" : "Regenerate with my profile"}
         </button>
@@ -542,7 +696,7 @@ const MessageItem = memo(function MessageItem({
 
   if (bubbles) {
     return (
-      <div className="flex gap-2 px-3 pt-3">
+      <div data-message-id={m.id} className="flex gap-2 px-3 pt-3">
         <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white">
           <Icon name="sparkle" size={14} />
         </div>
@@ -557,9 +711,11 @@ const MessageItem = memo(function MessageItem({
           </div>
           {showAnchor && anchor && (
             <div className="mb-1 max-w-full truncate px-1 text-xs text-zinc-500">
-              ↪ <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>: “{snippet(anchor.content, 50)}”
+              ↪ <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>:{" "}
+              {anchor.deleted ? <i>message deleted</i> : `“${snippet(anchor.content, 50)}”`}
             </div>
           )}
+          {m.reply_to && <ReplyQuote orig={replyOriginal} onJump={onJump} />}
           <div
             {...longPress.handlers}
             className={`max-w-full rounded-[20px] rounded-bl-md bg-indigo-50 px-3.5 py-2 text-[16px] leading-snug break-words text-zinc-900 dark:bg-indigo-950/60 dark:text-zinc-100 ${
@@ -570,14 +726,16 @@ const MessageItem = memo(function MessageItem({
           </div>
           <ReactionChips m={m} members={members} />
           <div className="mt-0.5 flex flex-wrap text-xs text-zinc-500">{actions}</div>
-          {sheet && <ReactionSheet m={m} onClose={() => setSheet(false)} />}
+          {sheet && (
+            <ReactionSheet m={m} mine={mine && !streaming} onReply={onReply} onEdit={onEdit} onClose={() => setSheet(false)} />
+          )}
         </div>
       </div>
     );
   }
 
   return (
-    <div className="group flex gap-3 px-4 pt-3 sm:px-5">
+    <div data-message-id={m.id} className="group flex gap-3 px-4 pt-3 sm:px-5">
       <div
         className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-indigo-500 to-fuchsia-500 text-white ring-2 ring-offset-2 ring-offset-white dark:ring-offset-zinc-950"
         style={{ ["--tw-ring-color" as string]: memberColor(m.author_id) }}
@@ -604,7 +762,13 @@ const MessageItem = memo(function MessageItem({
         </div>
         {showAnchor && anchor && (
           <div className="mt-0.5 truncate text-xs text-zinc-500">
-            ↪ answering <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>: “{snippet(anchor.content)}”
+            ↪ answering <span style={{ color: memberColor(anchor.author_id) }}>{anchor.author_name}</span>:{" "}
+            {anchor.deleted ? <i>message deleted</i> : `“${snippet(anchor.content)}”`}
+          </div>
+        )}
+        {m.reply_to && (
+          <div className="mt-0.5">
+            <ReplyQuote orig={replyOriginal} onJump={onJump} />
           </div>
         )}
         <div className="mt-1 rounded-xl rounded-tl-sm border border-zinc-200 bg-white px-3.5 py-2.5 text-[15px] leading-relaxed break-words shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
@@ -619,7 +783,19 @@ const MessageItem = memo(function MessageItem({
   );
 });
 
-function MessageList({ room, myProfileId, bubbles }: { room: RoomInfo; myProfileId: string | null; bubbles: boolean }) {
+function MessageList({
+  room,
+  myProfileId,
+  bubbles,
+  onEdit,
+  onReply,
+}: {
+  room: RoomInfo;
+  myProfileId: string | null;
+  bubbles: boolean;
+  onEdit: (m: Message) => void;
+  onReply: (m: Message) => void;
+}) {
   const messages = useChat((s) => s.messages[room.id]);
   const loaded = useChat((s) => !!s.loaded[room.id]);
   const myId = useChat((s) => s.client!.user_id);
@@ -674,6 +850,22 @@ function MessageList({ room, myProfileId, bubbles }: { room: RoomInfo; myProfile
     stick.current = fromBottom.current < 80;
   };
 
+  /** Scrolls a reply's quote to its original and flashes it. */
+  const onJump = useCallback((id: string) => {
+    const root = ref.current;
+    const el = root?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
+    if (!el) return;
+    // Jumping away from the bottom must not snap back on the next scroll effect.
+    stick.current = false;
+    fromBottom.current = root ? root.scrollHeight - root.scrollTop - root.clientHeight : 0;
+    el.scrollIntoView({ block: "center", behavior: "smooth" });
+    el.classList.remove("flash-highlight");
+    // Restart the animation if it's still running from an earlier jump.
+    void el.offsetWidth;
+    el.classList.add("flash-highlight");
+    window.setTimeout(() => el.classList.remove("flash-highlight"), 1500);
+  }, []);
+
   const list = messages ?? [];
   return (
     <div ref={ref} onScroll={onScroll} className={`min-h-0 flex-1 overflow-y-auto ${bubbles ? "overscroll-contain pb-2" : "pb-4"}`}>
@@ -701,12 +893,16 @@ function MessageList({ room, myProfileId, bubbles }: { room: RoomInfo; myProfile
               key={m.id}
               m={m}
               anchor={anchor}
+              replyOriginal={m.reply_to ? byId.get(m.reply_to) : undefined}
               showAnchor={!!anchor && prev?.id !== anchor.id}
               compact={compact}
               myProfileId={myProfileId}
               mine={m.author_id === myId}
               bubbles={bubbles}
               members={members}
+              onEdit={onEdit}
+              onReply={onReply}
+              onJump={onJump}
             />
           );
         })}
@@ -885,17 +1081,28 @@ function Composer({
   profileId,
   onOpenSettings,
   phone,
+  editing,
+  replyTo,
+  onClearEditing,
+  onClearReply,
 }: {
   room: RoomInfo;
   profileId: string | null;
   onOpenSettings: (tab: SettingsTab) => void;
   /** Phone layout: a pill message box with the options in a sheet. */
   phone: boolean;
+  /** Set while the box is editing one of this user's own messages. */
+  editing: Draft | null;
+  /** Set while the box is writing a reply to this message. */
+  replyTo: Message | null;
+  onClearEditing: () => void;
+  onClearReply: () => void;
 }) {
   const profiles = useChat((s) => s.client!.profiles);
   const platform = useChat((s) => s.client!.platform);
   const status = useChat((s) => s.status);
   const sendMessage = useChat((s) => s.sendMessage);
+  const editMessage = useChat((s) => s.editMessage);
   const chooseProfile = useChat((s) => s.chooseProfile);
   const [text, setText] = useState("");
   const [aiOn, setAiOn] = useState(true);
@@ -903,12 +1110,53 @@ function Composer({
   const servers = useChat((s) => s.client!.mcp_servers);
   const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
   const ta = useRef<HTMLTextAreaElement>(null);
-  const ai = aiOn && !!profileId;
+  // While editing, the AI-reply option doesn't apply: the edit goes out as-is.
+  const ai = !editing && aiOn && !!profileId;
+
+  // Entering edit mode loads the message's text (setting aside what was being typed) and
+  // focuses the box; leaving it, by saving or cancelling, brings that draft back. If edit
+  // mode ends some other way (the message was deleted, or Reply was picked) with unsaved
+  // changes, those stay in the box, ahead of the earlier draft.
+  const toast = useChat((s) => s.toast);
+  const draftBeforeEdit = useRef<string | null>(null);
+  const lastEdit = useRef<Draft | null>(null);
+  const textNow = useRef(text);
+  textNow.current = text;
+  const leaving = useRef(false);
+  const leaveEdit = () => {
+    leaving.current = true;
+    onClearEditing();
+  };
+  useEffect(() => {
+    if (editing) {
+      lastEdit.current = editing;
+      setText((t) => {
+        if (draftBeforeEdit.current === null) draftBeforeEdit.current = t;
+        return editing.content;
+      });
+      ta.current?.focus();
+    } else if (draftBeforeEdit.current !== null) {
+      const before = draftBeforeEdit.current;
+      const original = lastEdit.current?.content;
+      const t = textNow.current;
+      if (leaving.current || t === original) {
+        setText(before);
+      } else {
+        setText(before.trim() ? `${t}
+
+${before}` : t);
+        toast("Edit not saved. Your changes are still in the box.");
+      }
+      draftBeforeEdit.current = null;
+      lastEdit.current = null;
+      leaving.current = false;
+    }
+  }, [editing, toast]);
 
   // On phones, focusing would pop the keyboard up as soon as a room opens.
   useEffect(() => {
-    if (!phone) ta.current?.focus();
-  }, [room.id, phone]);
+    if (!phone && !editing) ta.current?.focus();
+  }, [room.id, phone, editing]);
 
   useLayoutEffect(() => {
     const el = ta.current;
@@ -920,24 +1168,80 @@ function Composer({
   const sending = useRef(false);
   const send = async () => {
     if (!text.trim() || status !== "online" || sending.current) return;
+    if (editing) {
+      if (text === editing.content) return leaveEdit();
+      sending.current = true;
+      try {
+        // Stay in edit mode (keeping the text) if the edit couldn't be sent.
+        if (await editMessage(room.id, editing.id, text)) leaveEdit();
+      } finally {
+        sending.current = false;
+      }
+      return;
+    }
     const sent = text;
+    const reply = replyTo?.id ?? null;
     sending.current = true;
     try {
       // Only clear the box once the message really went out. Text typed after the sent
       // part is kept; if the sent part itself was edited meanwhile, keep everything.
-      if (await sendMessage(room.id, sent, ai, ai ? profileId : null)) {
+      if (await sendMessage(room.id, sent, ai, ai ? profileId : null, reply)) {
         setText((t) => (t.startsWith(sent) ? t.slice(sent.length).trimStart() : t));
+        if (reply) onClearReply();
       }
     } finally {
       sending.current = false;
     }
   };
 
+  // Escape cancels an edit or a reply-in-progress from the box itself.
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key !== "Escape") return;
+    if (editing) {
+      e.preventDefault();
+      leaveEdit();
+    } else if (replyTo) {
+      e.preventDefault();
+      onClearReply();
+    }
+  };
+
+  // The "Editing message ✕" / "Replying to … ✕" bar above the box. Only one of the
+  // two can be active at a time; starting one clears the other in RoomView.
+  const contextBar = editing ? (
+    <div className="mb-1 flex items-center gap-2 px-1 text-xs text-zinc-600 dark:text-zinc-300">
+      <Icon name="pencil" size={13} className="shrink-0 text-indigo-600 dark:text-indigo-400" />
+      <span className="min-w-0 flex-1 truncate font-medium">Editing message</span>
+      <button
+        onClick={leaveEdit}
+        className="shrink-0 rounded-full p-1 text-zinc-400 active:bg-zinc-100 dark:active:bg-zinc-800"
+        aria-label="Cancel editing"
+      >
+        <Icon name="x" size={13} />
+      </button>
+    </div>
+  ) : replyTo ? (
+    <div className="mb-1 flex items-center gap-2 px-1 text-xs text-zinc-600 dark:text-zinc-300">
+      <Icon name="reply" size={13} className="shrink-0 text-indigo-600 dark:text-indigo-400" />
+      <span className="min-w-0 flex-1 truncate">
+        Replying to <span className="font-medium">{replyTo.author_name}</span>: {snippet(replyTo.content, 60)}
+      </span>
+      <button
+        onClick={onClearReply}
+        className="shrink-0 rounded-full p-1 text-zinc-400 active:bg-zinc-100 dark:active:bg-zinc-800"
+        aria-label="Cancel reply"
+      >
+        <Icon name="x" size={13} />
+      </button>
+    </div>
+  ) : null;
+
   if (phone) {
     const profile = profiles.find((p) => p.id === profileId);
     const toolsOn = servers.filter((s) => (modes?.[s.id] ?? s.default_mode) !== "off").length;
     return (
       <div className="safe-bottom border-t border-zinc-200 px-2 pt-1.5 pb-[max(0.5rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
+        {contextBar}
         <button
           onClick={() => (profiles.length ? setSheet(true) : onOpenSettings("profiles"))}
           className="mb-1 flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-xs text-zinc-500 active:bg-zinc-100 dark:active:bg-zinc-800"
@@ -962,16 +1266,17 @@ function Composer({
             rows={1}
             value={text}
             onChange={(e) => setText(e.target.value)}
-            placeholder={ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
+            onKeyDown={onKeyDown}
+            placeholder={editing ? "Edit your message" : ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
             className="block min-h-10 min-w-0 flex-1 resize-none rounded-[20px] border border-zinc-300 bg-white px-4 py-2 text-[16px] leading-snug outline-none placeholder:text-zinc-400 focus:border-indigo-500 dark:border-zinc-700 dark:bg-zinc-900"
           />
           <button
             onClick={send}
             disabled={!text.trim() || status !== "online"}
             className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-white transition active:bg-indigo-500 disabled:bg-zinc-200 disabled:text-zinc-400 dark:disabled:bg-zinc-800 dark:disabled:text-zinc-600"
-            aria-label="Send"
+            aria-label={editing ? "Save edit" : "Send"}
           >
-            <Icon name="send" size={18} className="-rotate-90" />
+            <Icon name={editing ? "check" : "send"} size={18} className={editing ? "" : "-rotate-90"} />
           </button>
         </div>
         {sheet && (
@@ -991,6 +1296,7 @@ function Composer({
   return (
     <div className="border-t border-zinc-200 px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-4 sm:pb-[max(1rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
       <div className="mx-auto max-w-4xl rounded-2xl border border-zinc-300 bg-white shadow-sm transition focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-500/20 dark:border-zinc-700 dark:bg-zinc-900">
+        {contextBar && <div className="px-4 pt-2.5">{contextBar}</div>}
         <textarea
           ref={ta}
           rows={1}
@@ -1000,9 +1306,11 @@ function Composer({
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
               send();
+            } else {
+              onKeyDown(e);
             }
           }}
-          placeholder={ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
+          placeholder={editing ? "Edit your message — Enter to save, Esc to cancel" : ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
           className="block w-full resize-none bg-transparent px-4 pt-3 pb-1 text-[15px] outline-none placeholder:text-zinc-400"
         />
         <div className="flex items-center gap-1.5 px-2 pb-2 sm:gap-2">
@@ -1046,9 +1354,9 @@ function Composer({
             onClick={send}
             disabled={!text.trim() || status !== "online"}
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-600 text-white transition hover:bg-indigo-500 disabled:bg-zinc-300 dark:disabled:bg-zinc-700"
-            aria-label="Send"
+            aria-label={editing ? "Save edit" : "Send"}
           >
-            <Icon name="send" size={16} />
+            <Icon name={editing ? "check" : "send"} size={16} />
           </button>
         </div>
       </div>
@@ -1244,7 +1552,30 @@ export function RoomView({
   const [promptOpen, setPromptOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  /** Editing/replying target for the composer, shared with the message list. */
+  const [editing, setEditing] = useState<Draft | null>(null);
+  const [replyTo, setReplyTo] = useState<Message | null>(null);
   const swipe = useSwipeBack(onBack);
+
+  // Starting one clears the other: the composer bar shows only one at a time. Stable
+  // callbacks keep the memoized message rows from re-rendering.
+  const startEdit = useCallback((m: Message) => {
+    setReplyTo(null);
+    setEditing({ mode: "edit", room_id: m.room_id, id: m.id, content: m.content });
+  }, []);
+  const startReply = useCallback((m: Message) => {
+    if (m.deleted) return;
+    setEditing(null);
+    setReplyTo(m);
+  }, []);
+  const clearEditing = useCallback(() => setEditing(null), []);
+  const clearReply = useCallback(() => setReplyTo(null), []);
+  // The desktop view isn't remounted per room, so ignore a target from another room,
+  // and drop one that was deleted (from another device or by its author) meanwhile.
+  const liveEdit = useChat((s) => (editing ? s.messages[editing.room_id]?.find((m) => m.id === editing.id) : undefined));
+  const liveReply = useChat((s) => (replyTo ? s.messages[replyTo.room_id]?.find((m) => m.id === replyTo.id) : undefined));
+  const editingHere = editing?.room_id === room.id && liveEdit && !liveEdit.deleted ? editing : null;
+  const replyHere = replyTo?.room_id === room.id && liveReply && !liveReply.deleted ? liveReply : null;
 
   const remembered = client.last_profile_by_room[room.id];
   const profileId = client.profiles.some((p) => p.id === remembered) ? remembered : (client.profiles[0]?.id ?? null);
@@ -1332,10 +1663,21 @@ export function RoomView({
     >
       <div className="flex min-w-0 flex-1 flex-col">
         {header}
-        <MessageList room={room} myProfileId={profileId} bubbles={phone} />
+        <MessageList room={room} myProfileId={profileId} bubbles={phone} onEdit={startEdit} onReply={startReply} />
         {/* Keyed by room: each room gets a fresh draft, and a send that finishes after
-            switching rooms can't edit the new room's text. */}
-        <Composer key={room.id} room={room} profileId={profileId} onOpenSettings={onOpenSettings} phone={phone} />
+            switching rooms can't edit the new room's text. The editing/replying state
+            lives here so both the list and the composer reach it. */}
+        <Composer
+          key={room.id}
+          room={room}
+          profileId={profileId}
+          onOpenSettings={onOpenSettings}
+          phone={phone}
+          editing={editingHere}
+          replyTo={replyHere}
+          onClearEditing={clearEditing}
+          onClearReply={clearReply}
+        />
       </div>
       {inlineMembers && membersPref && <MemberList room={room} overlay={false} onClose={() => setMembersPref(false)} />}
       {!inlineMembers && membersOverlay && <MemberList room={room} overlay onClose={() => setMembersOverlay(false)} />}

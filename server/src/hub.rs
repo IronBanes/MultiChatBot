@@ -114,9 +114,11 @@ impl Hub {
 pub struct State {
     pub db: Db,
     hub: Arc<Mutex<Hub>>,
-    /// Held across a reaction's write, re-read and broadcast, so snapshots go out in
-    /// the order they were written and a slower handler can't send a stale list last.
-    reactions_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held across a reaction, edit or delete (check, write, re-read, broadcast) and
+    /// across a room-history read and send. Sends are queued in order, so updates reach
+    /// every client in the order they were written, and a history snapshot read before
+    /// an update is always delivered before it, never after.
+    updates_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -129,7 +131,7 @@ fn err(request_id: Option<String>, message: impl Into<String>) -> ServerMsg {
 
 impl State {
     pub fn new(db: Db) -> Self {
-        Self { db, hub: Arc::new(Mutex::new(Hub::default())), reactions_lock: Default::default() }
+        Self { db, hub: Arc::new(Mutex::new(Hub::default())), updates_lock: Default::default() }
     }
 
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
@@ -300,6 +302,9 @@ impl State {
                     self.send(conn, err(None, "Not a member of that room"));
                     return Ok(());
                 }
+                // Read and send under the updates lock, so an edit, delete or reaction
+                // can't be overtaken by this older snapshot.
+                let _ordered = self.updates_lock.lock().await;
                 let mut messages = db::recent_messages(&self.db, &room_id, HISTORY_LIMIT).await?;
                 {
                     // Late joiners get the partial text of in-flight streams.
@@ -315,7 +320,7 @@ impl State {
                 self.send(conn, ServerMsg::RoomHistory { room_id, messages });
             }
 
-            ClientMsg::SendMessage { room_id, id, content, ai_requested } => {
+            ClientMsg::SendMessage { room_id, id, content, ai_requested, reply_to } => {
                 if !self.in_room(conn, &room_id) {
                     self.send(conn, err(None, "Not a member of that room"));
                     return Ok(());
@@ -327,6 +332,16 @@ impl State {
                 if content.trim().is_empty() || content.len() > MAX_CONTENT {
                     self.send(conn, err(None, "Message is empty or too long"));
                     return Ok(());
+                }
+                // From the reply check through the broadcast: a delete can't slip in
+                // between, so clients never get the deletion before the message itself.
+                let _ordered = self.updates_lock.lock().await;
+                if let Some(reply_to) = reply_to.as_deref() {
+                    let target = db::message(&self.db, reply_to).await?;
+                    if !target.is_some_and(|t| t.room_id == room_id && !t.deleted) {
+                        self.send(conn, err(None, "Can't reply to that message"));
+                        return Ok(());
+                    }
                 }
                 let res = db::insert_message(
                     &self.db,
@@ -340,6 +355,7 @@ impl State {
                         ai_requested,
                         anchor_id: None,
                         model: None,
+                        reply_to: reply_to.as_deref(),
                         status: "complete",
                     },
                 )
@@ -376,6 +392,7 @@ impl State {
                         ai_requested: false,
                         anchor_id: Some(&anchor_id),
                         model: Some(&model),
+                        reply_to: None,
                         status: "streaming",
                     },
                 )
@@ -489,6 +506,9 @@ impl State {
             }
 
             ClientMsg::AiComplete { room_id, id, content } => {
+                // Ordered with deletes: the finished row can't be deleted and announced
+                // before this completion goes out.
+                let _ordered = self.updates_lock.lock().await;
                 let Some(stream) = self.take_stream(conn, &room_id, &id) else { return Ok(()) };
                 let content: String = content.chars().take(MAX_CONTENT).collect();
                 let result = AiResult {
@@ -503,6 +523,7 @@ impl State {
             }
 
             ClientMsg::AiError { room_id, id, error } => {
+                let _ordered = self.updates_lock.lock().await;
                 let Some(stream) = self.take_stream(conn, &room_id, &id) else { return Ok(()) };
                 let error = clip(&error, MAX_ERROR);
                 let result = AiResult {
@@ -532,12 +553,19 @@ impl State {
                 if !self.in_room(conn, &room_id) {
                     return Ok(());
                 }
+                // Held from the read through the broadcast: a delete takes it too, so a
+                // reaction can't land on a message while it's being deleted.
+                let _ordered = self.updates_lock.lock().await;
                 let Some(message) = db::message(&self.db, &message_id).await? else {
                     self.send(conn, err(None, "That message isn't in this room"));
                     return Ok(());
                 };
                 if message.room_id != room_id {
                     self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                }
+                if message.deleted {
+                    self.send(conn, err(None, "That message was deleted"));
                     return Ok(());
                 }
                 let emoji = emoji.trim();
@@ -547,7 +575,6 @@ impl State {
                     self.send(conn, err(None, "Not a valid reaction"));
                     return Ok(());
                 }
-                let _ordered = self.reactions_lock.lock().await;
                 match db::set_reaction(&self.db, &room_id, &message_id, &user_id, emoji, on, MAX_REACTION_EMOJI).await? {
                     Ok(()) => {}
                     Err(db::ReactionRefused::TooMany) => {
@@ -564,6 +591,76 @@ impl State {
                     &room_id,
                     ServerMsg::Reactions { room_id: room_id.clone(), message_id, reactions },
                 );
+            }
+
+            ClientMsg::EditMessage { room_id, message_id, content } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(None, "Not a member of that room"));
+                    return Ok(());
+                }
+                // From the check through the broadcast, so an edit and a delete of the
+                // same message can't broadcast out of order.
+                let _ordered = self.updates_lock.lock().await;
+                let Some(m) = db::message(&self.db, &message_id).await? else {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                };
+                if m.room_id != room_id {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                }
+                if m.deleted {
+                    self.send(conn, err(None, "That message was deleted"));
+                    return Ok(());
+                }
+                // Human messages only: AI replies belong to whoever ran the model.
+                if m.kind != "human" || m.author_id != user_id {
+                    self.send(conn, err(None, "You can only edit your own messages"));
+                    return Ok(());
+                }
+                if content.trim().is_empty() || content.len() > MAX_CONTENT {
+                    self.send(conn, err(None, "Message is empty or too long"));
+                    return Ok(());
+                }
+                db::edit_message(&self.db, &message_id, &content).await?;
+                let message = db::message(&self.db, &message_id).await?.expect("row still there");
+                self.broadcast(&room_id, ServerMsg::MessageUpdated { room_id: room_id.clone(), message });
+            }
+
+            ClientMsg::DeleteMessage { room_id, message_id } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(None, "Not a member of that room"));
+                    return Ok(());
+                }
+                let _ordered = self.updates_lock.lock().await;
+                let Some(m) = db::message(&self.db, &message_id).await? else {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                };
+                if m.room_id != room_id {
+                    self.send(conn, err(None, "That message isn't in this room"));
+                    return Ok(());
+                }
+                if m.deleted {
+                    self.send(conn, err(None, "That message was deleted"));
+                    return Ok(());
+                }
+                // Both human messages and AI replies count as the author's own: an AI
+                // reply's author_id is the member whose profile generated it.
+                if m.author_id != user_id {
+                    self.send(conn, err(None, "You can only delete your own messages"));
+                    return Ok(());
+                }
+                // A streaming reply is still being written; deleting it mid-stream would
+                // race the finish that follows. (Rows left "streaming" by a crash are
+                // marked interrupted at startup.)
+                if m.status == "streaming" || self.hub().streams.contains_key(&message_id) {
+                    self.send(conn, err(None, "Stop the reply first"));
+                    return Ok(());
+                }
+                db::delete_message(&self.db, &message_id).await?;
+                let message = db::message(&self.db, &message_id).await?.expect("row still there");
+                self.broadcast(&room_id, ServerMsg::MessageUpdated { room_id: room_id.clone(), message });
             }
 
             ClientMsg::CreateLinkCode { request_id } => {
@@ -735,6 +832,8 @@ impl State {
         };
 
         for (id, s) in orphaned {
+            // Like AiComplete: a delete can't be announced between the write and this.
+            let _ordered = self.updates_lock.lock().await;
             if let Err(e) = db::finish_ai(
                 &self.db,
                 &id,
