@@ -35,6 +35,9 @@ pub enum ClientMsg {
         id: String,
         content: String,
         ai_requested: bool,
+        /// Message this one replies to, when sending a reply.
+        #[serde(default)]
+        reply_to: Option<String>,
     },
     AiStart {
         room_id: String,
@@ -297,6 +300,7 @@ pub struct Message {
     pub ai_requested: bool,
     pub anchor_id: Option<String>,
     pub model: Option<String>,
+    pub reply_to: Option<String>,
     pub status: String,
     pub error: Option<String>,
     pub created_at: i64,

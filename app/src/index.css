@@ -145,6 +145,20 @@ html[data-keyboard] .safe-bottom {
   }
 }
 
+/* Briefly flashes a message row when a reply quote jumps to it. */
+@keyframes flash-highlight {
+  0% {
+    background-color: color-mix(in srgb, var(--color-indigo-200) 70%, transparent);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+
+.flash-highlight {
+  animation: flash-highlight 1.4s ease-out;
+}
+
 html {
   /* Keep iOS from inflating text sizes when the phone rotates. */
   -webkit-text-size-adjust: 100%;

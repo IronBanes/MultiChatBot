@@ -34,8 +34,11 @@ messages (seq INTEGER PK AUTOINCREMENT,      -- global ordering
           ai_requested INTEGER,              -- human: did it ask for an AI reply
           anchor_id TEXT,                    -- ai: triggering human message id
           model TEXT,                        -- ai: model name (never base URL / key)
+          reply_to TEXT,                     -- human: message id this one replies to
           status TEXT,                       -- 'complete'|'streaming'|'error'|'interrupted'
-          error TEXT, created_at INTEGER)
+          error TEXT, created_at INTEGER,
+          edited_at INTEGER,                 -- set when the text was edited
+          deleted INTEGER DEFAULT 0)         -- soft delete: content blanked, row kept
 attachments (id TEXT PK, message_id TEXT, room_id TEXT, mime TEXT,
              call_id TEXT, width INTEGER, height INTEGER,
              data TEXT,                      -- base64 image
@@ -82,7 +85,7 @@ all rooms. The first client frame must be `hello`.
 | `join_room` | `request_id, invite_code` | → `room_joined` |
 | `leave_room` | `room_id` | |
 | `open_room` | `room_id` | → `room_history` |
-| `send_message` | `room_id, id, content, ai_requested` | human message |
+| `send_message` | `room_id, id, content, ai_requested, reply_to?` | human message; `reply_to` must be a non-deleted message in the room |
 | `ai_start` | `room_id, id, anchor_id, model` | anchor = human msg in room |
 | `ai_delta` | `room_id, id, delta` | only from the stream's owner connection |
 | `ai_reasoning` | `room_id, id, delta` | reasoning text, same rules as `ai_delta` |
@@ -93,6 +96,8 @@ all rooms. The first client frame must be `hello`.
 | `ai_error` | `room_id, id, error` | short, sanitized reason |
 | `set_room_prompt` | `room_id, system_prompt` | any member |
 | `react` | `room_id, message_id, emoji, on` | add (`on` true) or remove a reaction; any member, any message; ≤ 20 distinct emoji per message |
+| `edit_message` | `room_id, message_id, content` | edit your own human message; same empty/length rule as `send_message` → `message_updated` |
+| `delete_message` | `room_id, message_id` | soft-delete your own message (human, or an AI reply you generated; not while streaming) → `message_updated` |
 | `create_link_code` | `request_id` | → `link_code`; one live code per user, valid 10 min, single use |
 | `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
 
@@ -118,6 +123,7 @@ all rooms. The first client frame must be `hello`.
 | `presence` | `room_id, user_id, online` |
 | `room_updated` | `room_id, system_prompt, updated_by` |
 | `reactions` | `room_id, message_id, reactions: Reaction[]` (the message's full current list) |
+| `message_updated` | `room_id, message: Message` (the full row after an edit or delete) |
 | `link_code` | `request_id, code, expires_in_secs` |
 | `linked` | `request_id, user_id, display_name` |
 | `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline) |
@@ -128,7 +134,8 @@ all rooms. The first client frame must be `hello`.
 `Device = {device_id, device_name, platform}`
 `Reaction = {emoji, user_ids}` (grouped per emoji, in first-use order)
 `Message = {id, room_id, seq, kind, author_id, author_name, content, reasoning, tools,
-            attachments, reactions, ai_requested, anchor_id, model, status, error, created_at}`
+            attachments, reactions, ai_requested, anchor_id, model, reply_to, status, error,
+            created_at, edited_at, deleted}`
 
 ### AI reply lifecycle
 

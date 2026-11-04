@@ -64,6 +64,8 @@ export interface Message {
   ai_requested: boolean;
   anchor_id: string | null;
   model: string | null;
+  /** Message this one replies to, if any. */
+  reply_to: string | null;
   status: MessageStatus;
   error: string | null;
   created_at: number;
@@ -79,7 +81,7 @@ export type ClientMsg =
   | { type: "join_room"; request_id: string; invite_code: string }
   | { type: "leave_room"; room_id: string }
   | { type: "open_room"; room_id: string }
-  | { type: "send_message"; room_id: string; id: string; content: string; ai_requested: boolean }
+  | { type: "send_message"; room_id: string; id: string; content: string; ai_requested: boolean; reply_to?: string | null }
   | { type: "ai_start"; room_id: string; id: string; anchor_id: string; model: string }
   | { type: "ai_delta"; room_id: string; id: string; delta: string }
   | { type: "ai_reasoning"; room_id: string; id: string; delta: string }

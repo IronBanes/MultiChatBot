@@ -315,7 +315,7 @@ impl State {
                 self.send(conn, ServerMsg::RoomHistory { room_id, messages });
             }
 
-            ClientMsg::SendMessage { room_id, id, content, ai_requested } => {
+            ClientMsg::SendMessage { room_id, id, content, ai_requested, reply_to } => {
                 if !self.in_room(conn, &room_id) {
                     self.send(conn, err(None, "Not a member of that room"));
                     return Ok(());
@@ -327,6 +327,13 @@ impl State {
                 if content.trim().is_empty() || content.len() > MAX_CONTENT {
                     self.send(conn, err(None, "Message is empty or too long"));
                     return Ok(());
+                }
+                if let Some(reply_to) = reply_to.as_deref() {
+                    let target = db::message(&self.db, reply_to).await?;
+                    if !target.is_some_and(|t| t.room_id == room_id && !t.deleted) {
+                        self.send(conn, err(None, "Can't reply to that message"));
+                        return Ok(());
+                    }
                 }
                 let res = db::insert_message(
                     &self.db,
@@ -340,6 +347,7 @@ impl State {
                         ai_requested,
                         anchor_id: None,
                         model: None,
+                        reply_to: reply_to.as_deref(),
                         status: "complete",
                     },
                 )
@@ -376,6 +384,7 @@ impl State {
                         ai_requested: false,
                         anchor_id: Some(&anchor_id),
                         model: Some(&model),
+                        reply_to: None,
                         status: "streaming",
                     },
                 )

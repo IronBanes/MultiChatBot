@@ -61,7 +61,7 @@ interface ChatState {
   unlink(): Promise<void>;
   leaveRoom(id: string): void;
   /** Resolves true once the message was actually written to the relay. */
-  sendMessage(roomId: string, content: string, aiRequested: boolean, profileId: string | null): Promise<boolean>;
+  sendMessage(roomId: string, content: string, aiRequested: boolean, profileId: string | null, replyTo?: string | null): Promise<boolean>;
   /** Rewrites one of this user's own human messages. */
   editMessage(roomId: string, messageId: string, content: string): void;
   /** Soft-deletes one of this user's own messages (human, or an AI reply they generated). */
@@ -175,6 +175,16 @@ export const useChat = create<ChatState>((set, get) => {
     );
   }
 
+  /** History text for one message: deleted ones are dropped by the caller; a reply
+   *  gets a "(replying to …)" prefix so the model knows what it answers. */
+  function historyText(m: Message, byId: Map<string, Message>): string {
+    if (!m.reply_to) return m.content;
+    const orig = byId.get(m.reply_to);
+    if (!orig) return m.content;
+    const quote = orig.deleted ? "a deleted message" : `${orig.author_name}: "${orig.content.slice(0, 120)}"`;
+    return `(replying to ${quote})\n${m.content}`;
+  }
+
   function startAi(roomId: string, anchor: Message, profileId: string) {
     const s = get();
     const profile = s.client?.profiles.find((p) => p.id === profileId);
@@ -183,9 +193,11 @@ export const useChat = create<ChatState>((set, get) => {
       return;
     }
     const room = s.rooms[roomId];
-    const history: HistoryItem[] = (s.messages[roomId] ?? [])
+    const usable = s.messages[roomId] ?? [];
+    const byId = new Map(usable.map((m) => [m.id, m]));
+    const history: HistoryItem[] = usable
       .filter((m) => m.seq <= anchor.seq && !m.deleted && (m.kind === "human" || m.status === "complete"))
-      .map((m) => ({ kind: m.kind, author_name: m.author_name, content: m.content }));
+      .map((m) => ({ kind: m.kind, author_name: m.author_name, content: historyText(m, byId) }));
 
     const id = crypto.randomUUID();
     if (!relay?.send({ type: "ai_start", room_id: roomId, id, anchor_id: anchor.id, model: profile.model })) {
@@ -547,17 +559,25 @@ export const useChat = create<ChatState>((set, get) => {
       relay?.send({ type: "leave_room", room_id: id });
     },
 
-    async sendMessage(roomId, content, aiRequested, profileId) {
+    async sendMessage(roomId, content, aiRequested, profileId, replyTo) {
       const id = crypto.randomUUID();
       if (aiRequested && profileId) pendingAi.set(id, profileId);
       const ok = relay
-        ? await relay.sendConfirmed({ type: "send_message", room_id: roomId, id, content, ai_requested: aiRequested })
+        ? await relay.sendConfirmed({ type: "send_message", room_id: roomId, id, content, ai_requested: aiRequested, reply_to: replyTo ?? null })
         : false;
       if (!ok) {
         pendingAi.delete(id);
         get().toast("Message not sent: you're not connected to the server. Your text is still in the box.");
       }
       return ok;
+    },
+
+    editMessage(roomId, messageId, content) {
+      relay?.send({ type: "edit_message", room_id: roomId, message_id: messageId, content });
+    },
+
+    deleteMessage(roomId, messageId) {
+      relay?.send({ type: "delete_message", room_id: roomId, message_id: messageId });
     },
 
     regenerate(ai, profileId) {
@@ -571,14 +591,6 @@ export const useChat = create<ChatState>((set, get) => {
 
     stopAi(id) {
       void backend.stopGeneration(id);
-    },
-
-    editMessage(roomId, messageId, content) {
-      relay?.send({ type: "edit_message", room_id: roomId, message_id: messageId, content });
-    },
-
-    deleteMessage(roomId, messageId) {
-      relay?.send({ type: "delete_message", room_id: roomId, message_id: messageId });
     },
 
     react(roomId, messageId, emoji, on) {

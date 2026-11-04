@@ -82,8 +82,10 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
     for ddl in [
         "ALTER TABLE messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE messages ADD COLUMN attachments_stub TEXT",
         "ALTER TABLE messages ADD COLUMN edited_at INTEGER",
         "ALTER TABLE messages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE messages ADD COLUMN reply_to TEXT",
         "ALTER TABLE attachments ADD COLUMN call_id TEXT",
         "ALTER TABLE attachments ADD COLUMN width INTEGER",
         "ALTER TABLE attachments ADD COLUMN height INTEGER",
@@ -241,7 +243,8 @@ pub async fn set_room_prompt(db: &Db, room_id: &str, prompt: &str) -> sqlx::Resu
 
 // `attachments` and `reactions` are filled in by `with_attachments` / `with_reactions`.
 const MESSAGE_COLS: &str = "id, room_id, seq, kind, author_id, author_name, content, reasoning, tools, '[]' AS attachments, \
-                            '[]' AS reactions, ai_requested, anchor_id, model, status, error, created_at, edited_at, deleted";
+                            '[]' AS reactions, ai_requested, anchor_id, model, status, error, created_at, edited_at, \
+                            deleted, reply_to";
 
 pub async fn recent_messages(db: &Db, room_id: &str, limit: i64) -> sqlx::Result<Vec<Message>> {
     let messages = sqlx::query_as(&format!(
@@ -437,14 +440,15 @@ pub struct NewMessage<'a> {
     pub ai_requested: bool,
     pub anchor_id: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub reply_to: Option<&'a str>,
     pub status: &'a str,
 }
 
 pub async fn insert_message(db: &Db, m: NewMessage<'_>) -> sqlx::Result<Message> {
     sqlx::query(
         "INSERT INTO messages (id, room_id, kind, author_id, author_name, content, ai_requested,
-                               anchor_id, model, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               anchor_id, model, reply_to, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(m.id)
     .bind(m.room_id)
@@ -455,19 +459,12 @@ pub async fn insert_message(db: &Db, m: NewMessage<'_>) -> sqlx::Result<Message>
     .bind(m.ai_requested)
     .bind(m.anchor_id)
     .bind(m.model)
+    .bind(m.reply_to)
     .bind(m.status)
     .bind(now_ms())
     .execute(db)
     .await?;
     Ok(message(db, m.id).await?.expect("row just inserted"))
-}
-
-pub struct AiResult<'a> {
-    pub content: &'a str,
-    pub reasoning: &'a str,
-    pub tools: &'a [ToolActivity],
-    pub status: &'a str,
-    pub error: Option<&'a str>,
 }
 
 /// Rewrites a message's text and stamps `edited_at`, so clients can show "(edited)".
@@ -498,6 +495,14 @@ pub async fn delete_message(db: &Db, id: &str) -> sqlx::Result<()> {
         sqlx::query(sql).bind(id).execute(db).await?;
     }
     Ok(())
+}
+
+pub struct AiResult<'a> {
+    pub content: &'a str,
+    pub reasoning: &'a str,
+    pub tools: &'a [ToolActivity],
+    pub status: &'a str,
+    pub error: Option<&'a str>,
 }
 
 pub async fn finish_ai(db: &Db, id: &str, r: AiResult<'_>) -> sqlx::Result<()> {
@@ -593,7 +598,7 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let m1 = insert_message(
+        insert_message(
             &db,
             NewMessage {
                 id: "m1",
@@ -605,12 +610,13 @@ mod tests {
                 ai_requested: false,
                 anchor_id: None,
                 model: None,
+                reply_to: None,
                 status: "complete",
             },
         )
         .await
         .unwrap();
-        assert_eq!(m1.edited_at, None);
+        assert_eq!(message(&db, "m1").await.unwrap().unwrap().edited_at, None);
         edit_message(&db, "m1", "second take").await.unwrap();
         let m = message(&db, "m1").await.unwrap().unwrap();
         assert_eq!(m.content, "second take");
@@ -645,6 +651,7 @@ mod tests {
                 ai_requested: false,
                 anchor_id: None,
                 model: None,
+                reply_to: None,
                 status: "complete",
             },
         )
@@ -659,6 +666,45 @@ mod tests {
         assert!(m.deleted);
         // Reactions were removed with the content; the row itself stays.
         assert!(reactions(&db, "m1").await.unwrap().is_empty());
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn message_returns_reply_to_and_message_round_trips_it() {
+        let dir = std::env::temp_dir().join(format!("mc-reply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users VALUES ('a', 'A', 0);
+             INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
+             INSERT INTO members VALUES ('r', 'a', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        for (id, reply_to) in [("m1", None), ("m2", Some("m1"))] {
+            insert_message(
+                &db,
+                NewMessage {
+                    id,
+                    room_id: "r",
+                    kind: "human",
+                    author_id: "a",
+                    author_name: "A",
+                    content: "text",
+                    ai_requested: false,
+                    anchor_id: None,
+                    model: None,
+                    reply_to,
+                    status: "complete",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(message(&db, "m1").await.unwrap().unwrap().reply_to, None);
+        assert_eq!(message(&db, "m2").await.unwrap().unwrap().reply_to.as_deref(), Some("m1"));
         db.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
