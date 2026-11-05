@@ -97,6 +97,8 @@ struct ClientState {
     user_id: String,
     display_name: String,
     device_id: String,
+    /// Signs this device in to `user_id` on the relay (kept in the OS keychain).
+    account_secret: String,
     linked: bool,
     server_url: String,
     platform: &'static str,
@@ -117,11 +119,26 @@ fn platform() -> &'static str {
     }
 }
 
+/// The keychain secret for account `user_id`, made on first use for this device's
+/// own account. A linked account's secret comes from the link code; if it's missing
+/// (linked before accounts had secrets) a fresh one is made and the relay will ask
+/// to link again if the account already has another.
+fn account_secret(user_id: &str) -> Result<String, String> {
+    if let Some(s) = secrets::get_account(user_id)?.filter(|s| !s.is_empty()) {
+        return Ok(s);
+    }
+    let fresh = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+    secrets::set_account(user_id, &fresh)?;
+    Ok(fresh)
+}
+
 #[tauri::command]
 fn get_state(state: State<'_, AppState>) -> Result<ClientState, String> {
     let cfg = state.snapshot()?;
+    let account_secret = account_secret(&cfg.user_id)?;
     Ok(ClientState {
         instance: config::instance_name(),
+        account_secret,
         user_id: cfg.user_id,
         display_name: cfg.display_name,
         device_id: cfg.device_id,
@@ -140,11 +157,17 @@ fn link_device(
     state: State<'_, AppState>,
     user_id: String,
     display_name: String,
+    secret: String,
 ) -> Result<(), String> {
     if uuid::Uuid::parse_str(&user_id).is_err() {
         return Err("Invalid user id".into());
     }
+    if secret.is_empty() {
+        return Err("The link code didn't include the account's sign-in. Update the other device.".into());
+    }
     let name: String = display_name.trim().chars().take(40).collect();
+    // The secret first: without it this device couldn't sign in to the account.
+    secrets::set_account(&user_id, &secret)?;
     state.update(|c| {
         // Remember this device's own account so unlinking can return to it.
         if c.linked_from.is_none() {
@@ -158,6 +181,7 @@ fn link_device(
 
 #[tauri::command]
 fn unlink_device(state: State<'_, AppState>) -> Result<(), String> {
+    let linked = state.snapshot()?.user_id;
     state.update(|c| {
         // Back to this device's own account, or a fresh one if never linked.
         c.user_id =
@@ -165,7 +189,10 @@ fn unlink_device(state: State<'_, AppState>) -> Result<(), String> {
         if let Some(name) = c.linked_from_name.take().filter(|n| !n.is_empty()) {
             c.display_name = name;
         }
-    })
+    })?;
+    // This device no longer signs in to the account it left.
+    let _ = secrets::delete_account(&linked);
+    Ok(())
 }
 
 #[tauri::command]

@@ -132,6 +132,19 @@ pub fn delete_key(profile_id: &str) -> Result<(), String> {
     delete(&format!("profile:{profile_id}"))
 }
 
+/// The secret that signs this device in to account `user_id` on the relay.
+pub fn get_account(user_id: &str) -> Result<Option<String>, String> {
+    get(&format!("account:{user_id}"))
+}
+
+pub fn set_account(user_id: &str, secret: &str) -> Result<(), String> {
+    set(&format!("account:{user_id}"), secret)
+}
+
+pub fn delete_account(user_id: &str) -> Result<(), String> {
+    delete(&format!("account:{user_id}"))
+}
+
 /// Env vars (stdio servers) and HTTP headers (remote servers) for an MCP server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpSecrets {

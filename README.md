@@ -420,6 +420,9 @@ message, generated with your own model.
 
 ## Security notes
 
+- Each account has a secret kept in the OS keychain, and the relay checks it on every
+  connection, so knowing someone's user id isn't enough to sign in as them. Linking a
+  device hands it the secret; unlinking removes it.
 - Message content is rendered as Markdown with raw HTML disabled. `javascript:` links
   are neutralized, links open in the system browser, and remote images are never loaded.
 - MCP tool arguments and results are never sent to the relay (only to the MCP server

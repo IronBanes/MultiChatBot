@@ -8,6 +8,8 @@ class Client {
   constructor(name) {
     this.name = name;
     this.userId = uuid();
+    // Signs in to the account; another device of the same account copies it.
+    this.secret = uuid().replaceAll("-", "") + uuid().replaceAll("-", "");
     // Optional device identity for linked-device tests (same account, own device).
     this.deviceId = "";
     this.deviceName = "";
@@ -26,6 +28,7 @@ class Client {
           device_id: this.deviceId,
           device_name: this.deviceName,
           platform: this.platform,
+          secret: this.secret,
         });
         resolve();
       };
@@ -130,6 +133,7 @@ ok(human.message.author_name === "Bob" && !human.message.ai_requested, "human-on
   // types doesn't end Alice's indicator; the last one stopping does.
   const alice2 = new Client("Alice");
   alice2.userId = alice.userId;
+  alice2.secret = alice.secret;
   await alice2.open();
   await alice2.wait(type("welcome"), "welcome (second device)");
   alice2.send({ type: "typing", room_id: room.id, typing: true });
@@ -227,6 +231,7 @@ ok(true, "room prompt updated");
 // Persistence: a fresh connection sees the full history with final statuses.
 const bob2 = new Client("Bob");
 bob2.userId = bob.userId;
+bob2.secret = bob.secret;
 await bob2.open();
 const welcome = await bob2.wait(type("welcome"), "welcome");
 ok(welcome.rooms.some((r) => r.id === room.id && r.system_prompt === "Be brief."), "Bob's rooms restored on reconnect");
@@ -339,6 +344,7 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
 
   const pc = new Client("Alice");
   pc.userId = alice.userId; // same account, another device
+  pc.secret = alice.secret;
   pc.deviceId = "pc-1";
   pc.deviceName = "Office PC";
   pc.platform = "windows";
@@ -349,6 +355,7 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
 
   const phone = new Client("Alice");
   phone.userId = alice.userId; // same account, the phone
+  phone.secret = alice.secret;
   phone.deviceId = "phone-1";
   phone.deviceName = "Pixel";
   phone.platform = "android";
@@ -424,6 +431,50 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   pc.close();
   phone.close();
   bobd.close();
+}
+
+// Accounts are authenticated: knowing someone's user id (every room member does)
+// isn't enough to connect as them; a link code hands over the account's secret.
+{
+  const fake = new Client("Alice");
+  fake.userId = alice.userId; // the id is public, the secret isn't
+  await fake.open();
+  const refused = await fake.wait(type("error", (m) => /isn't signed in/.test(m.message)), "hello refused (wrong secret)");
+  ok(!!refused, "hello with another user's id and the wrong secret is refused");
+  ok(!fake.inbox.some((m) => m.type === "welcome" || m.type === "devices"), "the impostor gets no welcome or device list");
+  fake.send({ type: "request_ai", request_id: "rq-fake", room_id: room.id, anchor_id: human.message.id, device_id: "pc-1", profile_id: "prof-1" });
+  const unbound = await fake.wait(type("error", (m) => /hello first/.test(m.message)), "request_ai refused (not signed in)");
+  ok(!!unbound, "an impostor can't send request_ai");
+  fake.close();
+
+  const blank = new Client("Alice");
+  blank.userId = alice.userId;
+  blank.secret = "";
+  await blank.open();
+  await blank.wait(type("error", (m) => /isn't signed in/.test(m.message)), "hello refused (no secret)");
+  ok(true, "hello with no secret for an account that has one is refused");
+  blank.close();
+
+  // Linking: the code carries the account's secret to the new device.
+  alice.send({ type: "create_link_code", request_id: "lc-bad", secret: "not-alices" });
+  await alice.wait(type("error", (m) => m.request_id === "lc-bad"), "create_link_code refused (wrong secret)");
+  ok(true, "create_link_code with the wrong secret is refused");
+  alice.send({ type: "create_link_code", request_id: "lc1", secret: alice.secret });
+  const lc = await alice.wait(type("link_code", (m) => m.request_id === "lc1"), "link_code");
+  const newdev = new Client("New phone");
+  await newdev.open();
+  await newdev.wait(type("welcome"), "welcome (new device, own account)");
+  newdev.send({ type: "redeem_link_code", request_id: "rd1", code: lc.code });
+  const linked = await newdev.wait(type("linked", (m) => m.request_id === "rd1"), "linked");
+  ok(linked.user_id === alice.userId && linked.secret === alice.secret, "redeeming a link code hands over the account's id and secret");
+  newdev.close();
+  const asAlice = new Client("Alice");
+  asAlice.userId = linked.user_id;
+  asAlice.secret = linked.secret;
+  await asAlice.open();
+  const w = await asAlice.wait(type("welcome"), "welcome (linked device)");
+  ok(w.user_id === alice.userId, "the linked device signs in to the account");
+  asAlice.close();
 }
 
 alice.close();

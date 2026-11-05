@@ -117,6 +117,7 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
         "ALTER TABLE attachments ADD COLUMN call_id TEXT",
         "ALTER TABLE attachments ADD COLUMN width INTEGER",
         "ALTER TABLE attachments ADD COLUMN height INTEGER",
+        "ALTER TABLE users ADD COLUMN secret_hash TEXT",
     ] {
         if let Err(e) = sqlx::query(ddl).execute(&pool).await {
             if !e.to_string().contains("duplicate column") {
@@ -159,6 +160,77 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// How `hello`'s secret compares with what the relay knows about the account.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SecretCheck {
+    /// The secret matches the account's (or the account didn't exist and now has it).
+    Ok,
+    /// An account from before authentication had no secret; this one is now its own.
+    Claimed,
+    /// No secret was sent and the account has none yet (a client older than
+    /// authentication): allowed until the account claims one.
+    Legacy,
+    /// The account has a secret and this isn't it (or none was sent).
+    Wrong,
+}
+
+/// Hex SHA-256 of an account secret: the relay never stores the secret itself.
+pub fn secret_hash(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(secret.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The stored secret hash of `user_id`: outer None when there's no such user,
+/// inner None when the account has no secret yet.
+pub async fn stored_secret_hash(db: &Db, user_id: &str) -> sqlx::Result<Option<Option<String>>> {
+    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT secret_hash FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.map(|r| r.0))
+}
+
+/// Checks `secret` against `user_id`'s stored hash. A new account is created with
+/// it, and an existing one without a hash claims it (trust on first use).
+pub async fn check_secret(db: &Db, user_id: &str, name: &str, secret: &str) -> sqlx::Result<SecretCheck> {
+    match stored_secret_hash(db, user_id).await? {
+        Some(Some(stored)) => {
+            let ok = !secret.is_empty() && secret_hash(secret) == stored;
+            Ok(if ok { SecretCheck::Ok } else { SecretCheck::Wrong })
+        }
+        Some(None) if secret.is_empty() => Ok(SecretCheck::Legacy),
+        Some(None) => {
+            // Only claim while still unclaimed, so two first connections can't both win.
+            let done = sqlx::query("UPDATE users SET secret_hash = ? WHERE id = ? AND secret_hash IS NULL")
+                .bind(secret_hash(secret))
+                .bind(user_id)
+                .execute(db)
+                .await?;
+            if done.rows_affected() == 1 {
+                return Ok(SecretCheck::Claimed);
+            }
+            let again = stored_secret_hash(db, user_id).await?.flatten();
+            Ok(if again == Some(secret_hash(secret)) { SecretCheck::Ok } else { SecretCheck::Wrong })
+        }
+        None if secret.is_empty() => Ok(SecretCheck::Legacy),
+        None => {
+            sqlx::query(
+                "INSERT INTO users (id, display_name, updated_at, secret_hash) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(id) DO NOTHING",
+            )
+            .bind(user_id)
+            .bind(name)
+            .bind(now_ms())
+            .bind(secret_hash(secret))
+            .execute(db)
+            .await?;
+            // Whoever won a race of first connections, this one must match it.
+            let now = stored_secret_hash(db, user_id).await?.flatten();
+            Ok(if now == Some(secret_hash(secret)) { SecretCheck::Ok } else { SecretCheck::Wrong })
+        }
+    }
 }
 
 /// Upserts a user. Returns the previous display name, if the user existed.
@@ -719,7 +791,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
         sqlx::raw_sql(
-            "INSERT INTO users VALUES ('a', 'A', 0), ('b', 'B', 0), ('c', 'C', 0);
+            "INSERT INTO users (id, display_name, updated_at) VALUES ('a', 'A', 0), ('b', 'B', 0), ('c', 'C', 0);
              INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
              INSERT INTO members VALUES ('r', 'a', 0), ('r', 'b', 0);",
         )
@@ -753,7 +825,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
         sqlx::raw_sql(
-            "INSERT INTO users VALUES ('a', 'A', 0);
+            "INSERT INTO users (id, display_name, updated_at) VALUES ('a', 'A', 0);
              INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
              INSERT INTO members VALUES ('r', 'a', 0);",
         )
@@ -794,7 +866,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
         sqlx::raw_sql(
-            "INSERT INTO users VALUES ('a', 'A', 0), ('b', 'B', 0);
+            "INSERT INTO users (id, display_name, updated_at) VALUES ('a', 'A', 0), ('b', 'B', 0);
              INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
              INSERT INTO members VALUES ('r', 'a', 0), ('r', 'b', 0);",
         )
@@ -838,7 +910,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
         sqlx::raw_sql(
-            "INSERT INTO users VALUES ('a', 'A', 0);
+            "INSERT INTO users (id, display_name, updated_at) VALUES ('a', 'A', 0);
              INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
              INSERT INTO members VALUES ('r', 'a', 0);",
         )
@@ -877,7 +949,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
         sqlx::raw_sql(
-            "INSERT INTO users VALUES ('a', 'A', 0);
+            "INSERT INTO users (id, display_name, updated_at) VALUES ('a', 'A', 0);
              INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
              INSERT INTO members VALUES ('r', 'a', 0);",
         )
@@ -926,7 +998,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
         sqlx::raw_sql(
-            "INSERT INTO users VALUES ('a', 'A', 0);
+            "INSERT INTO users (id, display_name, updated_at) VALUES ('a', 'A', 0);
              INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
              INSERT INTO members VALUES ('r', 'a', 0);",
         )
@@ -987,7 +1059,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
         sqlx::raw_sql(
-            "INSERT INTO users VALUES ('a', 'A', 0);
+            "INSERT INTO users (id, display_name, updated_at) VALUES ('a', 'A', 0);
              INSERT INTO rooms (id, name, invite_code, created_by, created_at)
              VALUES ('r', 'R', 'X', 'a', 0), ('r2', 'R2', 'Y', 'a', 0);
              INSERT INTO members VALUES ('r', 'a', 0);",
@@ -1075,6 +1147,30 @@ mod tests {
         delete_message(&db, "m1").await.unwrap();
         assert!(search_messages(&db, "r", "hel", 10).await.unwrap().is_empty());
         assert!(search_messages(&db, "r", "rephras", 10).await.unwrap().len() == 1);
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[tokio::test]
+    async fn account_secrets_are_checked_claimed_and_never_stored() {
+        let dir = std::env::temp_dir().join(format!("mc-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        // A new account takes the secret it first connects with; only its hash is kept.
+        assert_eq!(check_secret(&db, "u1", "A", "s3cret").await.unwrap(), SecretCheck::Ok);
+        let stored = stored_secret_hash(&db, "u1").await.unwrap().flatten().unwrap();
+        assert_ne!(stored, "s3cret");
+        assert_eq!(stored, secret_hash("s3cret"));
+        assert_eq!(check_secret(&db, "u1", "A", "s3cret").await.unwrap(), SecretCheck::Ok);
+        assert_eq!(check_secret(&db, "u1", "A", "other").await.unwrap(), SecretCheck::Wrong);
+        assert_eq!(check_secret(&db, "u1", "A", "").await.unwrap(), SecretCheck::Wrong);
+        // An account from before secrets: an old client still gets in, the first
+        // secret claims it, and from then on only that secret works.
+        upsert_user(&db, "u2", "B").await.unwrap();
+        assert_eq!(check_secret(&db, "u2", "B", "").await.unwrap(), SecretCheck::Legacy);
+        assert_eq!(check_secret(&db, "u2", "B", "mine").await.unwrap(), SecretCheck::Claimed);
+        assert_eq!(check_secret(&db, "u2", "B", "theirs").await.unwrap(), SecretCheck::Wrong);
+        assert_eq!(check_secret(&db, "u2", "B", "").await.unwrap(), SecretCheck::Wrong);
+        assert_eq!(check_secret(&db, "u2", "B", "mine").await.unwrap(), SecretCheck::Ok);
         db.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
