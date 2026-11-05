@@ -467,6 +467,11 @@ export const useChat = create<ChatState>((set, get) => {
     const client = get().client;
     if (command.kind === "tool_approval") {
       const { room_id: roomId, message_id: messageId, call_id: callId, args, tool } = command;
+      // Rendered as text in the chat: anything else from the relay must not reach it.
+      if (typeof args !== "string") {
+        reply("Invalid tool approval");
+        return;
+      }
       // Offers repeat until answered; only the first one is news.
       const seen = !!get().remoteTools[messageId]?.[callId];
       set((s) => ({
@@ -494,9 +499,12 @@ export const useChat = create<ChatState>((set, get) => {
         if (!client.mcp_servers.some((s) => s.id === command.server_id)) throw new Error("That MCP server is gone");
         await backend.setRoomMcpMode(command.room_id, command.server_id, command.mode);
         await get().refreshClient();
-      } else {
+      } else if (command.kind === "set_profile_enabled") {
         await backend.setProfileEnabled(command.profile_id, command.enabled);
         await get().refreshClient();
+      } else {
+        // The relay's frames aren't trusted to match these types.
+        throw new Error("This app doesn't know that command");
       }
       reply(null);
     } catch (e) {
@@ -710,7 +718,7 @@ export const useChat = create<ChatState>((set, get) => {
           const askedBy = delegatedGenerations.get(id);
           if (askedBy && ev.status === "awaiting_approval") {
             const raw = ev.args ?? "{}";
-            const args = raw.length > MAX_APPROVAL_ARGS ? `${raw.slice(0, MAX_APPROVAL_ARGS)}\n… [cut short: the full call is on the computer]` : raw;
+            const args = raw.length > MAX_APPROVAL_ARGS ? `… [cut short: the full call is on the computer]\n${raw.slice(0, MAX_APPROVAL_ARGS)}` : raw;
             const pending = {
               deviceId: askedBy,
               command: { kind: "tool_approval", room_id: roomId, message_id: id, call_id: ev.call_id, server: ev.server, tool: ev.tool, args } as const,
