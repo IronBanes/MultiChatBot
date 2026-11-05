@@ -45,7 +45,11 @@ attachments (id TEXT PK, message_id TEXT, room_id TEXT, mime TEXT,
              created_at INTEGER)        -- source of truth for a reply's images,
                                         -- written at upload so they survive disconnects
 reactions (message_id TEXT, room_id TEXT, user_id TEXT, emoji TEXT,
-           created_at INTEGER, PRIMARY KEY(message_id, user_id, emoji))  -- emoji reactions
+            created_at INTEGER, PRIMARY KEY(message_id, user_id, emoji))  -- emoji reactions
+messages_fts                               -- FTS5 full-text index over messages.content
+                                              (external content, synced by triggers; built
+                                              once at startup, then maintained on insert,
+                                              edit and delete)
 ```
 
 On startup any leftover `streaming` rows become `interrupted`.
@@ -85,7 +89,7 @@ all rooms. The first client frame must be `hello`.
 | `join_room` | `request_id, invite_code` | → `room_joined` |
 | `leave_room` | `room_id` | |
 | `open_room` | `room_id` | → `room_history` (the newest 200 messages) |
-| `load_older` | `room_id, before_seq` | → `older_messages`: the next 100 messages older than `before_seq`, oldest first; members only |
+| `load_older` | `room_id, before_seq, until_seq?` | → `older_messages`: the next 100 messages older than `before_seq`, oldest first; with `until_seq` (a search jump target) the page reaches back to include that message plus context, capped at 2000 rows — the client asks again from there; members only |
 | `send_message` | `room_id, id, content, ai_requested, reply_to?` | human message; `reply_to` must be a non-deleted message in the room |
 | `ai_start` | `room_id, id, anchor_id, model` | anchor = human msg in room |
 | `ai_delta` | `room_id, id, delta` | only from the stream's owner connection |
@@ -102,6 +106,7 @@ all rooms. The first client frame must be `hello`.
 | `delete_message` | `room_id, message_id` | soft-delete your own message (human, or an AI reply you generated; not while streaming) → `message_updated` |
 | `create_link_code` | `request_id` | → `link_code`; one live code per user, valid 10 min, single use |
 | `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
+| `search_messages` | `request_id, room_id, query` | full-text search of that room's messages (prefix match on the last word, ≤ 200 chars); → `search_results`; members only |
 
 ### Server → client
 
@@ -111,7 +116,8 @@ all rooms. The first client frame must be `hello`.
 | `room_joined` | `request_id?, room: RoomInfo` |
 | `room_left` | `room_id` |
 | `room_history` | `room_id, messages: Message[], has_more` (newest 200; `has_more` true when older messages exist) |
-| `older_messages` | `room_id, messages: Message[], has_more` (answers `load_older`; page of 100, oldest first) |
+| `older_messages` | `room_id, messages: Message[], has_more` (answers `load_older`; page of 100, oldest first — or the stretch reaching to `until_seq`) |
+| `search_results` | `request_id, room_id, hits: SearchHit[]` (answers `search_messages`; newest first, max 50) |
 | `message` | `room_id, message: Message` (human, or AI on `ai_start` with status `streaming`) |
 | `ai_delta` | `room_id, id, delta` |
 | `ai_reasoning` | `room_id, id, delta` |
@@ -140,6 +146,8 @@ all rooms. The first client frame must be `hello`.
 `Message = {id, room_id, seq, kind, author_id, author_name, content, reasoning, tools,
             attachments, reactions, ai_requested, anchor_id, model, reply_to, status, error,
             created_at, edited_at, deleted}`
+`SearchHit = {id, seq, kind, author_name, created_at, snippet}` — the snippet's matched
+words are wrapped in STX/ETX control characters (\u0002 / \u0003) for highlighting.
 
 ### AI reply lifecycle
 

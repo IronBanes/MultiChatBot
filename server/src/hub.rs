@@ -17,6 +17,14 @@ const MAX_ERROR: usize = 300;
 const HISTORY_PAGE: i64 = 200;
 /// Messages sent in one `older_messages` page answering `load_older`.
 const OLDER_PAGE: i64 = 100;
+/// Rows of context below a `load_older` target when `until_seq` is set.
+const UNTIL_CONTEXT: i64 = OLDER_PAGE;
+/// Hard cap on one `older_messages` page, even when reaching back to `until_seq`.
+const UNTIL_MAX_ROWS: i64 = 2000;
+/// Search hits sent in one `search_results` frame.
+const MAX_SEARCH_HITS: usize = 50;
+/// Characters kept from a `search_messages` query.
+const MAX_SEARCH_QUERY: usize = 200;
 const MAX_TOOL_CALLS: usize = 100;
 const MAX_ATTACHMENTS: usize = 8;
 /// Distinct emoji one message accepts across all members.
@@ -339,7 +347,7 @@ impl State {
                 self.send(conn, ServerMsg::RoomHistory { room_id, messages, has_more });
             }
 
-            ClientMsg::LoadOlder { room_id, before_seq } => {
+            ClientMsg::LoadOlder { room_id, before_seq, until_seq } => {
                 if !self.in_room(conn, &room_id) {
                     self.send(conn, err(None, "Not a member of that room"));
                     return Ok(());
@@ -348,13 +356,51 @@ impl State {
                 // delete or reaction can't be overtaken by this older snapshot. The
                 // page isn't streamed, only the newest messages are.
                 let _ordered = self.updates_lock.lock().await;
-                let mut messages =
-                    db::messages_before(&self.db, &room_id, before_seq, OLDER_PAGE + 1).await?;
-                let has_more = messages.len() > OLDER_PAGE as usize;
-                if has_more {
-                    messages.remove(0);
-                }
+                // With `until_seq` (a search jump target) the page reaches back to
+                // that message plus context, capped: if the target is further back,
+                // the nearest rows come back and the client asks again.
+                let mut messages = match until_seq {
+                    Some(until) if until < before_seq => {
+                        db::messages_before_until(
+                            &self.db,
+                            &room_id,
+                            before_seq,
+                            until,
+                            UNTIL_CONTEXT,
+                            UNTIL_MAX_ROWS,
+                        )
+                        .await?
+                    }
+                    _ => db::messages_before(&self.db, &room_id, before_seq, OLDER_PAGE + 1).await?,
+                };
+                let has_more = match until_seq {
+                    // The stretch is sent whole; whether anything older remains is
+                    // asked directly (it may also have been capped short of the target).
+                    Some(until) if until < before_seq => match messages.first() {
+                        Some(m) => db::has_messages_before(&self.db, &room_id, m.seq).await?,
+                        None => false,
+                    },
+                    _ => {
+                        let more = messages.len() > OLDER_PAGE as usize;
+                        if more {
+                            messages.remove(0);
+                        }
+                        more
+                    }
+                };
                 self.send(conn, ServerMsg::OlderMessages { room_id, messages, has_more });
+            }
+
+            ClientMsg::SearchMessages { request_id, room_id, query } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(Some(request_id), "Not a member of that room"));
+                    return Ok(());
+                }
+                // Read-only: no updates lock, nothing to order against.
+                let hits =
+                    db::search_messages(&self.db, &room_id, &clip(&query, MAX_SEARCH_QUERY), MAX_SEARCH_HITS as i64)
+                        .await?;
+                self.send(conn, ServerMsg::SearchResults { request_id, room_id, hits });
             }
 
             ClientMsg::SendMessage { room_id, id, content, ai_requested, reply_to } => {

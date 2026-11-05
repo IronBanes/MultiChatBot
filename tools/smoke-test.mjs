@@ -256,6 +256,15 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   alice.send({ type: "load_older", room_id: bigRoom.id, before_seq: older.messages[0].seq });
   const empty = await alice.wait(type("older_messages"), "older_messages (empty page)");
   ok(empty.messages.length === 0 && empty.has_more === false, "an empty page is a valid answer");
+  // A search jump target: load_older with until_seq reaches back to it. Message
+  // 3 sits below the loaded page (m6 and up), so the page must stretch down.
+  const targetSeq = older.messages.find((m) => m.content === "m3").seq;
+  alice.send({ type: "load_older", room_id: bigRoom.id, before_seq: before, until_seq: targetSeq });
+  const deep = await alice.wait(type("older_messages"), "older_messages (until_seq)", 20000);
+  ok(
+    deep.messages.some((m) => m.content === "m3"),
+    "load_older with until_seq returns a page that includes the target message",
+  );
   // A non-member is refused.
   const mallory = new Client("Mallory");
   await mallory.open();
@@ -263,6 +272,50 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   mallory.send({ type: "load_older", room_id: bigRoom.id, before_seq: before });
   await mallory.wait(type("error", (m) => /Not a member/.test(m.message)), "load_older refused for a non-member");
   ok(true, "load_older from a non-member gets an error frame");
+  mallory.close();
+}
+
+// Message search: FTS hits with markers, edits and deletes reflected live, and
+// a non-member refused with the request id.
+{
+  alice.send({ type: "create_room", request_id: "r4", name: "Search room" });
+  const created = await alice.wait(type("room_joined", (m) => m.request_id === "r4"), "room_joined (search room)");
+  const sroom = created.room;
+  const send = async (content) => {
+    const id = uuid();
+    alice.send({ type: "send_message", room_id: sroom.id, id, content, ai_requested: false });
+    await alice.wait(type("message", (m) => m.message.id === id), `message "${content}"`);
+    return id;
+  };
+  const fox = await send("the quick brown fox");
+  await send("lazy dog");
+  const think = await send("Quick thinking");
+  // "quick" matches two messages, newest first, with the STX marker in snippets.
+  alice.send({ type: "search_messages", request_id: "s1", room_id: sroom.id, query: "quick" });
+  const res = await alice.wait(type("search_results", (m) => m.request_id === "s1"), "search_results");
+  ok(res.hits.length === 2, `search "quick" returns 2 hits (got ${res.hits.length})`);
+  ok(res.hits[0].id === think && res.hits[1].id === fox, "search hits are newest first");
+  ok(res.hits.every((h) => h.snippet.includes("\u0002")), "each snippet marks the matched word with the STX character");
+  ok(res.hits.every((h) => h.author_name === "Alice"), "hits carry the author name");
+  // Editing the word away removes the hit.
+  alice.send({ type: "edit_message", room_id: sroom.id, message_id: fox, content: "the slow brown fox" });
+  await alice.wait(type("message_updated", (m) => m.message.id === fox), "message_updated (edit)");
+  alice.send({ type: "search_messages", request_id: "s2", room_id: sroom.id, query: "quick" });
+  const res2 = await alice.wait(type("search_results", (m) => m.request_id === "s2"), "search_results (after edit)");
+  ok(res2.hits.length === 1 && res2.hits[0].id === think, "an edit that removes the word drops the hit");
+  // Deleting the other match leaves nothing.
+  alice.send({ type: "delete_message", room_id: sroom.id, message_id: think });
+  await alice.wait(type("message_updated", (m) => m.message.id === think), "message_updated (delete)");
+  alice.send({ type: "search_messages", request_id: "s3", room_id: sroom.id, query: "quick" });
+  const res3 = await alice.wait(type("search_results", (m) => m.request_id === "s3"), "search_results (after delete)");
+  ok(res3.hits.length === 0, "a deleted message is not found");
+  // A non-member gets the error with their request_id.
+  const mallory = new Client("Mallory");
+  await mallory.open();
+  await mallory.wait(type("welcome"), "welcome (search non-member)");
+  mallory.send({ type: "search_messages", request_id: "s4", room_id: sroom.id, query: "quick" });
+  const denied = await mallory.wait(type("error", (m) => m.request_id === "s4"), "search refused for a non-member");
+  ok(/Not a member/.test(denied.message), "search from a non-member gets an error frame with the request_id");
   mallory.close();
 }
 

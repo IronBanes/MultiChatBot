@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
-import type { Attachment, McpMode, Member, Message, RoomInfo, ToolActivity } from "../lib/types";
+import type { Attachment, McpMode, Member, Message, RoomInfo, SearchHit, ToolActivity } from "../lib/types";
 import { useChat, type LocalTool } from "../store";
 import { confirmAction } from "./Confirm";
 import { Markdown } from "./Markdown";
@@ -801,6 +801,7 @@ function MessageList({
   const hasMore = useChat((s) => !!s.hasMore[room.id]);
   const loadingOlder = useChat((s) => !!s.loadingOlder[room.id]);
   const loadOlder = useChat((s) => s.loadOlder);
+  const clearJump = useChat((s) => s.clearJump);
   const myId = useChat((s) => s.client!.user_id);
   // Stable reference: MessageItem is memo'd, so it must not see a new array each render.
   const members = useMemo(() => room.members, [room.members]);
@@ -810,6 +811,8 @@ function MessageList({
   /** Distance from the bottom of the list, kept when the list is resized (window, or an
    *  on-screen keyboard opening) so the same messages stay in view. */
   const fromBottom = useRef(0);
+  /** Until when a jump's smooth scroll is running (onScroll leaves `stick` alone). */
+  const jumpingUntil = useRef(0);
   /** The first message's id as of the last render. A change (with the same room) means
    *  older messages were prepended, not that the list grew at the bottom. */
   const firstId = useRef<string | null>(null);
@@ -862,7 +865,9 @@ function MessageList({
     const el = ref.current;
     if (!el) return;
     fromBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight;
-    stick.current = fromBottom.current < 80;
+    // While a jump's smooth scroll runs, a scroll event still queued from before it (or
+    // the scroll's first frames, still near the bottom) must not pin the list again.
+    if (Date.now() >= jumpingUntil.current) stick.current = fromBottom.current < 80;
     // Scrolled up to (or near) the top: fetch the previous page of older messages.
     if (hasMore && !loadingOlder && el.scrollTop < 300) loadOlder(room.id);
   };
@@ -875,13 +880,14 @@ function MessageList({
     if (el.scrollHeight <= el.clientHeight) loadOlder(room.id);
   }, [messages, loaded, hasMore, loadingOlder, room.id, loadOlder]);
 
-  /** Scrolls a reply's quote to its original and flashes it. */
+  /** Scrolls a reply's quote (or a search hit) to its message and flashes it. */
   const onJump = useCallback((id: string) => {
     const root = ref.current;
     const el = root?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(id)}"]`);
     if (!el) return;
     // Jumping away from the bottom must not snap back on the next scroll effect.
     stick.current = false;
+    jumpingUntil.current = Date.now() + 1500;
     fromBottom.current = root ? root.scrollHeight - root.scrollTop - root.clientHeight : 0;
     el.scrollIntoView({ block: "center", behavior: "smooth" });
     el.classList.remove("flash-highlight");
@@ -890,6 +896,15 @@ function MessageList({
     el.classList.add("flash-highlight");
     window.setTimeout(() => el.classList.remove("flash-highlight"), 1500);
   }, []);
+
+  // A search jump: scroll to the target (which may have needed older pages
+  // loaded first) using the same path a reply quote uses, then clear it.
+  const jumpTarget = useChat((s) => s.jumpTarget);
+  useEffect(() => {
+    if (!jumpTarget || jumpTarget.roomId !== room.id) return;
+    onJump(jumpTarget.id);
+    clearJump();
+  }, [jumpTarget, room.id, onJump, clearJump]);
 
   return (
     <div ref={ref} onScroll={onScroll} className={`min-h-0 flex-1 overflow-y-auto ${bubbles ? "overscroll-contain pb-9" : "pb-8"}`}>
@@ -938,6 +953,141 @@ function MessageList({
           );
         })}
       </div>
+    </div>
+  );
+}
+
+/** The matched words in a search snippet are wrapped in STX/ETX control
+ *  characters; split on them and render the marked parts as <mark>. */
+function highlight(hit: SearchHit) {
+  const parts = hit.snippet.split("\u0002");
+  return parts.map((part, i) => {
+    const end = part.indexOf("\u0003");
+    if (end < 0) return <span key={i}>{part}</span>;
+    return (
+      <span key={i}>
+        <mark className="rounded-[3px] bg-indigo-100 px-0.5 text-inherit dark:bg-indigo-500/30">{part.slice(0, end)}</mark>
+        {part.slice(end + 1)}
+      </span>
+    );
+  });
+}
+
+/** The room's message search: input (300 ms debounce, stale answers ignored) and
+ *  the hits; clicking one jumps to the message, loading older history if needed.
+ *  `phone` renders a full-screen overlay, otherwise a dropdown under the header. */
+function SearchPanel({ room, phone, onJump, onClose }: { room: RoomInfo; phone: boolean; onJump: (hit: SearchHit) => void; onClose: () => void }) {
+  const searchMessages = useChat((s) => s.searchMessages);
+  const [text, setText] = useState("");
+  const [hits, setHits] = useState<SearchHit[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+  const input = useRef<HTMLInputElement>(null);
+  // The latest keystroke's run number: a slower answer to an older query is dropped.
+  const latestRun = useRef(0);
+  useEffect(() => {
+    input.current?.focus();
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", esc);
+    // Desktop only (the phone overlay covers the screen and has a back button):
+    // a click outside the panel closes it.
+    const close = phone ? null : (e: MouseEvent) => {
+      if (box.current && !box.current.contains(e.target as Node)) onClose();
+    };
+    if (close) document.addEventListener("mousedown", close);
+    return () => {
+      window.removeEventListener("keydown", esc);
+      if (close) document.removeEventListener("mousedown", close);
+    };
+  }, [onClose, phone]);
+
+  // Search as you type, debounced; the empty box shows nothing (not "no match").
+  useEffect(() => {
+    const query = text.trim();
+    const run = ++latestRun.current;
+    if (!query) {
+      setHits(null);
+      setBusy(false);
+      return;
+    }
+    setBusy(true);
+    const t = window.setTimeout(async () => {
+      let got: SearchHit[] | null = null;
+      let failed = false;
+      try {
+        got = await searchMessages(room.id, query);
+      } catch {
+        failed = true;
+      }
+      if (latestRun.current !== run) return; // a newer query has taken over
+      setBusy(false);
+      setHits(failed ? null : got);
+    }, 300);
+    return () => window.clearTimeout(t);
+  }, [text, room.id, searchMessages]);
+
+  const results = busy ? (
+    <div className="px-3 py-6 text-center text-sm text-zinc-500">Searching…</div>
+  ) : hits === null ? null : hits.length === 0 ? (
+    <div className="px-3 py-6 text-center text-sm text-zinc-500">No messages match</div>
+  ) : (
+    hits.map((hit) => (
+      <button
+        key={hit.id}
+        onClick={() => onJump(hit)}
+        className="block w-full border-b border-zinc-100 px-3 py-2.5 text-left last:border-b-0 hover:bg-zinc-50 active:bg-zinc-100 dark:border-zinc-800 dark:hover:bg-zinc-800/60 dark:active:bg-zinc-800"
+      >
+        <span className="flex items-baseline gap-2">
+          <span className="truncate text-[13px] font-semibold text-zinc-700 dark:text-zinc-200">{hit.author_name}</span>
+          <span className="ml-auto shrink-0 text-[11px] text-zinc-400">{time(hit.created_at)}</span>
+        </span>
+        <span className="mt-0.5 block truncate text-[13px] leading-snug text-zinc-600 dark:text-zinc-300">{highlight(hit)}</span>
+      </button>
+    ))
+  );
+
+  const field = (
+    <div className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2">
+      <Icon name="search" size={15} className="shrink-0 text-zinc-400" />
+      <input
+        ref={input}
+        autoFocus
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder={`Search #${room.name}`}
+        aria-label="Search messages"
+        className={`${phone ? "text-base" : "text-sm"} min-w-0 flex-1 bg-transparent py-1 outline-none placeholder:text-zinc-400`}
+      />
+      {text && (
+        <button onClick={() => setText("")} className="rounded-full p-1 text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800" aria-label="Clear search">
+          <Icon name="x" size={14} />
+        </button>
+      )}
+    </div>
+  );
+
+  if (phone) {
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col bg-white pt-[calc(env(safe-area-inset-top)+0.5rem)] dark:bg-zinc-950">
+        <div className="flex items-center gap-1 border-b border-zinc-200 px-1 pb-2 dark:border-zinc-800">
+          <button
+            onClick={onClose}
+            className="flex h-11 items-center gap-0.5 rounded-full pr-2 pl-1 text-indigo-600 active:bg-zinc-100 dark:text-indigo-400 dark:active:bg-zinc-800"
+            aria-label="Back to the room"
+          >
+            <Icon name="chevron" size={24} className="rotate-180" />
+          </button>
+          <span className="sr-only">Search messages</span>
+          {field}
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto">{results}</div>
+      </div>
+    );
+  }
+  return (
+    <div ref={box} className="absolute top-1 right-0 z-30 w-96 max-w-[calc(100%-1rem)] overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
+      {field}
+      <div className="max-h-[60vh] overflow-y-auto border-t border-zinc-100 dark:border-zinc-800">{results}</div>
     </div>
   );
 }
@@ -1706,6 +1856,7 @@ export function RoomView({
   const [membersOverlay, setMembersOverlay] = useState(false);
   const [promptOpen, setPromptOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   /** Editing/replying target for the composer, shared with the message list. */
   const [editing, setEditing] = useState<Draft | null>(null);
@@ -1725,6 +1876,16 @@ export function RoomView({
   }, []);
   const clearEditing = useCallback(() => setEditing(null), []);
   const clearReply = useCallback(() => setReplyTo(null), []);
+  const closeSearch = useCallback(() => setSearchOpen(false), []);
+  // A hit from the search panel: close it and scroll the room to the message,
+  // loading older history first when the hit is further back than what's loaded.
+  const jumpToHit = useCallback(
+    (hit: SearchHit) => {
+      setSearchOpen(false);
+      useChat.getState().jumpTo(room.id, hit.id, hit.seq);
+    },
+    [room.id],
+  );
   // The desktop view isn't remounted per room, so ignore a target from another room,
   // and drop one that was deleted (from another device or by its author) meanwhile.
   const liveEdit = useChat((s) => (editing ? s.messages[editing.room_id]?.find((m) => m.id === editing.id) : undefined));
@@ -1770,6 +1931,13 @@ export function RoomView({
         </span>
       </button>
       <button
+        onClick={() => setSearchOpen(true)}
+        className="flex h-11 w-11 items-center justify-center rounded-full text-zinc-600 active:bg-zinc-100 dark:text-zinc-300 dark:active:bg-zinc-800"
+        aria-label="Search messages"
+      >
+        <Icon name="search" size={21} />
+      </button>
+      <button
         onClick={() => setMenuOpen(true)}
         className="flex h-11 w-11 items-center justify-center rounded-full text-zinc-600 active:bg-zinc-100 dark:text-zinc-300 dark:active:bg-zinc-800"
         aria-label="Room options"
@@ -1792,6 +1960,9 @@ export function RoomView({
       >
         {copied ? "COPIED" : room.invite_code}
       </button>
+      <Button variant="ghost" className="!px-2" onClick={() => setSearchOpen(true)} title="Search messages" aria-label="Search messages">
+        <Icon name="search" size={17} />
+      </Button>
       <Button variant="ghost" className="!px-2" onClick={() => setPromptOpen(true)} title="Room instructions">
         <Icon name="note" size={17} />
       </Button>
@@ -1823,6 +1994,9 @@ export function RoomView({
           {/* Floats over the list's bottom edge, outside the flow, so it appears and
               disappears without moving the messages. */}
           <TypingIndicator roomId={room.id} phone={phone} />
+          {/* The search dropdown hangs from the top of this container, under the
+              header; on phones SearchPanel renders a full-screen overlay instead. */}
+          {searchOpen && !phone && <SearchPanel room={room} phone={false} onJump={jumpToHit} onClose={closeSearch} />}
         </div>
         {/* Keyed by room: each room gets a fresh draft, and a send that finishes after
             switching rooms can't edit the new room's text. The editing/replying state
@@ -1841,6 +2015,7 @@ export function RoomView({
       </div>
       {inlineMembers && membersPref && <MemberList room={room} overlay={false} onClose={() => setMembersPref(false)} />}
       {!inlineMembers && membersOverlay && <MemberList room={room} overlay onClose={() => setMembersOverlay(false)} />}
+      {searchOpen && phone && <SearchPanel room={room} phone onJump={jumpToHit} onClose={closeSearch} />}
       {promptOpen && <RoomPromptDialog room={room} onClose={() => setPromptOpen(false)} />}
       {menuOpen && (
         <RoomMenu

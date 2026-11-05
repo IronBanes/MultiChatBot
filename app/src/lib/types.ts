@@ -75,13 +75,24 @@ export interface Message {
   deleted: boolean;
 }
 
+/** One message search hit (ServerMsg "search_results"). The snippet's matched
+ *  words are wrapped in STX/ETX control characters (\u0002 / \u0003). */
+export interface SearchHit {
+  id: string;
+  seq: number;
+  kind: "human" | "ai";
+  author_name: string;
+  created_at: number;
+  snippet: string;
+}
+
 export type ClientMsg =
   | { type: "hello"; user_id: string; display_name: string; device_id: string; device_name: string; platform: string }
   | { type: "create_room"; request_id: string; name: string }
   | { type: "join_room"; request_id: string; invite_code: string }
   | { type: "leave_room"; room_id: string }
   | { type: "open_room"; room_id: string }
-  | { type: "load_older"; room_id: string; before_seq: number }
+  | { type: "load_older"; room_id: string; before_seq: number; until_seq?: number }
   | { type: "send_message"; room_id: string; id: string; content: string; ai_requested: boolean; reply_to?: string | null }
   | { type: "ai_start"; room_id: string; id: string; anchor_id: string; model: string }
   | { type: "ai_delta"; room_id: string; id: string; delta: string }
@@ -97,7 +108,8 @@ export type ClientMsg =
   | { type: "edit_message"; room_id: string; message_id: string; content: string }
   | { type: "delete_message"; room_id: string; message_id: string }
   | { type: "create_link_code"; request_id: string }
-  | { type: "redeem_link_code"; request_id: string; code: string };
+  | { type: "redeem_link_code"; request_id: string; code: string }
+  | { type: "search_messages"; request_id: string; room_id: string; query: string };
 
 export type ServerMsg =
   | { type: "welcome"; user_id: string; rooms: RoomInfo[] }
@@ -105,6 +117,7 @@ export type ServerMsg =
   | { type: "room_left"; room_id: string }
   | { type: "room_history"; room_id: string; messages: Message[]; has_more: boolean }
   | { type: "older_messages"; room_id: string; messages: Message[]; has_more: boolean }
+  | { type: "search_results"; request_id: string; room_id: string; hits: SearchHit[] }
   | { type: "message"; room_id: string; message: Message }
   | { type: "message_updated"; room_id: string; message: Message }
   | { type: "ai_delta"; room_id: string; id: string; delta: string }

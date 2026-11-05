@@ -1,10 +1,10 @@
 // App state: relay connection, rooms, messages, and AI reply orchestration.
 
-import { create } from "zustand";
+import { create, type StoreApi } from "zustand";
 import { backend, errorText } from "./lib/backend";
 import { prepareImage } from "./lib/images";
 import { Relay, type ConnStatus } from "./lib/relay";
-import type { Attachment, ClientState, Device, HistoryItem, McpMode, Message, RoomInfo, ServerMsg, ToolStatus } from "./lib/types";
+import type { Attachment, ClientState, Device, HistoryItem, McpMode, Message, RoomInfo, SearchHit, ServerMsg, ToolStatus } from "./lib/types";
 
 /** Tool call details only the sender sees (arguments and a result preview). */
 export interface LocalTool {
@@ -47,6 +47,9 @@ interface ChatState {
   images: Record<string, string>;
   /** Room id → user id → who is typing and when that expires (never persisted). */
   typing: Record<string, Record<string, { name: string; until: number }>>;
+  /** A pending "scroll to this message" from a search jump: MessageList scrolls
+   *  to it and flashes it, then clears it via clearJump. */
+  jumpTarget: { roomId: string; id: string } | null;
   toasts: Toast[];
 
   init(): Promise<void>;
@@ -76,6 +79,12 @@ interface ChatState {
   stopAi(id: string): void;
   /** Asks the relay for the next page of older messages (scroll-up pagination). */
   loadOlder(roomId: string): void;
+  /** Full-text search over a room's messages (newest first). */
+  searchMessages(roomId: string, query: string): Promise<SearchHit[]>;
+  /** Scrolls the room to a message, loading older history until it's on screen. */
+  jumpTo(roomId: string, messageId: string, seq: number): void;
+  /** Clears the jump target once MessageList has scrolled to it. */
+  clearJump(): void;
   /** Adds or removes this user's reaction on a message (human or AI). */
   react(roomId: string, messageId: string, emoji: string, on: boolean): void;
   /** Best-effort "I'm typing" broadcast; never persisted by the relay. */
@@ -94,6 +103,9 @@ let relay: Relay | null = null;
 const pendingAi = new Map<string, string>();
 /** Images announced for a reply this client hasn't loaded yet (e.g. while joining). */
 const unclaimedAttachments = new Map<string, Attachment[]>();
+/** Room id → the message a search jump is waiting for, while older history that
+ *  reaches back to it is being fetched. */
+const pendingJumps = new Map<string, { id: string; seq: number }>();
 
 /** Adds attachments not already on the message, plus any waiting for it. */
 function withAttachments(m: Message, extra: Attachment[] = []): Message {
@@ -162,6 +174,29 @@ function request<T>(build: (requestId: string) => Parameters<Relay["send"]>[0]):
   });
 }
 
+/** After an older_messages page lands: if a search jump was waiting for it, point
+ *  MessageList at the target now that it's loaded, or ask again when the page was
+ *  capped short of it (the relay reaches back at most 2000 rows at a time). */
+function continueJump(set: StoreApi<ChatState>["setState"], get: () => ChatState, roomId: string) {
+  const jump = pendingJumps.get(roomId);
+  if (!jump) return;
+  const s = get();
+  if (s.messages[roomId]?.some((m) => m.id === jump.id)) {
+    pendingJumps.delete(roomId);
+    set({ jumpTarget: { roomId, id: jump.id } });
+    return;
+  }
+  // Still not on screen: fetch the next stretch toward it.
+  const first = s.messages[roomId]?.[0];
+  if (!first || !s.hasMore[roomId] || s.loadingOlder[roomId] || first.seq <= jump.seq) {
+    pendingJumps.delete(roomId);
+    return;
+  }
+  const ok = relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq, until_seq: jump.seq });
+  if (!ok) pendingJumps.delete(roomId);
+  else set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));
+}
+
 export const useChat = create<ChatState>((set, get) => {
   const patchRoom = (roomId: string, f: (r: RoomInfo) => RoomInfo) =>
     set((s) => (s.rooms[roomId] ? { rooms: { ...s.rooms, [roomId]: f(s.rooms[roomId]) } } : {}));
@@ -187,7 +222,11 @@ export const useChat = create<ChatState>((set, get) => {
         onMessage: handle,
         onStatus: (status, error) => {
           // A lost answer can't arrive anymore; don't let it block loading forever.
-          if (status === "offline") set({ loadingOlder: {} });
+          if (status === "offline") {
+            set({ loadingOlder: {} });
+            // A jump waiting on that answer is dropped too, so it can't fire later.
+            pendingJumps.clear();
+          }
           // The relay marks our in-flight replies as interrupted when the socket drops.
           if (status === "offline") stopAllGenerations();
           if (status !== "online") set({ devices: [] });
@@ -301,6 +340,8 @@ export const useChat = create<ChatState>((set, get) => {
         // Image fetches still pending when the connection dropped never got an answer;
         // forget them so the images request again on this connection.
         const images = Object.fromEntries(Object.entries(get().images).filter(([, src]) => src));
+        // A new connection: no search jump is waiting on a page from the old one.
+        pendingJumps.clear();
         // hasMore stays: room_history needs it for older pages it keeps.
         set({ rooms, roomOrder: order, loaded: {}, loadingOlder: {}, activeRoomId: active, images });
         if (active) relay?.send({ type: "open_room", room_id: active });
@@ -367,7 +408,16 @@ export const useChat = create<ChatState>((set, get) => {
             loadingOlder: { ...s.loadingOlder, [msg.room_id]: false },
           };
         });
+        // A search jump waiting for this page: point MessageList at the target,
+        // or ask again when the page was capped short of it.
+        continueJump(set, get, msg.room_id);
         break;
+      case "search_results": {
+        const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
+        if (msg.request_id) pendingRequests.delete(msg.request_id);
+        pending?.resolve(msg.hits);
+        break;
+      }
       case "message": {
         const m = withAttachments(msg.message);
         const mine = m.author_id === get().client?.user_id;
@@ -571,6 +621,7 @@ export const useChat = create<ChatState>((set, get) => {
     localTools: {},
     images: {},
     typing: {},
+    jumpTarget: null,
     toasts: [],
 
     async init() {
@@ -601,12 +652,20 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     selectRoom(id) {
-      set((s) => ({ activeRoomId: id, roomClosed: false, unread: { ...s.unread, [id]: 0 } }));
+      // A search jump belongs to the room it was started in: leaving drops it.
+      if (get().activeRoomId !== id) pendingJumps.clear();
+      set((s) => ({
+        activeRoomId: id,
+        roomClosed: false,
+        unread: { ...s.unread, [id]: 0 },
+        jumpTarget: s.jumpTarget?.roomId === id ? s.jumpTarget : null,
+      }));
       if (!get().loaded[id]) relay?.send({ type: "open_room", room_id: id });
     },
 
     closeRoom() {
-      set({ activeRoomId: null, roomClosed: true });
+      pendingJumps.clear();
+      set({ activeRoomId: null, roomClosed: true, jumpTarget: null });
     },
 
     createRoom: (name) => request<RoomInfo>((request_id) => ({ type: "create_room", request_id, name })),
@@ -684,6 +743,35 @@ export const useChat = create<ChatState>((set, get) => {
       if (s.loadingOlder[roomId] || !s.hasMore[roomId] || !first) return;
       const ok = relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq });
       if (ok) set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));
+    },
+
+    searchMessages: (roomId, query) =>
+      request<SearchHit[]>((request_id) => ({ type: "search_messages", request_id, room_id: roomId, query })),
+
+    jumpTo(roomId, messageId, seq) {
+      // The latest pick wins: an earlier jump still waiting for a page is dropped, and
+      // so is a target the list hasn't scrolled to yet.
+      pendingJumps.delete(roomId);
+      if (get().jumpTarget) set({ jumpTarget: null });
+      const s = get();
+      if (s.messages[roomId]?.some((m) => m.id === messageId)) {
+        set({ jumpTarget: { roomId, id: messageId } });
+        return;
+      }
+      // Not loaded: fetch a page that reaches back to the message, then jump
+      // (continueJump in the older_messages case finishes this).
+      const first = s.messages[roomId]?.[0];
+      if (!s.hasMore[roomId] || !first || seq >= first.seq) return;
+      pendingJumps.set(roomId, { id: messageId, seq });
+      // A page is already on its way: continueJump picks the jump up when it lands.
+      if (s.loadingOlder[roomId]) return;
+      const ok = relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq, until_seq: seq });
+      if (!ok) pendingJumps.delete(roomId);
+      else set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));
+    },
+
+    clearJump() {
+      set((s) => (s.jumpTarget ? { jumpTarget: null } : {}));
     },
 
     react(roomId, messageId, emoji, on) {
