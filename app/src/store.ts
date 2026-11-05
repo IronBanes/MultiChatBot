@@ -133,6 +133,8 @@ const pendingDelegatedOpens = new Map<string, { requestId: string; anchorId: str
 /** Generation ids this client is generating for another of this user's devices.
  *  Nobody is at this computer to approve tools, so Ask-mode calls are denied. */
 const delegatedGenerations = new Set<string>();
+/** The profile list last shared on the current connection (null: none yet). */
+let lastSharedProfiles: string | null = null;
 /** Images announced for a reply this client hasn't loaded yet (e.g. while joining). */
 const unclaimedAttachments = new Map<string, Attachment[]>();
 /** Room id → the message a search jump is waiting for, while older history that
@@ -243,7 +245,11 @@ export const useChat = create<ChatState>((set, get) => {
     const client = get().client;
     if (!relay || client?.platform !== "desktop") return;
     const profiles: SharedProfile[] = (client.profiles ?? []).map((p) => ({ id: p.id, label: p.label, model: p.model }));
-    relay.send({ type: "share_profiles", profiles });
+    // Only when the list changed on this connection: every share makes the relay
+    // send `devices` again, so sharing in answer to that would never stop.
+    const key = JSON.stringify(profiles);
+    if (key === lastSharedProfiles) return;
+    if (relay.send({ type: "share_profiles", profiles })) lastSharedProfiles = key;
   }
 
   function connect() {
@@ -427,6 +433,9 @@ export const useChat = create<ChatState>((set, get) => {
   function handle(msg: ServerMsg) {
     switch (msg.type) {
       case "welcome": {
+        // A new connection starts with nothing shared: publish this desktop's profiles.
+        lastSharedProfiles = null;
+        shareMyProfiles();
         const rooms: Record<string, RoomInfo> = {};
         for (const r of msg.rooms) rooms[r.id] = r;
         const order = msg.rooms.map((r) => r.id);
@@ -708,9 +717,6 @@ export const useChat = create<ChatState>((set, get) => {
       }
       case "devices":
         set({ devices: msg.devices });
-        // This desktop's own profiles are what other devices can pick from:
-        // keep the published list in step with the connection state too.
-        shareMyProfiles();
         break;
       case "error": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
