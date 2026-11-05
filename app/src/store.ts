@@ -381,17 +381,32 @@ export const useChat = create<ChatState>((set, get) => {
       fail("That message isn't in this room's history");
       return;
     }
-    startAi(roomId, anchor, profileId, (id) => {
-      delegatedGenerations.add(id);
-      return () => delegatedGenerations.delete(id);
-    });
+    startAi(
+      roomId,
+      anchor,
+      profileId,
+      (id) => {
+        delegatedGenerations.add(id);
+        return () => delegatedGenerations.delete(id);
+      },
+      // The asking device hears about a failed reply directly, not only via the room.
+      fail,
+    );
   }
 
-  function startAi(roomId: string, anchor: Message, profileId: string, delegated?: (id: string) => () => void) {
+  function startAi(
+    roomId: string,
+    anchor: Message,
+    profileId: string,
+    delegated?: (id: string) => () => void,
+    /** Also told when the reply fails (a delegated request's asking device). */
+    onFail?: (message: string) => void,
+  ) {
     const s = get();
     const profile = s.client?.profiles.find((p) => p.id === profileId);
     if (!profile) {
       get().toast("That AI profile no longer exists. Pick another one.");
+      onFail?.("That AI profile isn't on this computer anymore");
       return;
     }
     const room = s.rooms[roomId];
@@ -404,6 +419,7 @@ export const useChat = create<ChatState>((set, get) => {
     const id = crypto.randomUUID();
     if (!relay?.send({ type: "ai_start", room_id: roomId, id, anchor_id: anchor.id, model: profile.model })) {
       get().toast("Not connected to the server");
+      onFail?.("The other device couldn't reach the server");
       return;
     }
     set((st) => ({ myGenerations: { ...st.myGenerations, [id]: true } }));
@@ -461,12 +477,14 @@ export const useChat = create<ChatState>((set, get) => {
           const error = ev.message;
           afterUploads(() => {
             relay?.send({ type: "ai_error", room_id: roomId, id, error });
+            onFail?.(error);
             finish();
           });
         }
       })
       .catch((e) => {
         relay?.send({ type: "ai_error", room_id: roomId, id, error: errorText(e) });
+        onFail?.(errorText(e));
         finish();
       });
   }
