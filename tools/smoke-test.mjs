@@ -462,6 +462,7 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   ok(true, "create_link_code with the wrong secret is refused");
   alice.send({ type: "create_link_code", request_id: "lc1", secret: alice.secret });
   const lc = await alice.wait(type("link_code", (m) => m.request_id === "lc1"), "link_code");
+  ok(/^[A-Z2-9]{8}$/.test(lc.code), "link codes are 8 characters (too many to guess in ten minutes)");
   const newdev = new Client("New phone");
   await newdev.open();
   await newdev.wait(type("welcome"), "welcome (new device, own account)");

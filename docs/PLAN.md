@@ -107,7 +107,7 @@ all rooms. The first client frame must be `hello`.
 | `share_profiles` | `profiles: SharedProfile[]` | this connection's profiles the user's other devices may generate with (≤ 50; label/model clipped like names); broadcast as a refreshed `devices` to the user's connections |
 | `request_ai` | `request_id, room_id, anchor_id, device_id, profile_id` | ask one of the user's own devices to reply to `anchor_id` with its local profile → `ai_requested` there (or `error` with the request_id); the sender must be in the room, the anchor a non-deleted human message of that room, the target an online connection of the same user's device that is in the room and not the sender's own connection; nothing is stored |
 | `ai_request_failed` | `request_id, to_device_id, message` | the target's answer when it can't; relayed to the asking device's connections of the same user as `error` with the request_id (message clipped like `ai_error`) |
-| `create_link_code` | `request_id, secret` | → `link_code`; one live code per user, valid 10 min, single use; `secret` must be the account's (it's handed to the redeeming device) |
+| `create_link_code` | `request_id, secret` | → `link_code` (8 characters); one live code per user, valid 10 min, single use; `secret` must be the account's (it's handed to the redeeming device) |
 | `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
 | `search_messages` | `request_id, room_id, query` | full-text search of that room's messages (prefix match on the last word, ≤ 200 chars); → `search_results`; members only |
 

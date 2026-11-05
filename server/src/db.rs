@@ -292,9 +292,14 @@ pub async fn room(db: &Db, room_id: &str) -> sqlx::Result<Option<RoomRow>> {
 
 /// Short human-readable code used for room invites and device linking.
 pub fn invite_code() -> String {
+    random_code(6)
+}
+
+/// `len` characters from an alphabet without look-alikes (no I, L, O, 0, 1).
+pub fn random_code(len: usize) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
     let mut rng = rand::thread_rng();
-    (0..6).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
+    (0..len).map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char).collect()
 }
 
 /// Creates a room and adds the creator as its first member. Returns the room id.

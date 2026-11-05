@@ -42,10 +42,6 @@ const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/
 const LINK_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Failed link-code redeems allowed per connection before further tries are refused.
 const MAX_FAILED_REDEEMS: u32 = 5;
-/// Wrong link-code guesses the whole relay accepts per `REDEEM_WINDOW` before refusing
-/// redeems until older ones age out (codes are single use and expire in ten minutes).
-const MAX_FAILED_REDEEMS_GLOBAL: usize = 30;
-const REDEEM_WINDOW: Duration = Duration::from_secs(10 * 60);
 /// Longest account secret `hello` accepts (the app sends 64 hex characters).
 const MAX_SECRET: usize = 256;
 /// Minimum gap between two accepted `typing: true` frames from one connection.
@@ -100,9 +96,6 @@ struct Hub {
     conns: HashMap<ConnId, Conn>,
     streams: HashMap<String, Stream>,
     link_codes: HashMap<String, LinkCode>,
-    /// When recent wrong link-code guesses happened, across all connections: the
-    /// per-connection limit alone resets with every new connection.
-    failed_redeem_times: std::collections::VecDeque<Instant>,
 }
 
 impl Hub {
@@ -948,7 +941,11 @@ impl State {
                 hub.link_codes.retain(|_, c| c.expires > Instant::now());
                 // One live code per user: a fresh code replaces the previous one.
                 hub.link_codes.retain(|_, c| c.user_id != user_id);
-                let code = db::invite_code();
+                // Longer than room codes: a code hands over the account's secret, and with
+                // 31^8 (~850 billion) possibilities guessing one within its ten minutes is
+                // hopeless even across many connections, without a relay-wide limit that
+                // one guesser could use to block everyone's linking.
+                let code = db::random_code(8);
                 hub.link_codes.insert(
                     code.clone(),
                     LinkCode {
@@ -968,14 +965,6 @@ impl State {
 
             ClientMsg::RedeemLinkCode { request_id, code } => {
                 let mut hub = self.hub();
-                let now = Instant::now();
-                while hub.failed_redeem_times.front().is_some_and(|t| now.duration_since(*t) > REDEEM_WINDOW) {
-                    hub.failed_redeem_times.pop_front();
-                }
-                if hub.failed_redeem_times.len() >= MAX_FAILED_REDEEMS_GLOBAL {
-                    hub.send(conn, &err(Some(request_id), "Too many wrong link codes right now. Try again in a few minutes"));
-                    return Ok(());
-                }
                 if hub.conns.get(&conn).is_some_and(|c| c.failed_redeems >= MAX_FAILED_REDEEMS) {
                     hub.send(
                         conn,
@@ -989,7 +978,6 @@ impl State {
                     if let Some(c) = hub.conns.get_mut(&conn) {
                         c.failed_redeems += 1;
                     }
-                    hub.failed_redeem_times.push_back(Instant::now());
                 };
                 // Clone the owner out of the map so the else branch can mutably
                 // borrow the hub (the map borrow ends with this statement).
