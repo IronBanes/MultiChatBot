@@ -1,6 +1,7 @@
 //! SQLite persistence for users, rooms, members and messages.
 
-use crate::protocol::{Attachment, Message, Reaction, ToolActivity};
+use anyhow::Context;
+use crate::protocol::{Attachment, Message, Reaction, SearchHit, ToolActivity};
 use rand::Rng;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
 use std::collections::HashMap;
@@ -71,6 +72,27 @@ CREATE TABLE IF NOT EXISTS reactions (
 CREATE INDEX IF NOT EXISTS reactions_message ON reactions(message_id);
 "#;
 
+/// Full-text index of message text: an external-content FTS5 table over
+/// `messages.content`, kept in sync by triggers. Deleting means issuing FTS5's
+/// special 'delete' command with the old row, because the content table (not the
+/// index) is the source of truth.
+const FTS_SCHEMA: &str = r#"
+CREATE VIRTUAL TABLE messages_fts USING fts5(
+    content, content='messages', content_rowid='seq',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.seq, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.seq, old.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.seq, old.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (new.seq, new.content);
+END;
+"#;
+
 pub async fn connect(path: &str) -> anyhow::Result<Db> {
     let opts = SqliteConnectOptions::from_str(&format!("sqlite://{path}"))?
         .create_if_missing(true)
@@ -94,6 +116,23 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
                 return Err(e.into());
             }
         }
+    }
+    // The search index: created once; a database from before search gets its
+    // existing messages indexed in one rebuild.
+    let fts_existed: Option<(String,)> = sqlx::query_as(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'",
+    )
+    .fetch_optional(&pool)
+    .await?;
+    if fts_existed.is_none() {
+        sqlx::raw_sql(FTS_SCHEMA)
+            .execute(&pool)
+            .await
+            .context("creating messages_fts failed: this SQLite build lacks FTS5 (full-text search)")?;
+        sqlx::query("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
+            .execute(&pool)
+            .await
+            .context("indexing existing messages into messages_fts")?;
     }
     // Streams cannot survive a server restart.
     sqlx::query("UPDATE messages SET status = 'interrupted' WHERE status = 'streaming'")
@@ -278,6 +317,54 @@ pub async fn messages_before(
     with_reactions(db, with_attachments(db, messages).await?).await
 }
 
+/// A page of messages older than `before_seq` that reaches back to `until_seq`
+/// (the message a search jump targets) plus `context` older rows for context —
+/// or, when that would exceed `max_rows`, the `max_rows` messages nearest the
+/// page start, so the caller can ask again from there. Oldest first.
+pub async fn messages_before_until(
+    db: &Db,
+    room_id: &str,
+    before_seq: i64,
+    until_seq: i64,
+    context: i64,
+    max_rows: i64,
+) -> sqlx::Result<Vec<Message>> {
+    // The seq of the `context`-th message at or before the target: the page
+    // reaches down to it. None means the history runs out first.
+    let floor: Option<(i64,)> = sqlx::query_as(
+        "SELECT seq FROM messages WHERE room_id = ? AND seq <= ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
+    )
+    .bind(room_id)
+    .bind(until_seq)
+    .bind(context - 1)
+    .fetch_optional(db)
+    .await?;
+    let messages = sqlx::query_as(&format!(
+        "SELECT * FROM (SELECT {MESSAGE_COLS} FROM messages
+         WHERE room_id = ? AND seq < ? AND (seq >= ? OR seq <= ?)
+         ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
+    ))
+    .bind(room_id)
+    .bind(before_seq)
+    .bind(until_seq)
+    .bind(floor.map_or(i64::MIN, |f| f.0))
+    .bind(max_rows)
+    .fetch_all(db)
+    .await?;
+    with_reactions(db, with_attachments(db, messages).await?).await
+}
+
+/// True when the room has messages older than `seq` (`has_more` for a page).
+pub async fn has_messages_before(db: &Db, room_id: &str, seq: i64) -> sqlx::Result<bool> {
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT 1 FROM messages WHERE room_id = ? AND seq < ? LIMIT 1")
+            .bind(room_id)
+            .bind(seq)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.is_some())
+}
+
 pub async fn message(db: &Db, id: &str) -> sqlx::Result<Option<Message>> {
     let m: Option<Message> = sqlx::query_as(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id = ?"))
         .bind(id)
@@ -287,6 +374,41 @@ pub async fn message(db: &Db, id: &str) -> sqlx::Result<Option<Message>> {
         Some(m) => with_reactions(db, with_attachments(db, vec![m]).await?).await?.pop(),
         None => None,
     })
+}
+
+/// Turns the text a user typed into a safe FTS5 query: each whitespace-separated
+/// token is quoted (doubling inner quotes, so nothing can be parsed as FTS5
+/// syntax), the last one gets `*` for prefix matching, and all are required.
+/// Returns None when nothing queryable is left.
+fn fts_query(query: &str) -> Option<String> {
+    let mut tokens: Vec<String> =
+        query.split_whitespace().map(|t| format!("\"{}\"", t.replace('"', "\"\""))).collect();
+    tokens.last_mut()?.push('*');
+    Some(tokens.join(" "))
+}
+
+/// Full-text search over one room's message text, newest first. Each hit's
+/// `snippet` marks the matched words with STX/ETX control characters, so the
+/// app can highlight them without parsing HTML.
+pub async fn search_messages(
+    db: &Db,
+    room_id: &str,
+    query: &str,
+    limit: i64,
+) -> sqlx::Result<Vec<SearchHit>> {
+    let Some(query) = fts_query(query) else { return Ok(Vec::new()) };
+    sqlx::query_as(
+        "SELECT m.id, m.seq, m.kind, m.author_name, m.created_at,
+                snippet(messages_fts, 0, '\u{2}', '\u{3}', '…', 12) AS snippet
+         FROM messages_fts JOIN messages m ON m.seq = messages_fts.rowid
+         WHERE m.room_id = ? AND m.deleted = 0 AND messages_fts MATCH ?
+         ORDER BY m.seq DESC LIMIT ?",
+    )
+    .bind(room_id)
+    .bind(query)
+    .bind(limit)
+    .fetch_all(db)
+    .await
 }
 
 type AttachmentRow = (String, String, String, Option<String>, Option<i64>, Option<i64>);
@@ -777,6 +899,158 @@ mod tests {
         assert_eq!(probe.len(), 3);
         // Before the oldest message there is nothing, not even with a page size left over.
         assert!(messages_before(&db, "r", all[0].seq, 2).await.unwrap().is_empty());
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn messages_before_until_reaches_a_far_back_target() {
+        let dir = std::env::temp_dir().join(format!("mc-until-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users VALUES ('a', 'A', 0);
+             INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
+             INSERT INTO members VALUES ('r', 'a', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        for id in ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8", "m9", "m10"] {
+            insert_message(
+                &db,
+                NewMessage {
+                    id,
+                    room_id: "r",
+                    kind: "human",
+                    author_id: "a",
+                    author_name: "A",
+                    content: "text",
+                    ai_requested: false,
+                    anchor_id: None,
+                    model: None,
+                    reply_to: None,
+                    status: "complete",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let all = recent_messages(&db, "r", 20).await.unwrap();
+        let seq = |id: &str| all.iter().find(|m| m.id == id).unwrap().seq;
+        // The stretch: everything down to the target m3, plus two rows of context.
+        let page = messages_before_until(&db, "r", seq("m8"), seq("m3"), 2, 100).await.unwrap();
+        assert_eq!(
+            page.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m1", "m2", "m3", "m4", "m5", "m6", "m7"]
+        );
+        assert!(!has_messages_before(&db, "r", page[0].seq).await.unwrap());
+        // Capped at four rows: the four nearest the page start come back.
+        let capped = messages_before_until(&db, "r", seq("m8"), seq("m3"), 2, 4).await.unwrap();
+        assert_eq!(
+            capped.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m4", "m5", "m6", "m7"]
+        );
+        assert!(has_messages_before(&db, "r", capped[0].seq).await.unwrap());
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rooms "r" and "r2" with member "a"; r gets hello world / Hello there /
+    /// goodbye, r2 gets hello. Returns (db, dir) for the caller to clean up.
+    async fn search_fixture(suffix: &str) -> (Db, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("mc-search-{suffix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users VALUES ('a', 'A', 0);
+             INSERT INTO rooms (id, name, invite_code, created_by, created_at)
+             VALUES ('r', 'R', 'X', 'a', 0), ('r2', 'R2', 'Y', 'a', 0);
+             INSERT INTO members VALUES ('r', 'a', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        (db, dir)
+    }
+
+    #[tokio::test]
+    async fn search_matches_prefixes_in_one_room_newest_first() {
+        let (db, dir) = search_fixture("hits").await;
+        for (id, room, text) in
+            [("m1", "r", "hello world"), ("m2", "r", "Hello there"), ("m3", "r", "goodbye"), ("m4", "r2", "hello")]
+        {
+            insert_message(
+                &db,
+                NewMessage {
+                    id,
+                    room_id: room,
+                    kind: "human",
+                    author_id: "a",
+                    author_name: "A",
+                    content: text,
+                    ai_requested: false,
+                    anchor_id: None,
+                    model: None,
+                    reply_to: None,
+                    status: "complete",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // "hel": prefix match, case-insensitive, this room only, newest first.
+        let hits = search_messages(&db, "r", "hel", 10).await.unwrap();
+        assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["m2", "m1"]);
+        for h in &hits {
+            assert_eq!(h.kind, "human");
+            assert_eq!(h.author_name, "A");
+            assert!(h.created_at > 0);
+            assert!(h.snippet.contains('\u{2}') && h.snippet.contains('\u{3}'));
+        }
+        assert!(hits[0].snippet.to_lowercase().contains("hello"));
+        // The limit holds.
+        assert_eq!(search_messages(&db, "r", "hel", 1).await.unwrap().len(), 1);
+        // Only whitespace, or quote characters, is nothing to search for.
+        assert!(search_messages(&db, "r", "   ", 10).await.unwrap().is_empty());
+        assert!(search_messages(&db, "r", "\" \"", 10).await.unwrap().is_empty());
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn search_follows_edits_and_deletes() {
+        let (db, dir) = search_fixture("writes").await;
+        for (id, text) in [("m1", "hello world"), ("m2", "Hello there")] {
+            insert_message(
+                &db,
+                NewMessage {
+                    id,
+                    room_id: "r",
+                    kind: "human",
+                    author_id: "a",
+                    author_name: "A",
+                    content: text,
+                    ai_requested: false,
+                    anchor_id: None,
+                    model: None,
+                    reply_to: None,
+                    status: "complete",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        // Editing m2 away from the word: the old text stops matching, the new starts.
+        edit_message(&db, "m2", "rephrased entirely").await.unwrap();
+        let hits = search_messages(&db, "r", "hel", 10).await.unwrap();
+        assert_eq!(hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["m1"]);
+        let rephrased = search_messages(&db, "r", "rephras", 10).await.unwrap();
+        assert_eq!(rephrased.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["m2"]);
+        // Deleting a message takes it out of the results.
+        delete_message(&db, "m1").await.unwrap();
+        assert!(search_messages(&db, "r", "hel", 10).await.unwrap().is_empty());
+        assert!(search_messages(&db, "r", "rephras", 10).await.unwrap().len() == 1);
         db.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

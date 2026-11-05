@@ -30,10 +30,14 @@ pub enum ClientMsg {
     OpenRoom {
         room_id: String,
     },
-    /// Asks for the next page of history older than `before_seq`.
+    /// Asks for the next page of history older than `before_seq`. With
+    /// `until_seq`, the page reaches back far enough to include that message
+    /// (capped; the client asks again from there if it still isn't included).
     LoadOlder {
         room_id: String,
         before_seq: i64,
+        #[serde(default)]
+        until_seq: Option<i64>,
     },
     SendMessage {
         room_id: String,
@@ -118,6 +122,12 @@ pub enum ClientMsg {
         request_id: String,
         code: String,
     },
+    /// Full-text search over one room's message text.
+    SearchMessages {
+        request_id: String,
+        room_id: String,
+        query: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +155,12 @@ pub enum ServerMsg {
         room_id: String,
         messages: Vec<Message>,
         has_more: bool,
+    },
+    /// Answers `search_messages`: the room's hits, newest first.
+    SearchResults {
+        request_id: String,
+        room_id: String,
+        hits: Vec<SearchHit>,
     },
     Message {
         room_id: String,
@@ -304,6 +320,19 @@ pub struct Attachment {
 pub struct Reaction {
     pub emoji: String,
     pub user_ids: Vec<String>,
+}
+
+/// One full-text search hit. The `snippet` carries a fragment of the message
+/// text with the matched words wrapped in STX/ETX control characters, so
+/// clients can highlight them without parsing HTML.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct SearchHit {
+    pub id: String,
+    pub seq: i64,
+    pub kind: String,
+    pub author_name: String,
+    pub created_at: i64,
+    pub snippet: String,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
