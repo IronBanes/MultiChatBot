@@ -866,7 +866,9 @@ impl State {
                         })
                         .filter(|p| !p.id.is_empty() && !p.label.is_empty())
                         .collect();
-                    shared.dedup_by(|a, b| a.id == b.id);
+                    // Every repeat of an id, not just neighbouring ones.
+                    let mut seen = HashSet::new();
+                    shared.retain(|p| seen.insert(p.id.clone()));
                     shared.truncate(MAX_SHARED_PROFILES);
                     c.shared_profiles = shared;
                 }

@@ -327,6 +327,11 @@ export const useChat = create<ChatState>((set, get) => {
       fail("That AI profile isn't on this computer anymore");
       return;
     }
+    // Left the room meanwhile: opening it would fail without telling the asking device.
+    if (!get().rooms[roomId]) {
+      fail("This computer isn't in that room anymore");
+      return;
+    }
     // The room's messages aren't loaded here yet: ask for them and retry when
     // the history arrives (or give up if the connection drops first).
     if (!get().loaded[roomId]) {
@@ -564,7 +569,7 @@ export const useChat = create<ChatState>((set, get) => {
           // device: send it a `request_ai` instead of starting one here.
           const remote = parseRemoteProfileId(profileId);
           if (remote) {
-            relay?.send({
+            const asked = relay?.send({
               type: "request_ai",
               request_id: crypto.randomUUID(),
               room_id: m.room_id,
@@ -572,6 +577,7 @@ export const useChat = create<ChatState>((set, get) => {
               device_id: remote.deviceId,
               profile_id: remote.profileId,
             });
+            if (!asked) get().toast("Not connected to the server");
           } else {
             startAi(m.room_id, m, profileId);
           }
@@ -732,7 +738,8 @@ export const useChat = create<ChatState>((set, get) => {
         break;
       }
       case "devices":
-        set({ devices: msg.devices });
+        // An older relay may leave `profiles` out: treat that as sharing nothing.
+        set({ devices: msg.devices.map((d) => ({ ...d, profiles: d.profiles ?? [] })) });
         break;
       case "error": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
@@ -885,7 +892,7 @@ export const useChat = create<ChatState>((set, get) => {
       // With a remote profile id, the other device generates from the same anchor.
       const remote = parseRemoteProfileId(profileId);
       if (remote) {
-        relay?.send({
+        const asked = relay?.send({
           type: "request_ai",
           request_id: crypto.randomUUID(),
           room_id: ai.room_id,
@@ -893,6 +900,7 @@ export const useChat = create<ChatState>((set, get) => {
           device_id: remote.deviceId,
           profile_id: remote.profileId,
         });
+        if (!asked) get().toast("Not connected to the server");
         return;
       }
       startAi(ai.room_id, anchor, profileId);
