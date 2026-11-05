@@ -97,6 +97,9 @@ const FTS_SCHEMA: [&str; 4] = [
     END",
 ];
 
+/// Opens (or creates) the database at `path`: applies the schema and later column
+/// additions, creates the search index on first use (indexing existing messages),
+/// and marks replies left streaming by a previous run as interrupted.
 pub async fn connect(path: &str) -> anyhow::Result<Db> {
     let opts = SqliteConnectOptions::from_str(&format!("sqlite://{path}"))?
         .create_if_missing(true)
