@@ -222,6 +222,9 @@ fn resolve_key(state: &AppState, profile: &Profile, api_key: Option<String>) -> 
             // before pairing only at the profile's saved address (whether or not pairing
             // it there succeeds). Keychain errors are passed on, never read as "paired".
             let saved = state.snapshot()?.profiles.iter().find(|p| p.id == profile.id).map(|p| p.base_url.clone());
+            // Taking turns with saves: pairing an old key here must not overwrite a key
+            // a save is putting in place at the same moment.
+            let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
             secrets::get_key_for_form(&profile.id, &profile.base_url, saved.as_deref())
         }
         None => Ok(None),
@@ -299,15 +302,20 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     // The address changed but the key was kept: the user moved it on purpose, so pair
     // it with the new address (after the settings, so a failure here leaves the key
     // tied to the old address and refused, never sent somewhere unintended).
-    if !changing_key
-        && let Some(old) = old_endpoint.filter(|o| *o != saved.base_url)
-        && let Ok(Some(key)) = secrets::get_key(&saved.id, &old)
-        && secrets::set_key(&saved.id, &key, &saved.base_url).is_err()
-    {
-        return Err(format!(
-            "{} was saved, but its API key couldn't be moved to the new address. Enter the key again.",
-            saved.label
-        ));
+    if !changing_key && let Some(old) = old_endpoint.filter(|o| *o != saved.base_url) {
+        // A failed read counts as a failed move too: the save would otherwise look fine
+        // while the key stays tied to the old address (and a later save wouldn't retry).
+        let moved = match secrets::get_key(&saved.id, &old) {
+            Ok(Some(key)) => secrets::set_key(&saved.id, &key, &saved.base_url),
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if moved.is_err() {
+            return Err(format!(
+                "{} was saved, but its API key couldn't be moved to the new address. Enter the key again.",
+                saved.label
+            ));
+        }
     }
     Ok(view(saved))
 }
@@ -556,7 +564,8 @@ async fn test_mcp_server(
     validate_mcp(&server)?;
     // Stored secrets only go to the address they were saved for, even in a test.
     let merged = merge_secrets(&state, &server.id, &mcp_target(&normalized(&server)), secrets)?;
-    let mut probe = server.clone();
+    // Test exactly what would be saved (and what the secrets are paired with).
+    let mut probe = normalized(&server);
     if probe.id.is_empty() {
         probe.id = format!("test-{}", uuid::Uuid::new_v4());
     }
@@ -604,7 +613,11 @@ fn generate(
     let cfg = state.snapshot()?;
     let profile = state.profile(&profile_id)?;
     check_not_blocked(&state, &profile)?;
-    secrets::pair_legacy_key(&profile.id, &profile.base_url);
+    {
+        // Same as resolve_key: pairing takes turns with saves.
+        let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
+        secrets::pair_legacy_key(&profile.id, &profile.base_url);
+    }
     let key = secrets::get_key(&profile.id, &profile.base_url)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let prompt = context::build(&history, &room_prompt, profile.max_context_tokens);
