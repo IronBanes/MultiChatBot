@@ -374,19 +374,20 @@ impl State {
                     _ => db::messages_before(&self.db, &room_id, before_seq, OLDER_PAGE + 1).await?,
                 };
                 let has_more = match until_seq {
-                    // The capped page may still end short of the target.
-                    Some(until) if until < before_seq => {
-                        db::has_messages_before(&self.db, &room_id, messages[0].seq).await?
+                    // The stretch is sent whole; whether anything older remains is
+                    // asked directly (it may also have been capped short of the target).
+                    Some(until) if until < before_seq => match messages.first() {
+                        Some(m) => db::has_messages_before(&self.db, &room_id, m.seq).await?,
+                        None => false,
+                    },
+                    _ => {
+                        let more = messages.len() > OLDER_PAGE as usize;
+                        if more {
+                            messages.remove(0);
+                        }
+                        more
                     }
-                    _ => messages.len() > OLDER_PAGE as usize,
                 };
-                if let Some(until) = until_seq {
-                    if until >= before_seq || messages.len() > OLDER_PAGE as usize {
-                        messages.drain(..messages.len() - OLDER_PAGE as usize);
-                    }
-                } else if has_more {
-                    messages.remove(0);
-                }
                 self.send(conn, ServerMsg::OlderMessages { room_id, messages, has_more });
             }
 

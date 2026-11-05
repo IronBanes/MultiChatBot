@@ -742,10 +742,11 @@ export const useChat = create<ChatState>((set, get) => {
       }
       // Not loaded: fetch a page that reaches back to the message, then jump
       // (continueJump in the older_messages case finishes this).
-      if (s.loadingOlder[roomId] || !s.hasMore[roomId]) return;
       const first = s.messages[roomId]?.[0];
-      if (!first || seq >= first.seq) return;
+      if (!s.hasMore[roomId] || !first || seq >= first.seq) return;
       pendingJumps.set(roomId, { id: messageId, seq });
+      // A page is already on its way: continueJump picks the jump up when it lands.
+      if (s.loadingOlder[roomId]) return;
       const ok = relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq, until_seq: seq });
       if (!ok) pendingJumps.delete(roomId);
       else set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));

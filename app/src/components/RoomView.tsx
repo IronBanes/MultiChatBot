@@ -811,6 +811,8 @@ function MessageList({
   /** Distance from the bottom of the list, kept when the list is resized (window, or an
    *  on-screen keyboard opening) so the same messages stay in view. */
   const fromBottom = useRef(0);
+  /** Until when a jump's smooth scroll is running (onScroll leaves `stick` alone). */
+  const jumpingUntil = useRef(0);
   /** The first message's id as of the last render. A change (with the same room) means
    *  older messages were prepended, not that the list grew at the bottom. */
   const firstId = useRef<string | null>(null);
@@ -863,7 +865,9 @@ function MessageList({
     const el = ref.current;
     if (!el) return;
     fromBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight;
-    stick.current = fromBottom.current < 80;
+    // While a jump's smooth scroll runs, a scroll event still queued from before it (or
+    // the scroll's first frames, still near the bottom) must not pin the list again.
+    if (Date.now() >= jumpingUntil.current) stick.current = fromBottom.current < 80;
     // Scrolled up to (or near) the top: fetch the previous page of older messages.
     if (hasMore && !loadingOlder && el.scrollTop < 300) loadOlder(room.id);
   };
@@ -883,6 +887,7 @@ function MessageList({
     if (!el) return;
     // Jumping away from the bottom must not snap back on the next scroll effect.
     stick.current = false;
+    jumpingUntil.current = Date.now() + 1500;
     fromBottom.current = root ? root.scrollHeight - root.scrollTop - root.clientHeight : 0;
     el.scrollIntoView({ block: "center", behavior: "smooth" });
     el.classList.remove("flash-highlight");
@@ -1042,7 +1047,7 @@ function SearchPanel({ room, phone, onJump, onClose }: { room: RoomInfo; phone: 
   );
 
   const field = (
-    <div className="flex items-center gap-2 px-3 py-2">
+    <div className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2">
       <Icon name="search" size={15} className="shrink-0 text-zinc-400" />
       <input
         ref={input}

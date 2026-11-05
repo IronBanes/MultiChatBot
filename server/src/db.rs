@@ -329,25 +329,29 @@ pub async fn messages_before_until(
     context: i64,
     max_rows: i64,
 ) -> sqlx::Result<Vec<Message>> {
-    // The seq of the `context`-th message at or before the target: the page
-    // reaches down to it. None means the history runs out first.
+    // The seq of the `context`-th message older than the target: the page reaches
+    // down to it, one unbroken stretch. None means the history runs out first.
     let floor: Option<(i64,)> = sqlx::query_as(
-        "SELECT seq FROM messages WHERE room_id = ? AND seq <= ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
+        "SELECT seq FROM messages WHERE room_id = ? AND seq < ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
     )
     .bind(room_id)
     .bind(until_seq)
-    .bind(context - 1)
+    .bind((context - 1).max(0))
     .fetch_optional(db)
     .await?;
+    let floor = match floor {
+        Some((f,)) => f,
+        None if context > 0 => i64::MIN,
+        None => until_seq,
+    };
     let messages = sqlx::query_as(&format!(
         "SELECT * FROM (SELECT {MESSAGE_COLS} FROM messages
-         WHERE room_id = ? AND seq < ? AND (seq >= ? OR seq <= ?)
+         WHERE room_id = ? AND seq < ? AND seq >= ?
          ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
     ))
     .bind(room_id)
     .bind(before_seq)
-    .bind(until_seq)
-    .bind(floor.map_or(i64::MIN, |f| f.0))
+    .bind(floor)
     .bind(max_rows)
     .fetch_all(db)
     .await?;
@@ -952,6 +956,13 @@ mod tests {
             vec!["m4", "m5", "m6", "m7"]
         );
         assert!(has_messages_before(&db, "r", capped[0].seq).await.unwrap());
+        // Wider context: one unbroken stretch from three rows below the target (m6)
+        // up to the page start, with no gap between the context and the target.
+        let wide = messages_before_until(&db, "r", seq("m10"), seq("m6"), 3, 100).await.unwrap();
+        assert_eq!(
+            wide.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["m3", "m4", "m5", "m6", "m7", "m8", "m9"]
+        );
         db.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
