@@ -162,9 +162,10 @@ const unclaimedAttachments = new Map<string, Attachment[]>();
  *  reaches back to it is being fetched. */
 const pendingJumps = new Map<string, { id: string; seq: number }>();
 
-/** System notifications: room id → when the last one went out, and how many
- *  messages the 5-second window has held back since (counted into the next one). */
-const notifyState = new Map<string, { lastAt: number; held: number }>();
+/** System notifications: room id → when the last one went out, how many messages
+ *  have been held back since (counted into the next one), and whether one is
+ *  waiting on the permission ask. */
+const notifyState = new Map<string, { lastAt: number; held: number; pending: boolean }>();
 const NOTIFY_GAP = 5000;
 /** The OS permission this run: "unknown" until the first notification would be
  *  shown, then "granted", or "denied" (which stops every attempt until restart). */
@@ -173,6 +174,13 @@ let notifyPermission: "unknown" | "granted" | "denied" = "unknown";
 let notifyPermissionAsk: Promise<boolean> | null = null;
 /** Hooks notification clicks once; settles when the listener is in place. */
 let notifyClicks: Promise<unknown> | null = null;
+/** Saves of notification choices, run one at a time so the last choice wins. */
+let notifyWrites: Promise<unknown> = Promise.resolve();
+function queueNotifyWrite(write: () => Promise<void>): Promise<void> {
+  const run = notifyWrites.then(write);
+  notifyWrites = run.catch(() => {});
+  return run;
+}
 
 /** Adds attachments not already on the message, plus any waiting for it. */
 function withAttachments(m: Message, extra: Attachment[] = []): Message {
@@ -269,20 +277,24 @@ function hookNotificationClicks() {
  *  many messages piled up. */
 async function notifyRoom(get: () => ChatState, roomId: string, roomName: string, body: string) {
   const st = notifyState.get(roomId);
-  const now = Date.now();
-  if (st && now - st.lastAt < NOTIFY_GAP) {
-    notifyState.set(roomId, { lastAt: st.lastAt, held: st.held + 1 });
+  if (st && (st.pending || Date.now() - st.lastAt < NOTIFY_GAP)) {
+    notifyState.set(roomId, { ...st, held: st.held + 1 });
     return;
   }
-  // Claim the window before the permission ask, so messages arriving while the
-  // OS prompt is open fold into this notification instead of sending their own.
-  notifyState.set(roomId, { lastAt: now, held: st?.held ?? 0 });
+  // Claim the room before the permission ask, so messages arriving while the OS
+  // prompt is open fold into this notification instead of sending their own.
+  notifyState.set(roomId, { lastAt: Date.now(), held: st?.held ?? 0, pending: true });
   await hookNotificationClicks();
-  if (!(await notificationPermission(get))) return;
+  const allowed = await notificationPermission(get);
   const claimed = notifyState.get(roomId);
-  if (!claimed) return; // Left the room while the prompt was open.
+  if (!claimed) return; // Left the room during the wait.
+  // The room may have been set to Off during the wait; its text must not show.
+  if (!allowed || get().client?.notify_by_room[roomId] === "off") {
+    notifyState.set(roomId, { ...claimed, held: 0, pending: false });
+    return;
+  }
   const count = claimed.held + 1;
-  notifyState.set(roomId, { ...claimed, held: 0 });
+  notifyState.set(roomId, { lastAt: Date.now(), held: 0, pending: false });
   sendNotification({
     title: `#${roomName}`,
     body: count > 1 ? `${count} new messages` : body,
@@ -656,7 +668,7 @@ export const useChat = create<ChatState>((set, get) => {
         pendingDelegatedOpens.delete(msg.room_id);
         // The room is gone; its notification choice (and in-flight throttle) go too.
         notifyState.delete(msg.room_id);
-        backend.forgetRoomNotify(msg.room_id).catch(() => {});
+        queueNotifyWrite(() => backend.forgetRoomNotify(msg.room_id)).catch(() => {});
         set((s) => {
           const { [msg.room_id]: _, ...rooms } = s.rooms;
           const roomOrder = s.roomOrder.filter((id) => id !== msg.room_id);
@@ -1178,7 +1190,7 @@ export const useChat = create<ChatState>((set, get) => {
         const notify_by_room = mode === "mentions" ? rest : { ...rest, [roomId]: mode };
         return { client: { ...s.client, notify_by_room } };
       });
-      backend.setRoomNotify(roomId, mode).catch((e) => get().toast(errorText(e)));
+      queueNotifyWrite(() => backend.setRoomNotify(roomId, mode)).catch((e) => get().toast(errorText(e)));
     },
 
     async testNotification() {
