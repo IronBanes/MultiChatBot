@@ -898,11 +898,11 @@ function MessageList({
           older messages move up as new ones arrive. */}
       <div ref={content} className={`mx-auto max-w-4xl ${bubbles ? "flex min-h-full flex-col justify-end" : ""}`}>
         {!loaded && list.length === 0 && <div className="p-8 text-center text-sm text-zinc-400">Loading history…</div>}
-        {loaded && list.length > 0 && loadingOlder && (
-          <div className="pb-1 pt-3 text-center text-xs text-zinc-500">Loading earlier messages…</div>
-        )}
-        {loaded && list.length > 0 && !hasMore && !loadingOlder && (
-          <div className="pb-1 pt-3 text-center text-xs text-zinc-500">Start of #{room.name}</div>
+        {/* Always the same height, so the status changing doesn't move what you're reading. */}
+        {loaded && list.length > 0 && (
+          <div className="h-9 pt-3 text-center text-xs text-zinc-500">
+            {loadingOlder ? "Loading earlier messages…" : hasMore ? "" : `Start of #${room.name}`}
+          </div>
         )}
         {loaded && list.length === 0 && (
           <div className="mx-auto mt-16 max-w-sm px-6 text-center">

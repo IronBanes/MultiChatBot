@@ -236,13 +236,13 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
 // Older messages: a fresh room with 205 human messages pages its history.
 {
   alice.send({ type: "create_room", request_id: "r3", name: "Deep history" });
-  const big = await alice.wait(type("room_joined"), "room_joined (deep history)");
+  const big = await alice.wait(type("room_joined", (m) => m.request_id === "r3"), "room_joined (deep history)");
   const bigRoom = big.room;
   for (let i = 1; i <= 205; i++) {
     alice.send({ type: "send_message", room_id: bigRoom.id, id: uuid(), content: `m${i}`, ai_requested: false });
   }
   alice.send({ type: "open_room", room_id: bigRoom.id });
-  const hist = await alice.wait(type("room_history"), "room_history (paged)", 20000);
+  const hist = await alice.wait(type("room_history", (m) => m.room_id === bigRoom.id), "room_history (paged)", 20000);
   ok(hist.messages.length === 200 && hist.has_more === true, "room_history holds the newest 200 messages with has_more: true");
   ok(hist.messages[hist.messages.length - 1].content === "m205", "the history page ends at the newest message");
   const before = hist.messages[0].seq;
