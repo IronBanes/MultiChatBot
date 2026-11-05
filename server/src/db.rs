@@ -76,23 +76,30 @@ CREATE INDEX IF NOT EXISTS reactions_message ON reactions(message_id);
 /// `messages.content`, kept in sync by triggers. Deleting means issuing FTS5's
 /// special 'delete' command with the old row, because the content table (not the
 /// index) is the source of truth.
-const FTS_SCHEMA: &str = r#"
-CREATE VIRTUAL TABLE messages_fts USING fts5(
-    content, content='messages', content_rowid='seq',
-    tokenize='unicode61 remove_diacritics 2'
-);
-CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
-    INSERT INTO messages_fts(rowid, content) VALUES (new.seq, new.content);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.seq, old.content);
-END;
-CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content ON messages BEGIN
-    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.seq, old.content);
-    INSERT INTO messages_fts(rowid, content) VALUES (new.seq, new.content);
-END;
-"#;
+///
+/// One statement per entry, run with `sqlx::query` inside a transaction: `raw_sql`
+/// on a transaction makes `connect()`'s future non-`Send`, which the desktop app's
+/// relay host needs.
+const FTS_SCHEMA: [&str; 4] = [
+    "CREATE VIRTUAL TABLE messages_fts USING fts5(
+        content, content='messages', content_rowid='seq',
+        tokenize='unicode61 remove_diacritics 2'
+    )",
+    "CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, content) VALUES (new.seq, new.content);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.seq, old.content);
+    END",
+    "CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.seq, old.content);
+        INSERT INTO messages_fts(rowid, content) VALUES (new.seq, new.content);
+    END",
+];
 
+/// Opens (or creates) the database at `path`: applies the schema and later column
+/// additions, creates the search index on first use (indexing existing messages),
+/// and marks replies left streaming by a previous run as interrupted.
 pub async fn connect(path: &str) -> anyhow::Result<Db> {
     let opts = SqliteConnectOptions::from_str(&format!("sqlite://{path}"))?
         .create_if_missing(true)
@@ -128,10 +135,12 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
         // One transaction: if the rebuild fails, the table isn't left behind empty
         // (which would make the next start skip indexing the old messages).
         let mut tx = pool.begin().await?;
-        sqlx::raw_sql(FTS_SCHEMA)
-            .execute(&mut *tx)
-            .await
-            .context("creating messages_fts failed: this SQLite build lacks FTS5 (full-text search)")?;
+        for ddl in FTS_SCHEMA {
+            sqlx::query(ddl)
+                .execute(&mut *tx)
+                .await
+                .context("creating messages_fts failed: this SQLite build lacks FTS5 (full-text search)")?;
+        }
         sqlx::query("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
             .execute(&mut *tx)
             .await
