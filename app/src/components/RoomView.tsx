@@ -1583,8 +1583,7 @@ ${before}` : t);
   // --- @mentions ------------------------------------------------------------
   // Typing "@" offers the room's members and every AI profile this device can use;
   // picking one inserts "@Name ". A message mentioning one of those profiles is
-  // answered by that profile (even with the AI toggle off).
-  const choices = useProfileChoices();
+  // answered by that profile (even with the AI toggle off). `choices` is above.
   const myUserId = useChat((s) => s.client!.user_id);
   const [caret, setCaret] = useState(0);
   const [pick, setPick] = useState(0);
@@ -1605,10 +1604,18 @@ ${before}` : t);
     return options.length ? { start, options } : null;
   }, [text, caret, editing, dismissedAt, room.members, myUserId, choices]);
   useEffect(() => setPick(0), [mention?.start, mention?.options.length]);
+  // A dismissal only lasts while that "@…" is being typed; once it's gone (sent,
+  // deleted, or the caret moved off it) the next "@" gets the list again.
+  useEffect(() => {
+    if (dismissedAt >= 0 && !/(^|\s)@[^\n@]{0,40}$/.test(text.slice(0, caret))) setDismissedAt(-1);
+  }, [text, caret, dismissedAt]);
   const insertMention = (name: string) => {
     if (!mention) return;
     const next = `${text.slice(0, mention.start)}@${name} ${text.slice(caret)}`;
     const at = mention.start + name.length + 2;
+    // Picked: don't reopen for longer names that start the same ("Sam" → "Sam Smith"),
+    // or Enter would insert that instead of sending.
+    setDismissedAt(mention.start);
     onTextChange(next);
     setCaret(at);
     requestAnimationFrame(() => {
