@@ -534,6 +534,9 @@ export const useChat = create<ChatState>((set, get) => {
         const waiting = pendingDelegatedOpens.get(msg.room_id) ?? [];
         if (waiting.length) pendingDelegatedOpens.delete(msg.room_id);
         set((s) => {
+          // Left the room before its history arrived: don't keep (or mark loaded) a room
+          // this device is no longer in, or a rejoin would skip loading it fresh.
+          if (!s.rooms[msg.room_id]) return {};
           // Keep anything live that arrived after the history snapshot, including images
           // announced while the snapshot was being read.
           const current = s.messages[msg.room_id] ?? [];
@@ -560,6 +563,7 @@ export const useChat = create<ChatState>((set, get) => {
       }
       case "older_messages":
         set((s) => {
+          if (!s.rooms[msg.room_id]) return { loadingOlder: { ...s.loadingOlder, [msg.room_id]: false } };
           const current = s.messages[msg.room_id] ?? [];
           // Keep only what's older than the current first message; skip ids already
           // present (a duplicate answer to a retry, or a race with room_history).
