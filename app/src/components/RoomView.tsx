@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
-import { remoteProfileId } from "../store";
+import { mentions, remoteProfileId } from "../store";
 import type { Attachment, McpMode, Member, Message, RoomInfo, SearchHit, ToolActivity } from "../lib/types";
 import { useChat, type LocalTool } from "../store";
 import { confirmAction } from "./Confirm";
@@ -456,6 +456,7 @@ const MessageItem = memo(function MessageItem({
   compact,
   myProfileId,
   mine,
+  myName,
   bubbles,
   members,
   onEdit,
@@ -471,6 +472,8 @@ const MessageItem = memo(function MessageItem({
   compact: boolean;
   myProfileId: string | null;
   mine: boolean;
+  /** This user's display name: a message that @mentions it is highlighted. */
+  myName: string;
   /** Phone layout: chat bubbles, yours on the right. */
   bubbles: boolean;
   /** Room members, to name who reacted (stable reference from MessageList). */
@@ -515,9 +518,12 @@ const MessageItem = memo(function MessageItem({
     );
   }
 
+  const pingsMe = !mine && m.kind === "human" && mentions(m.content, myName);
+  const pingCls = pingsMe ? "bg-amber-50/80 shadow-[inset_3px_0_0_0_#f59e0b] dark:bg-amber-500/10" : "";
+
   if (m.kind === "human" && bubbles) {
     return (
-      <div data-message-id={m.id} className={`flex gap-2 px-3 ${mine ? "justify-end" : ""} ${compact ? "pt-0.5" : "pt-3"}`}>
+      <div data-message-id={m.id} className={`flex gap-2 px-3 ${mine ? "justify-end" : ""} ${compact ? "pt-0.5" : "pt-3"} ${pingCls}`}>
         {!mine && <div className="w-7 shrink-0">{!compact && <Avatar userId={m.author_id} name={m.author_name} size={28} />}</div>}
         <div className={`flex min-w-0 max-w-[80%] flex-col ${mine ? "items-end" : "items-start"}`}>
           {!compact && (
@@ -560,7 +566,7 @@ const MessageItem = memo(function MessageItem({
 
   if (m.kind === "human") {
     return (
-      <div data-message-id={m.id} className={`group relative flex gap-3 px-4 sm:px-5 ${compact ? "pt-0.5" : "pt-3"}`}>
+      <div data-message-id={m.id} className={`group relative flex gap-3 px-4 sm:px-5 ${compact ? "pt-0.5" : "pt-3"} ${pingCls}`}>
         <div className="w-8 shrink-0">{!compact && <Avatar userId={m.author_id} name={m.author_name} />}</div>
         <div className="min-w-0 flex-1">
           {!compact && (
@@ -801,6 +807,7 @@ function MessageList({
   const loadOlder = useChat((s) => s.loadOlder);
   const clearJump = useChat((s) => s.clearJump);
   const myId = useChat((s) => s.client!.user_id);
+  const myName = useChat((s) => s.client!.display_name);
   // Stable reference: MessageItem is memo'd, so it must not see a new array each render.
   const members = useMemo(() => room.members, [room.members]);
   const ref = useRef<HTMLDivElement>(null);
@@ -942,6 +949,7 @@ function MessageList({
               compact={compact}
               myProfileId={myProfileId}
               mine={m.author_id === myId}
+              myName={myName}
               bubbles={bubbles}
               members={members}
               onEdit={onEdit}
@@ -1577,6 +1585,91 @@ ${before}` : t);
     el.style.height = Math.min(el.scrollHeight, phone ? 140 : 220) + "px";
   }, [text, phone]);
 
+  // --- @mentions ------------------------------------------------------------
+  // Typing "@" offers the room's members and every AI profile this device can use;
+  // picking one inserts "@Name ". A message mentioning one of those profiles is
+  // answered by that profile (even with the AI toggle off). `choices` is above.
+  const myUserId = useChat((s) => s.client!.user_id);
+  const [caret, setCaret] = useState(0);
+  const [pick, setPick] = useState(0);
+  const [dismissedAt, setDismissedAt] = useState(-1);
+  const trackCaret = (e: React.SyntheticEvent<HTMLTextAreaElement>) => setCaret(e.currentTarget.selectionStart ?? 0);
+  const mention = useMemo(() => {
+    if (editing) return null;
+    const m = /(^|\s)@([^\n@]{0,40})$/.exec(text.slice(0, caret));
+    if (!m) return null;
+    const start = m.index + m[1].length;
+    if (start === dismissedAt) return null;
+    const q = m[2].toLowerCase();
+    const people = room.members
+      .filter((mb) => mb.user_id !== myUserId)
+      .map((mb) => ({ key: `u:${mb.user_id}`, name: mb.display_name, detail: mb.online ? "online" : "member" }));
+    const ais = choices.map((c) => ({ key: `p:${c.id}`, name: c.label, detail: `AI · ${c.detail}` }));
+    const options = [...people, ...ais].filter((o) => o.name.toLowerCase().startsWith(q)).slice(0, 6);
+    return options.length ? { start, options } : null;
+  }, [text, caret, editing, dismissedAt, room.members, myUserId, choices]);
+  useEffect(() => setPick(0), [mention?.start, mention?.options.length]);
+  // A dismissal only lasts while that "@…" is being typed; once it's gone (sent,
+  // deleted, or the caret moved off it) the next "@" gets the list again.
+  useEffect(() => {
+    if (dismissedAt >= 0 && !/(^|\s)@[^\n@]{0,40}$/.test(text.slice(0, caret))) setDismissedAt(-1);
+  }, [text, caret, dismissedAt]);
+  /** Label (lowercased) → the profile picked from the list for it, so two profiles
+   *  with the same label (one here, one on another device) stay apart on send. */
+  const pickedProfiles = useRef(new Map<string, string>());
+  const insertMention = (name: string, key?: string) => {
+    if (!mention) return;
+    if (key?.startsWith("p:")) pickedProfiles.current.set(name.toLowerCase(), key.slice(2));
+    const next = `${text.slice(0, mention.start)}@${name} ${text.slice(caret)}`;
+    const at = mention.start + name.length + 2;
+    // Picked: don't reopen for longer names that start the same ("Sam" → "Sam Smith"),
+    // or Enter would insert that instead of sending.
+    setDismissedAt(mention.start);
+    onTextChange(next);
+    setCaret(at);
+    requestAnimationFrame(() => {
+      ta.current?.focus();
+      ta.current?.setSelectionRange(at, at);
+    });
+  };
+  /** Arrow keys, Enter/Tab and Escape drive the mention list while it's open. */
+  const mentionKeys = (e: React.KeyboardEvent): boolean => {
+    if (!mention || e.nativeEvent.isComposing) return false;
+    const n = mention.options.length;
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      setPick((i) => (i + (e.key === "ArrowDown" ? 1 : n - 1)) % n);
+    } else if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
+      const o = mention.options[Math.min(pick, n - 1)];
+      insertMention(o.name, o.key);
+    } else if (e.key === "Escape") {
+      setDismissedAt(mention.start);
+    } else {
+      return false;
+    }
+    e.preventDefault();
+    return true;
+  };
+  const mentionMenu = mention && (
+    <div role="listbox" aria-label="Mention" className="mb-1 overflow-hidden rounded-xl border border-zinc-200 bg-white py-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+      {mention.options.map((o, i) => (
+        <button
+          key={o.key}
+          role="option"
+          aria-selected={i === pick}
+          // mousedown, not click: the textarea keeps focus and the caret stays put.
+          onMouseDown={(e) => {
+            e.preventDefault();
+            insertMention(o.name, o.key);
+          }}
+          className={`flex w-full items-center gap-2 px-3 text-left ${phone ? "min-h-11 py-2" : "py-1.5"} ${i === pick ? "bg-indigo-50 dark:bg-indigo-950/50" : ""}`}
+        >
+          <span className={`min-w-0 flex-1 truncate font-medium ${phone ? "text-[15px]" : "text-sm"}`}>@{o.name}</span>
+          <span className="shrink-0 truncate text-[11px] text-zinc-500">{o.detail}</span>
+        </button>
+      ))}
+    </div>
+  );
+
   const sending = useRef(false);
   const send = async () => {
     if (!text.trim() || status !== "online" || sending.current) return;
@@ -1594,11 +1687,22 @@ ${before}` : t);
     const sent = text;
     const reply = replyTo?.id ?? null;
     const typingAtSend = typingGeneration.current;
+    // "@<profile>" picks who answers (unless a member has that same name).
+    // The longest matching label wins ("@Sam Smith" also matches "Sam"), and the exact
+    // profile picked from the list wins over another with the same label.
+    const named = [...choices]
+      .sort((a, b) => b.label.length - a.label.length)
+      .find((c) => mentions(sent, c.label) && !room.members.some((mb) => mb.display_name.toLowerCase() === c.label.toLowerCase()));
+    const pickedId = named && pickedProfiles.current.get(named.label.toLowerCase());
+    const namedId = pickedId && choices.some((c) => c.id === pickedId) ? pickedId : named?.id;
+    const withAi = named ? true : ai;
+    const answerWith = namedId ?? profileId;
     sending.current = true;
     try {
       // Only clear the box once the message really went out. Text typed after the sent
       // part is kept; if the sent part itself was edited meanwhile, keep everything.
-      if (await sendMessage(room.id, sent, ai, ai ? profileId : null, reply)) {
+      if (await sendMessage(room.id, sent, withAi, withAi ? answerWith : null, reply)) {
+        pickedProfiles.current.clear();
         setText((t) => (t.startsWith(sent) ? t.slice(sent.length).trimStart() : t));
         if (reply) onClearReply();
         // Only if nothing was typed while it sent: newer text is still being typed.
@@ -1614,6 +1718,7 @@ ${before}` : t);
 
   // Escape cancels an edit or a reply-in-progress from the box itself.
   const onKeyDown = (e: React.KeyboardEvent) => {
+    if (mentionKeys(e)) return;
     if (e.key !== "Escape") return;
     if (editing) {
       e.preventDefault();
@@ -1663,6 +1768,7 @@ ${before}` : t);
     return (
       <div className="safe-bottom border-t border-zinc-200 px-2 pt-1.5 pb-[max(0.5rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
         {contextBar}
+        {mentionMenu}
         <button
           onClick={() => (anyProfile ? setSheet(true) : onOpenSettings("profiles"))}
           className="mb-1 flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-xs text-zinc-500 active:bg-zinc-100 dark:active:bg-zinc-800"
@@ -1686,7 +1792,11 @@ ${before}` : t);
             ref={ta}
             rows={1}
             value={text}
-            onChange={(e) => onTextChange(e.target.value)}
+            onChange={(e) => {
+              onTextChange(e.target.value);
+              trackCaret(e);
+            }}
+            onSelect={trackCaret}
             onKeyDown={onKeyDown}
             placeholder={editing ? "Edit your message" : ai ? `Message #${room.name}` : `Message #${room.name} — humans only`}
             className="block min-h-10 min-w-0 flex-1 resize-none rounded-[20px] border border-zinc-300 bg-white px-4 py-2 text-[16px] leading-snug outline-none placeholder:text-zinc-400 focus:border-indigo-500 dark:border-zinc-700 dark:bg-zinc-900"
@@ -1718,12 +1828,18 @@ ${before}` : t);
     <div className="border-t border-zinc-200 px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:px-4 sm:pb-[max(1rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
       <div className="mx-auto max-w-4xl rounded-2xl border border-zinc-300 bg-white shadow-sm transition focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-500/20 dark:border-zinc-700 dark:bg-zinc-900">
         {contextBar && <div className="px-4 pt-2.5">{contextBar}</div>}
+        {mentionMenu && <div className="px-2 pt-2">{mentionMenu}</div>}
         <textarea
           ref={ta}
           rows={1}
           value={text}
-          onChange={(e) => onTextChange(e.target.value)}
+          onChange={(e) => {
+            onTextChange(e.target.value);
+            trackCaret(e);
+          }}
+          onSelect={trackCaret}
           onKeyDown={(e) => {
+            if (mentionKeys(e)) return;
             if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault();
               send();

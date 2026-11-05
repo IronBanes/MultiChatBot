@@ -40,6 +40,8 @@ interface ChatState {
   roomOrder: string[];
   messages: Record<string, Message[]>;
   loaded: Record<string, boolean>;
+  /** Room id → true when a message there mentioned this user since the room was last open. */
+  mentioned: Record<string, boolean>;
   /** Room id → whether older messages exist before the first one loaded. */
   hasMore: Record<string, boolean>;
   /** Room id → whether an older-messages request is in flight. */
@@ -116,6 +118,15 @@ const pendingAi = new Map<string, string>();
 
 /** The relay's answer to a `hello` whose account secret is wrong (see server `hello`). */
 export const SIGN_IN_REFUSED = /isn't signed in to that account/;
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** True when `content` mentions `name` as `@name` (case-insensitive, not followed by
+ *  more of a word, so "@Sam" doesn't match "@Samantha"). Names may contain spaces. */
+export function mentions(content: string, name: string): boolean {
+  if (!name.trim()) return false;
+  return new RegExp(`(^|[^\\p{L}\\p{N}_])@${escapeRe(name.trim())}(?![\\p{L}\\p{N}_])`, "iu").test(content);
+}
 
 /** A profile on another of this user's devices is referenced as `remote:<device_id>:<profile_id>`. */
 export function remoteProfileId(deviceId: string, profileId: string): string {
@@ -617,7 +628,12 @@ export const useChat = create<ChatState>((set, get) => {
         const mine = m.author_id === get().client?.user_id;
         // Their message arrived: they're not typing anymore.
         const typingGone = m.kind === "human" ? dropTyping(get(), m.room_id, m.author_id) : {};
+        // Someone @mentioned me in a room I'm not looking at: mark it in the room list.
+        const me = get().client;
+        const pinged =
+          !mine && m.kind === "human" && get().activeRoomId !== m.room_id && !!me && mentions(m.content, me.display_name);
         set((s) => ({
+          ...(pinged ? { mentioned: { ...s.mentioned, [m.room_id]: true } } : {}),
           messages: { ...s.messages, [m.room_id]: upsert(s.messages[m.room_id], m) },
           unread:
             s.activeRoomId === m.room_id || (mine && m.kind === "human")
@@ -821,6 +837,7 @@ export const useChat = create<ChatState>((set, get) => {
     roomOrder: [],
     messages: {},
     loaded: {},
+    mentioned: {},
     hasMore: {},
     loadingOlder: {},
     unread: {},
@@ -871,6 +888,7 @@ export const useChat = create<ChatState>((set, get) => {
         activeRoomId: id,
         roomClosed: false,
         unread: { ...s.unread, [id]: 0 },
+        mentioned: s.mentioned[id] ? { ...s.mentioned, [id]: false } : s.mentioned,
         jumpTarget: s.jumpTarget?.roomId === id ? s.jumpTarget : null,
       }));
       if (!get().loaded[id]) relay?.send({ type: "open_room", room_id: id });
