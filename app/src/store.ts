@@ -475,9 +475,17 @@ export const useChat = create<ChatState>((set, get) => {
         set((s) => {
           const { [msg.room_id]: _, ...rooms } = s.rooms;
           const roomOrder = s.roomOrder.filter((id) => id !== msg.room_id);
+          // Forget the room's cached history too: if the account rejoins later, it loads
+          // fresh instead of showing (or generating from) messages that changed meanwhile.
+          const { [msg.room_id]: _m, ...messages } = s.messages;
+          const { [msg.room_id]: _l, ...loaded } = s.loaded;
+          const { [msg.room_id]: _h, ...hasMore } = s.hasMore;
           return {
             rooms,
             roomOrder,
+            messages,
+            loaded,
+            hasMore,
             activeRoomId: s.activeRoomId === msg.room_id ? (roomOrder[0] ?? null) : s.activeRoomId,
           };
         });
