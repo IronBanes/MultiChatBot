@@ -689,7 +689,7 @@ const MessageItem = memo(function MessageItem({
       )}
       {!streaming && myProfileId && anchor && !anchor.deleted && (
         <button onClick={() => regenerate(m, myProfileId)} className={actionCls}>
-          <Icon name="refresh" size={12} /> {bubbles ? "Regenerate" : "Regenerate with my profile"}
+          <Icon name="refresh" size={12} /> {bubbles || myProfileId.startsWith("remote:") ? "Regenerate" : "Regenerate with my profile"}
         </button>
       )}
     </>
