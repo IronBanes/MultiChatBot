@@ -2,7 +2,7 @@
 
 use crate::db::{self, Db, NewMessage};
 use crate::db::AiResult;
-use crate::protocol::{Attachment, ClientMsg, Device, Member, RoomInfo, ServerMsg, ToolActivity};
+use crate::protocol::{Attachment, ClientMsg, Device, Member, RoomInfo, ServerMsg, SharedProfile, ToolActivity};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,6 +26,8 @@ const MAX_SEARCH_HITS: usize = 50;
 /// Characters kept from a `search_messages` query.
 const MAX_SEARCH_QUERY: usize = 200;
 const MAX_TOOL_CALLS: usize = 100;
+/// Profiles one connection may share with the user's other devices.
+const MAX_SHARED_PROFILES: usize = 50;
 const MAX_ATTACHMENTS: usize = 8;
 /// Distinct emoji one message accepts across all members.
 const MAX_REACTION_EMOJI: usize = 20;
@@ -40,6 +42,8 @@ const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/
 const LINK_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Failed link-code redeems allowed per connection before further tries are refused.
 const MAX_FAILED_REDEEMS: u32 = 5;
+/// Longest account secret `hello` accepts (the app sends 64 hex characters).
+const MAX_SECRET: usize = 256;
 /// Minimum gap between two accepted `typing: true` frames from one connection.
 const TYPING_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -47,10 +51,15 @@ pub type ConnId = u64;
 
 struct Conn {
     user_id: Option<String>,
+    /// Set when `welcome` was sent: before that, room notifications would arrive ahead of
+    /// the room list they belong after.
+    welcomed: bool,
     display_name: String,
     device_id: String,
     device_name: String,
     platform: String,
+    /// Profiles this connection shared for the user's other devices to generate with.
+    shared_profiles: Vec<SharedProfile>,
     failed_redeems: u32,
     /// When this connection last had a `typing: true` accepted (server-side throttle).
     last_typing: Option<Instant>,
@@ -75,6 +84,9 @@ struct Stream {
 struct LinkCode {
     user_id: String,
     display_name: String,
+    /// The account's secret, given to the device that redeems the code. Held in
+    /// memory only, for the code's ten minutes.
+    secret: String,
     expires: Instant,
 }
 
@@ -93,9 +105,11 @@ impl Hub {
             .any(|c| c.user_id.as_deref() == Some(user_id) && c.rooms.contains(room_id))
     }
 
-    fn send(&self, conn_id: ConnId, msg: &ServerMsg) {
-        if let Some(c) = self.conns.get(&conn_id) {
-            let _ = c.tx.send(serde_json::to_string(msg).expect("serializable"));
+    /// Queues `msg` for one connection. False when it's gone (or its queue closed).
+    fn send(&self, conn_id: ConnId, msg: &ServerMsg) -> bool {
+        match self.conns.get(&conn_id) {
+            Some(c) => c.tx.send(serde_json::to_string(msg).expect("serializable")).is_ok(),
+            None => false,
         }
     }
 
@@ -109,15 +123,20 @@ impl Hub {
     /// Sends the user's currently online devices to every one of their connections.
     fn send_devices(&self, user_id: &str) {
         let mut seen = HashSet::new();
-        let mut devices: Vec<Device> = self
-            .conns
-            .values()
+        // Newest connection first, so for a device with several (a reconnect in
+        // progress) the newest one's shared profiles win.
+        let mut conns: Vec<(&ConnId, &Conn)> = self.conns.iter().collect();
+        conns.sort_by(|a, b| b.0.cmp(a.0));
+        let mut devices: Vec<Device> = conns
+            .into_iter()
+            .map(|(_, c)| c)
             .filter(|c| c.user_id.as_deref() == Some(user_id) && !c.device_id.is_empty())
             .filter(|c| seen.insert(c.device_id.clone()))
             .map(|c| Device {
                 device_id: c.device_id.clone(),
                 device_name: c.device_name.clone(),
                 platform: c.platform.clone(),
+                profiles: c.shared_profiles.clone(),
             })
             .collect();
         devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
@@ -125,6 +144,29 @@ impl Hub {
         for c in self.conns.values().filter(|c| c.user_id.as_deref() == Some(user_id)) {
             let _ = c.tx.send(text.clone());
         }
+    }
+
+    /// The first connection of `user_id`'s device `device_id` that is in `room_id`
+    /// (and isn't `except`): the one an `ai_requested` goes to.
+    fn device_conn_in_room(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        room_id: &str,
+        except: Option<ConnId>,
+    ) -> Option<ConnId> {
+        // The newest connection of the device (highest id): during a reconnect the
+        // old one may still be registered.
+        self.conns
+            .iter()
+            .filter(|(id, _)| Some(**id) != except)
+            .filter(|(_, c)| {
+                c.user_id.as_deref() == Some(user_id)
+                    && c.device_id == device_id
+                    && c.rooms.contains(room_id)
+            })
+            .map(|(id, _)| *id)
+            .max()
     }
 }
 
@@ -137,6 +179,10 @@ pub struct State {
     /// every client in the order they were written, and a history snapshot read before
     /// an update is always delivered before it, never after.
     updates_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held in `hello` from the secret check until the connection is bound to the
+    /// account, so a claim can't slip between an older client's check and its bind
+    /// (the claim's sign-out would miss a connection not bound yet).
+    auth_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -149,7 +195,7 @@ fn err(request_id: Option<String>, message: impl Into<String>) -> ServerMsg {
 
 impl State {
     pub fn new(db: Db) -> Self {
-        Self { db, hub: Arc::new(Mutex::new(Hub::default())), updates_lock: Default::default() }
+        Self { db, hub: Arc::new(Mutex::new(Hub::default())), updates_lock: Default::default(), auth_lock: Default::default() }
     }
 
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
@@ -164,10 +210,12 @@ impl State {
             id,
             Conn {
                 user_id: None,
+                welcomed: false,
                 display_name: String::new(),
                 device_id: String::new(),
                 device_name: String::new(),
                 platform: String::new(),
+                shared_profiles: Vec::new(),
                 failed_redeems: 0,
                 last_typing: None,
                 typing_rooms: HashSet::new(),
@@ -219,6 +267,24 @@ impl State {
     }
 
     /// Subscribes every connection of `user_id` to `room_id` and announces presence.
+    /// Answers a create/join on `conn`, and tells the user's other connections
+    /// (linked devices) about the room too, without a request id, so they list it
+    /// and know its details (such as the system prompt) without reconnecting.
+    fn room_joined(&self, conn: ConnId, user_id: &str, request_id: String, room: RoomInfo) {
+        let others: Vec<ConnId> = self
+            .hub()
+            .conns
+            .iter()
+            // Not-yet-welcomed connections get the room in their welcome instead.
+            .filter(|(id, c)| **id != conn && c.welcomed && c.user_id.as_deref() == Some(user_id))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in others {
+            self.send(id, ServerMsg::RoomJoined { request_id: None, room: room.clone() });
+        }
+        self.send(conn, ServerMsg::RoomJoined { request_id: Some(request_id), room });
+    }
+
     fn subscribe_user(&self, user_id: &str, room_id: &str) {
         let mut hub = self.hub();
         let was_online = hub.is_online(user_id, room_id);
@@ -243,8 +309,8 @@ impl State {
     }
 
     async fn dispatch(&self, conn: ConnId, msg: ClientMsg) -> sqlx::Result<()> {
-        if let ClientMsg::Hello { user_id, display_name, device_id, device_name, platform } = msg {
-            return self.hello(conn, user_id, display_name, device_id, device_name, platform).await;
+        if let ClientMsg::Hello { user_id, display_name, device_id, device_name, platform, secret } = msg {
+            return self.hello(conn, user_id, display_name, device_id, device_name, platform, secret).await;
         }
         let Some((user_id, display_name)) = self.identity(conn) else {
             self.send(conn, err(None, "Send hello first"));
@@ -255,6 +321,9 @@ impl State {
             ClientMsg::Hello { .. } => unreachable!(),
 
             ClientMsg::CreateRoom { request_id, name } => {
+                // Ordered with LeaveRoom (same lock), so a leave can't land between the
+                // subscription and the room_joined notifications.
+                let _ordered = self.updates_lock.lock().await;
                 let name = clip(&name, MAX_ROOM_NAME);
                 if name.is_empty() {
                     self.send(conn, err(Some(request_id), "Room name is required"));
@@ -263,11 +332,13 @@ impl State {
                 let room_id = db::create_room(&self.db, &name, &user_id).await?;
                 self.subscribe_user(&user_id, &room_id);
                 if let Some(room) = self.room_info(&room_id).await? {
-                    self.send(conn, ServerMsg::RoomJoined { request_id: Some(request_id), room });
+                    self.room_joined(conn, &user_id, request_id, room);
                 }
             }
 
             ClientMsg::JoinRoom { request_id, invite_code } => {
+                // Ordered with LeaveRoom, like CreateRoom.
+                let _ordered = self.updates_lock.lock().await;
                 let code = invite_code.trim().to_uppercase();
                 let Some(room_id) = db::room_id_by_code(&self.db, &code).await? else {
                     self.send(conn, err(Some(request_id), "No room with that invite code"));
@@ -289,7 +360,7 @@ impl State {
                 }
                 self.subscribe_user(&user_id, &room_id);
                 if let Some(room) = self.room_info(&room_id).await? {
-                    self.send(conn, ServerMsg::RoomJoined { request_id: Some(request_id), room });
+                    self.room_joined(conn, &user_id, request_id, room);
                 }
             }
 
@@ -297,6 +368,9 @@ impl State {
                 if !self.in_room(conn, &room_id) {
                     return Ok(());
                 }
+                // Under the updates lock, so a connection catching up after its welcome
+                // can't subscribe to this room again between the delete and the unsubscribe.
+                let _ordered = self.updates_lock.lock().await;
                 db::remove_member(&self.db, &room_id, &user_id).await?;
                 let mut hub = self.hub();
                 let mine: Vec<ConnId> = hub
@@ -787,17 +861,109 @@ impl State {
                 self.broadcast(&room_id, ServerMsg::MessageUpdated { room_id: room_id.clone(), message });
             }
 
-            ClientMsg::CreateLinkCode { request_id } => {
+            ClientMsg::ShareProfiles { profiles } => {
+                if let Some(c) = self.hub().conns.get_mut(&conn) {
+                    let mut shared: Vec<SharedProfile> = profiles
+                        .into_iter()
+                        .take(MAX_SHARED_PROFILES)
+                        .map(|p| SharedProfile {
+                            id: clip(&p.id, 100),
+                            label: clip(&p.label, MAX_NAME),
+                            model: clip(&p.model, 120),
+                        })
+                        .filter(|p| !p.id.is_empty() && !p.label.is_empty())
+                        .collect();
+                    // Every repeat of an id, not just neighbouring ones.
+                    let mut seen = HashSet::new();
+                    shared.retain(|p| seen.insert(p.id.clone()));
+                    shared.truncate(MAX_SHARED_PROFILES);
+                    c.shared_profiles = shared;
+                }
+                // The user's devices changed what they can pick from.
+                let hub = self.hub();
+                if let Some(user_id) = hub.conns.get(&conn).and_then(|c| c.user_id.clone()) {
+                    hub.send_devices(&user_id);
+                }
+            }
+
+            ClientMsg::RequestAi { request_id, room_id, anchor_id, device_id, profile_id } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(Some(request_id), "Not a member of that room"));
+                    return Ok(());
+                }
+                let anchor = db::message(&self.db, &anchor_id).await?;
+                let Some(anchor_seq) =
+                    anchor.filter(|a| a.room_id == room_id && a.kind == "human" && !a.deleted).map(|a| a.seq)
+                else {
+                    self.send(conn, err(Some(request_id), "That message isn't in this room"));
+                    return Ok(());
+                };
+                // Pick the target and forward under one hub lock, so it can't disconnect
+                // in between; if it's gone anyway, the asking device hears so.
+                let hub = self.hub();
+                // Only an online connection of this same user's device that is in the
+                // room counts, never the connection that asked.
+                let target = hub.device_conn_in_room(&user_id, &device_id, &room_id, Some(conn));
+                let from_device_id = hub.conns.get(&conn).map(|c| c.device_id.clone()).unwrap_or_default();
+                // Ephemeral: forwarded, never stored.
+                let delivered = target.is_some_and(|t| {
+                    hub.send(
+                        t,
+                        &ServerMsg::AiRequested {
+                            request_id: request_id.clone(),
+                            room_id,
+                            anchor_id,
+                            anchor_seq,
+                            profile_id,
+                            from_device_id,
+                        },
+                    )
+                });
+                if !delivered {
+                    hub.send(conn, &err(Some(request_id), "That device is offline"));
+                }
+            }
+
+            ClientMsg::AiRequestFailed { request_id, to_device_id, message } => {
+                let hub = self.hub();
+                let msg = err(Some(request_id), clip(&message, MAX_ERROR));
+                // Back to the asking device's connections only, and only within
+                // this user — another user's device ids can't be reached.
+                for id in hub
+                    .conns
+                    .iter()
+                    .filter(|(_, c)| {
+                        c.user_id.as_deref() == Some(user_id.as_str()) && c.device_id == to_device_id
+                    })
+                    .map(|(id, _)| *id)
+                {
+                    hub.send(id, &msg);
+                }
+            }
+
+            ClientMsg::CreateLinkCode { request_id, secret } => {
+                // The code hands the account's secret to the linked device, so it must
+                // be the account's real one.
+                let real = db::stored_secret_hash(&self.db, &user_id).await?.flatten();
+                if secret.is_empty() || real != Some(db::secret_hash(&secret)) {
+                    self.send(conn, err(Some(request_id), "Update the app to link devices"));
+                    return Ok(());
+                }
                 let mut hub = self.hub();
                 hub.link_codes.retain(|_, c| c.expires > Instant::now());
                 // One live code per user: a fresh code replaces the previous one.
                 hub.link_codes.retain(|_, c| c.user_id != user_id);
-                let code = db::invite_code();
+                // Longer than room codes: a code hands over the account's secret, and with
+                // 31^8 (~850 billion) possibilities guessing one within its ten minutes is
+                // hopeless even across many connections, without a relay-wide limit that
+                // one guesser could use to block everyone's linking.
+                let code = db::random_code(8);
                 hub.link_codes.insert(
                     code.clone(),
                     LinkCode {
                         user_id: user_id.clone(),
                         display_name: display_name.clone(),
+                        secret,
                         expires: Instant::now() + LINK_CODE_TTL,
                     },
                 );
@@ -827,9 +993,11 @@ impl State {
                 };
                 // Clone the owner out of the map so the else branch can mutably
                 // borrow the hub (the map borrow ends with this statement).
-                let link =
-                    hub.link_codes.get(&code).map(|l| (l.user_id.clone(), l.display_name.clone()));
-                let Some((owner_id, owner_name)) = link else {
+                let link = hub
+                    .link_codes
+                    .get(&code)
+                    .map(|l| (l.user_id.clone(), l.display_name.clone(), l.secret.clone()));
+                let Some((owner_id, owner_name, owner_secret)) = link else {
                     miss(&mut hub);
                     hub.send(
                         conn,
@@ -848,6 +1016,7 @@ impl State {
                     request_id,
                     user_id: owner_id,
                     display_name: owner_name,
+                    secret: owner_secret,
                 };
                 hub.send(conn, &msg);
             }
@@ -864,6 +1033,7 @@ impl State {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn hello(
         &self,
         conn: ConnId,
@@ -872,6 +1042,7 @@ impl State {
         device_id: String,
         device_name: String,
         platform: String,
+        secret: String,
     ) -> sqlx::Result<()> {
         let display_name = clip(&display_name, MAX_NAME);
         let device_name = clip(&device_name, MAX_NAME);
@@ -884,6 +1055,47 @@ impl State {
         if let Some((existing, _)) = self.identity(conn) {
             if existing != user_id {
                 self.send(conn, err(None, "Cannot change user on an open connection"));
+                return Ok(());
+            }
+        }
+        // The account's secret decides whether this connection may be `user_id`:
+        // the id alone is visible to every room member, so it proves nothing.
+        if secret.len() > MAX_SECRET {
+            self.send(conn, err(None, "That account secret is too long"));
+            return Ok(());
+        }
+        let auth = self.auth_lock.lock().await;
+        match db::check_secret(&self.db, &user_id, &display_name, &secret).await? {
+            db::SecretCheck::Ok => {}
+            db::SecretCheck::Claimed => {
+                // Until now the account had no secret, so any connection already signed in
+                // as it never proved one: sign those out; they can reconnect with the secret.
+                let mut hub = self.hub();
+                let others: Vec<ConnId> = hub
+                    .conns
+                    .iter()
+                    .filter(|(id, c)| **id != conn && c.user_id.as_deref() == Some(user_id.as_str()))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in others {
+                    if let Some(c) = hub.conns.get_mut(&id) {
+                        c.user_id = None;
+                        c.welcomed = false;
+                        c.rooms.clear();
+                        c.typing_rooms.clear();
+                        c.shared_profiles.clear();
+                    }
+                    hub.send(id, &err(None, "This device isn't signed in to that account. Link it again from a device on the account."));
+                }
+            }
+            db::SecretCheck::Legacy => {
+                tracing::warn!("hello without an account secret for {user_id} (older client)");
+            }
+            db::SecretCheck::Wrong => {
+                self.send(
+                    conn,
+                    err(None, "This device isn't signed in to that account. Link it again from a device on the account."),
+                );
                 return Ok(());
             }
         }
@@ -908,6 +1120,8 @@ impl State {
             }
             newly
         };
+        // Bound: a claim from here on will see (and sign out) this connection.
+        drop(auth);
 
         let renamed = prev_name.is_some_and(|p| p != display_name);
         {
@@ -938,9 +1152,39 @@ impl State {
                 rooms.push(info);
             }
         }
-        self.send(conn, ServerMsg::Welcome { user_id: user_id.clone(), rooms });
-        let hub = self.hub();
-        hub.send_devices(&user_id);
+        {
+            let mut hub = self.hub();
+            // Sent and marked together under the lock, so a room_joined either goes out
+            // after this welcome or is skipped because the room is already in it.
+            hub.send(conn, &ServerMsg::Welcome { user_id: user_id.clone(), rooms });
+            if let Some(c) = hub.conns.get_mut(&conn) {
+                c.welcomed = true;
+            }
+            hub.send_devices(&user_id);
+        }
+        // A room another device created or joined while this welcome was being built is
+        // in neither the welcome nor a room_joined (this connection wasn't welcomed yet).
+        for id in db::user_room_ids(&self.db, &user_id).await? {
+            if room_ids.contains(&id) {
+                continue;
+            }
+            // Same lock as LeaveRoom, and membership checked again inside it, so a room
+            // left meanwhile isn't subscribed again.
+            let _ordered = self.updates_lock.lock().await;
+            if !db::is_member(&self.db, &id, &user_id).await? {
+                continue;
+            }
+            if let Some(room) = self.room_info(&id).await? {
+                // Subscribe and announce in one step under the hub lock, so nothing can
+                // pick this connection for the room before it has heard about it. The
+                // account's other connections were subscribed when the room was joined.
+                let mut hub = self.hub();
+                if let Some(c) = hub.conns.get_mut(&conn) {
+                    c.rooms.insert(id.clone());
+                }
+                hub.send(conn, &ServerMsg::RoomJoined { request_id: None, room });
+            }
+        }
         Ok(())
     }
 

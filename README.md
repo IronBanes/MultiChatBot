@@ -81,7 +81,9 @@ To use your phone as the same person as your computer, link them. On the compute
 **Settings → General → Devices → Create code**. On the phone, enter that code under
 **Link to another device**. The phone then shows the computer's rooms, and its messages
 count as yours. Codes work once and expire after 10 minutes. **Unlink** returns the phone
-to its own account and rooms. AI profiles and MCP servers stay on each device for now.
+to its own account and rooms. A linked phone can also use the computer's AI profiles
+while the computer is online — pick one labelled "· on <device>" and the computer
+generates the reply with its own keys.
 
 ### Playing with a friend
 
@@ -418,6 +420,11 @@ message, generated with your own model.
 
 ## Security notes
 
+- Each account has a secret kept in the OS keychain, and the relay checks it on every
+  connection, so knowing someone's user id isn't enough to sign in as them. Linking a
+  device hands it the secret; unlinking removes it. The app sends the secret on every
+  connection, and plain `ws://` sends it unencrypted, so use `wss://` for any relay
+  outside your local network.
 - Each API key is stored together with the address it was saved for, and MCP env vars and
   headers with their server's URL or command. The app won't send them anywhere else, even
   after a save that failed part-way and a restart. Changing a profile's address keeps its
@@ -437,6 +444,5 @@ message, generated with your own model.
 - On Android keys are not in a hardware-backed keystore: they sit in plain JSON in the
   app's private storage. Other apps can't read that, but a rooted phone or a debug build
   can.
-- v1 has no accounts. Anyone with an invite code can join that room, and a user id is
-  just a locally generated UUID. Run the relay only where you trust the network, or put
-  it behind TLS (`wss://`) and a reverse proxy.
+- Anyone with an invite code can join that room. Run the relay only where you trust the
+  network, or put it behind TLS (`wss://`) and a reverse proxy.

@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
+import { remoteProfileId } from "../store";
 import type { Attachment, McpMode, Member, Message, RoomInfo, SearchHit, ToolActivity } from "../lib/types";
 import { useChat, type LocalTool } from "../store";
 import { confirmAction } from "./Confirm";
@@ -481,7 +482,6 @@ const MessageItem = memo(function MessageItem({
   /** Scroll a reply's quote to the message it answers. */
   onJump: (id: string) => void;
 }) {
-  const regenerate = useChat((s) => s.regenerate);
   const stopAi = useChat((s) => s.stopAi);
   const deleteMessage = useChat((s) => s.deleteMessage);
   const answerToolCall = useChat((s) => s.answerToolCall);
@@ -687,9 +687,7 @@ const MessageItem = memo(function MessageItem({
         </button>
       )}
       {!streaming && myProfileId && anchor && !anchor.deleted && (
-        <button onClick={() => regenerate(m, myProfileId)} className={actionCls}>
-          <Icon name="refresh" size={12} /> {bubbles ? "Regenerate" : "Regenerate with my profile"}
-        </button>
+        <RegenerateButton m={m} myProfileId={myProfileId} bubbles={bubbles} className={actionCls} />
       )}
     </>
   );
@@ -1097,6 +1095,93 @@ function SearchPanel({ room, phone, onJump, onClose }: { room: RoomInfo; phone: 
 let lastTypingTrueAt = 0;
 const RELAY_TYPING_GAP = 1100;
 
+/** Every profile this device can answer with: its own, then those its user's other
+ *  online devices share (as `remote:<device>:<profile>` ids). */
+function useProfileChoices() {
+  const profiles = useChat((s) => s.client!.profiles);
+  const devices = useChat((s) => s.devices);
+  const myDeviceId = useChat((s) => s.client!.device_id);
+  return useMemo(
+    () => [
+      ...profiles.map((p) => ({ id: p.id, label: p.label, model: p.model, detail: p.model, remote: false, device: "" })),
+      ...devices
+        .filter((d) => d.device_id !== myDeviceId)
+        .flatMap((d) =>
+          d.profiles.map((p) => ({
+            id: remoteProfileId(d.device_id, p.id),
+            label: p.label,
+            model: p.model,
+            detail: `on ${d.device_name}`,
+            remote: true,
+            device: d.device_name,
+          })),
+        ),
+    ],
+    [profiles, devices, myDeviceId],
+  );
+}
+
+/** Regenerate an AI reply with the room's chosen profile, or (from the menu) with any
+ *  other one, so models can be compared side by side on the same message. Its own
+ *  component so profile and device updates don't re-render the message rows. */
+function RegenerateButton({ m, myProfileId, bubbles, className }: { m: Message; myProfileId: string; bubbles: boolean; className: string }) {
+  const regenerate = useChat((s) => s.regenerate);
+  const choices = useProfileChoices();
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: PointerEvent) => {
+      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+    };
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", esc);
+    };
+  }, [open]);
+  const run = (profileId: string) => {
+    setOpen(false);
+    regenerate(m, profileId);
+  };
+  return (
+    <span ref={box} className="relative flex items-center">
+      <button onClick={() => run(myProfileId)} className={className}>
+        <Icon name="refresh" size={12} /> {bubbles || myProfileId.startsWith("remote:") ? "Regenerate" : "Regenerate with my profile"}
+      </button>
+      {choices.length > 1 && (
+        <button onClick={() => setOpen((o) => !o)} className={className} aria-label="Regenerate with another profile" aria-expanded={open}>
+          <Icon name="chevron" size={12} className="rotate-90" />
+        </button>
+      )}
+      {open && (
+        <span
+          role="menu"
+          className="absolute right-0 bottom-full z-30 mb-1 flex w-64 max-w-[80vw] flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white py-1 text-left shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        >
+          <span className="px-3 pt-1 pb-1.5 text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Regenerate with</span>
+          {choices.map((c) => (
+            <button
+              key={c.id}
+              role="menuitem"
+              onClick={() => run(c.id)}
+              className={`flex w-full items-center gap-2 px-3 text-left hover:bg-zinc-50 active:bg-zinc-100 dark:hover:bg-zinc-800 dark:active:bg-zinc-800 ${bubbles ? "min-h-11 py-2" : "py-1.5"}`}
+            >
+              <span className="min-w-0 flex-1">
+                <span className={`block truncate font-medium text-zinc-800 dark:text-zinc-100 ${bubbles ? "text-[15px]" : "text-sm"}`}>{c.label}</span>
+                <span className="block truncate font-mono text-[11px] text-zinc-500">{c.detail}</span>
+              </span>
+              {c.id === myProfileId && <Icon name="check" size={14} className="shrink-0 text-indigo-600 dark:text-indigo-400" />}
+            </button>
+          ))}
+        </span>
+      )}
+    </span>
+  );
+}
+
 /** "Sam is typing…" — live relay state, subscribed on its own so typing updates never
  *  re-render the memoized message rows. Entries expire on their own, so a lost
  *  `typing: false` frame just makes the line vanish a few seconds later. */
@@ -1172,7 +1257,7 @@ function ToolsList({ room }: { room: RoomInfo }) {
 }
 
 /** Per-chat MCP switches: Off / Ask / Auto for each server the user added. */
-function ToolsMenu({ room, onOpenSettings }: { room: RoomInfo; onOpenSettings: (tab: SettingsTab) => void }) {
+function ToolsMenu({ room, onOpenSettings, remote }: { room: RoomInfo; onOpenSettings: (tab: SettingsTab) => void; remote: boolean }) {
   const servers = useChat((s) => s.client!.mcp_servers);
   const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
   const [open, setOpen] = useState(false);
@@ -1199,18 +1284,20 @@ function ToolsMenu({ room, onOpenSettings }: { room: RoomInfo; onOpenSettings: (
     <div ref={box} className="relative">
       <button
         onClick={() => setOpen((o) => !o)}
-        className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition ${
-          active
+        // Another device's profile replies without tools (see generate's `delegated`).
+        disabled={remote}
+        className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition disabled:opacity-40 ${
+          active && !remote
             ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300"
             : "border-zinc-300 text-zinc-500 dark:border-zinc-700"
         }`}
-        title="MCP tools for this chat"
+        title={remote ? "Replies from another device's profile run without tools" : "MCP tools for this chat"}
       >
         <Icon name="wrench" size={13} />
         <span className="hidden min-[480px]:inline">Tools</span>
-        {active > 0 && <span className="rounded-full bg-indigo-600 px-1.5 text-[10px] text-white">{active}</span>}
+        {active > 0 && !remote && <span className="rounded-full bg-indigo-600 px-1.5 text-[10px] text-white">{active}</span>}
       </button>
-      {open && (
+      {open && !remote && (
         <div className="fixed inset-x-3 bottom-24 z-30 rounded-xl sm:absolute sm:inset-x-auto sm:bottom-full sm:left-0 sm:mb-2 sm:w-80 border border-zinc-200 bg-white p-3 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
           <div className="mb-2 flex items-center justify-between">
             <span className="text-sm font-semibold">Tools in #{room.name}</span>
@@ -1257,6 +1344,10 @@ function ComposerSheet({
     onClose();
     onOpenSettings(tab);
   };
+  // Other devices of this account that share their profiles.
+  const choices = useProfileChoices();
+  const shared = useMemo(() => choices.filter((c) => c.remote), [choices]);
+  const anyProfile = profiles.length + shared.length > 0;
   return (
     <div className="fixed inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={onClose}>
       <div
@@ -1279,7 +1370,7 @@ function ComposerSheet({
           />
         </div>
         <div className="mt-3 mb-1 text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Answer with</div>
-        {profiles.length === 0 ? (
+        {!anyProfile ? (
           <button onClick={() => settings("profiles")} className="py-2 text-sm font-medium text-indigo-600 dark:text-indigo-400">
             Add an AI profile
           </button>
@@ -1299,6 +1390,20 @@ function ComposerSheet({
                 {p.id === profileId && <Icon name="check" size={18} className="shrink-0 text-indigo-600 dark:text-indigo-400" />}
               </button>
             ))}
+            {shared.map((p) => (
+              <button
+                key={p.id}
+                onClick={() => chooseProfile(room.id, p.id)}
+                disabled={!aiOn}
+                className="flex min-h-12 w-full items-center gap-3 border-b border-zinc-100 px-3 py-2 text-left last:border-b-0 disabled:opacity-50 active:bg-zinc-50 dark:border-zinc-800 dark:active:bg-zinc-800"
+              >
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[15px] font-medium">{p.label} · on {p.device}</span>
+                  <span className="block truncate font-mono text-xs text-zinc-500">{p.model}</span>
+                </span>
+                {p.id === profileId && <Icon name="check" size={18} className="shrink-0 text-indigo-600 dark:text-indigo-400" />}
+              </button>
+            ))}
           </div>
         )}
         <div className="mt-4 mb-1 flex items-baseline justify-between">
@@ -1307,6 +1412,9 @@ function ComposerSheet({
             Manage
           </button>
         </div>
+        {profileId?.startsWith("remote:") && (
+          <p className="mb-1 text-xs text-zinc-500">Replies from another device's profile run without tools.</p>
+        )}
         <ToolsList room={room} />
         <Button variant="outline" className="mt-5 w-full !py-3" onClick={onClose}>
           Done
@@ -1351,6 +1459,11 @@ function Composer({
   const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
   const ta = useRef<HTMLTextAreaElement>(null);
   // While editing, the AI-reply option doesn't apply: the edit goes out as-is.
+  // The pickers list local profiles first, then other devices' shared ones.
+  const choices = useProfileChoices();
+  const shared = useMemo(() => choices.filter((c) => c.remote), [choices]);
+  const anyProfile = profiles.length + shared.length > 0;
+
   const ai = !editing && aiOn && !!profileId;
 
   // --- Typing indicator broadcast ------------------------------------------
@@ -1542,19 +1655,22 @@ ${before}` : t);
   ) : null;
 
   if (phone) {
-    const profile = profiles.find((p) => p.id === profileId);
+    // A remote id points at another device's shared profile; local picks resolve directly.
+    const local = profiles.find((p) => p.id === profileId);
+    const remote = shared.find((p) => p.id === profileId);
+    const pickedLabel = local?.label ?? (remote ? `${remote.label} · on ${remote.device}` : "");
     const toolsOn = servers.filter((s) => (modes?.[s.id] ?? s.default_mode) !== "off").length;
     return (
       <div className="safe-bottom border-t border-zinc-200 px-2 pt-1.5 pb-[max(0.5rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
         {contextBar}
         <button
-          onClick={() => (profiles.length ? setSheet(true) : onOpenSettings("profiles"))}
+          onClick={() => (anyProfile ? setSheet(true) : onOpenSettings("profiles"))}
           className="mb-1 flex max-w-full items-center gap-1.5 rounded-full px-2.5 py-1 text-xs text-zinc-500 active:bg-zinc-100 dark:active:bg-zinc-800"
         >
           <Icon name="sparkle" size={13} className={ai ? "text-indigo-600 dark:text-indigo-400" : ""} />
           <span className="truncate">
-            {!profiles.length ? "Add an AI profile to get replies" : ai ? `AI reply · ${profile?.label ?? ""}` : "AI reply off"}
-            {toolsOn > 0 && ` · ${toolsOn} tool${toolsOn === 1 ? "" : "s"}`}
+            {!anyProfile ? "Add an AI profile to get replies" : ai ? `AI reply · ${pickedLabel}` : "AI reply off"}
+            {toolsOn > 0 && !remote && ` · ${toolsOn} tool${toolsOn === 1 ? "" : "s"}`}
           </span>
           <Icon name="chevron" size={12} className="shrink-0 -rotate-90" />
         </button>
@@ -1620,7 +1736,7 @@ ${before}` : t);
         />
         <div className="flex items-center gap-1.5 px-2 pb-2 sm:gap-2">
           <button
-            onClick={() => (profiles.length ? setAiOn((v) => !v) : onOpenSettings("profiles"))}
+            onClick={() => (anyProfile ? setAiOn((v) => !v) : onOpenSettings("profiles"))}
             className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition ${
               ai
                 ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300"
@@ -1631,7 +1747,7 @@ ${before}` : t);
             <Icon name="sparkle" size={13} />
             <span className="hidden min-[480px]:inline">{ai ? "AI on" : "AI off"}</span>
           </button>
-          {profiles.length > 0 ? (
+          {anyProfile ? (
             <select
               value={profileId ?? ""}
               onChange={(e) => chooseProfile(room.id, e.target.value)}
@@ -1639,9 +1755,20 @@ ${before}` : t);
               className="min-w-0 flex-shrink truncate rounded-full border border-zinc-300 bg-transparent px-2.5 py-1 text-xs outline-none disabled:opacity-50 sm:max-w-64 dark:border-zinc-700 dark:bg-zinc-900"
               title="Which of your profiles answers your next message"
             >
+              {/* Only another device's profiles and none picked yet: make the first one selectable. */}
+              {!profileId && (
+                <option value="" disabled>
+                  Choose a profile
+                </option>
+              )}
               {profiles.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.label} · {p.model}
+                </option>
+              ))}
+              {shared.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label} · on {p.device}
                 </option>
               ))}
             </select>
@@ -1650,7 +1777,7 @@ ${before}` : t);
               Add an AI profile
             </button>
           )}
-          <ToolsMenu room={room} onOpenSettings={onOpenSettings} />
+          <ToolsMenu room={room} onOpenSettings={onOpenSettings} remote={!!profileId?.startsWith("remote:")} />
           <div className="flex-1" />
           {platform === "desktop" && (
             <span className="hidden text-[11px] text-zinc-400 lg:inline">Shift+Enter for newline</span>
@@ -1894,7 +2021,21 @@ export function RoomView({
   const replyHere = replyTo?.room_id === room.id && liveReply && !liveReply.deleted ? liveReply : null;
 
   const remembered = client.last_profile_by_room[room.id];
-  const profileId = client.profiles.some((p) => p.id === remembered) ? remembered : (client.profiles[0]?.id ?? null);
+  // Local profiles first, then the shared ones of this user's other online
+  // devices (a remote profile stays pickable while its device is online with
+  // that profile). With none of either, there is no AI reply to get.
+  const allChoices = useProfileChoices();
+  const sharedProfiles = useMemo(() => allChoices.filter((c) => c.remote), [allChoices]);
+  // A remembered remote id stays chosen while that device is online with that
+  // profile; otherwise fall back to the first local profile, then the first
+  // shared one.
+  const profileId = client.profiles.some((p) => p.id === remembered)
+    ? remembered
+    : sharedProfiles.some((p) => p.id === remembered)
+      ? remembered
+      : // Never fall back to another device's profile: that would send the room's
+        // history to a provider nobody picked. It's only used when chosen.
+        (client.profiles[0]?.id ?? null);
   const online = room.members.filter((m) => m.online).length;
 
   const copyCode = async () => {

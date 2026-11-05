@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { errorText } from "../lib/backend";
-import { useChat } from "../store";
+import { useChat, SIGN_IN_REFUSED } from "../store";
 import { Avatar, Button, Field, Icon, inputCls, Logo, Modal } from "./ui";
 
 export function RoomDialog({ mode, onClose }: { mode: "create" | "join"; onClose: () => void }) {
@@ -102,7 +102,8 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
 
       {status !== "online" && connError && (
         <p className="mx-3 mb-3 rounded-lg bg-amber-50 px-2.5 py-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
-          {connError} Check the relay address in Settings.
+          {connError}
+          {!SIGN_IN_REFUSED.test(connError) && " Check the relay address in Settings."}
         </p>
       )}
 
@@ -210,7 +211,8 @@ export function PhoneRoomList({ onSettings }: { onSettings: () => void }) {
         </div>
         {status !== "online" && connError && (
           <p className="mt-2 rounded-xl bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
-            {connError} Check the relay address in Settings.
+            {connError}
+          {!SIGN_IN_REFUSED.test(connError) && " Check the relay address in Settings."}
           </p>
         )}
       </header>

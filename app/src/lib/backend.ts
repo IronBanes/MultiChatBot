@@ -21,8 +21,8 @@ export const backend = {
   setIdentity: (displayName: string, serverUrl: string) =>
     invoke<void>("set_identity", { displayName, serverUrl }),
   /** Switches this device to another device's account (device linking). */
-  linkDevice: (userId: string, displayName: string) =>
-    invoke<void>("link_device", { userId, displayName }),
+  linkDevice: (userId: string, displayName: string, secret: string) =>
+    invoke<void>("link_device", { userId, displayName, secret }),
   /** Returns this device to its own account after `linkDevice`. */
   unlinkDevice: () => invoke<void>("unlink_device"),
   /** apiKey: undefined keeps the stored key, "" removes it. */
@@ -53,11 +53,14 @@ export const backend = {
     roomId: string,
     history: HistoryItem[],
     roomPrompt: string,
+    /** For another of this user's devices: no MCP tools (nobody here to approve, and
+     *  the relay can't yet prove who asked). */
+    delegated: boolean,
     onEvent: (e: GenEvent) => void,
   ) => {
     const channel = new Channel<GenEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, onEvent: channel });
+    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, delegated, onEvent: channel });
   },
   stopGeneration: (id: string) => invoke<void>("stop_generation", { id }),
 
