@@ -60,6 +60,21 @@ pub enum McpTransport {
     Http,
 }
 
+/// When the app shows a system notification for a room's new messages.
+/// A room without an entry in `notify_by_room` behaves as `Mentions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyMode {
+    /// Every message from someone else, and finished AI replies.
+    All,
+    /// Only messages that @mention this user (the default), and AI replies
+    /// answering this user's message.
+    #[default]
+    Mentions,
+    /// Never notify.
+    Off,
+}
+
 /// An MCP server the user added. Env vars and HTTP headers can hold secrets,
 /// so they live in the keychain (`secrets::McpSecrets`), not here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,6 +130,10 @@ pub struct Config {
     /// room id → server id → mode, overriding the server's default in that room.
     #[serde(default)]
     pub mcp_modes_by_room: HashMap<String, HashMap<String, McpMode>>,
+    /// room id → which messages earn a system notification. Rooms without an
+    /// entry use `NotifyMode::Mentions`.
+    #[serde(default)]
+    pub notify_by_room: HashMap<String, NotifyMode>,
     /// Port of the relay this app hosts (desktop only); `None` when not hosting.
     /// Hosting resumes on the next launch.
     #[serde(default)]
@@ -157,6 +176,7 @@ impl Default for Config {
             profiles: Vec::new(),
             mcp_servers: Vec::new(),
             mcp_modes_by_room: HashMap::new(),
+            notify_by_room: HashMap::new(),
             host_relay_port: None,
         }
     }

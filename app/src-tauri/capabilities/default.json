@@ -6,6 +6,10 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "websocket:default"
+    "websocket:default",
+    "notification:default",
+    "core:window:allow-show",
+    "core:window:allow-unminimize",
+    "core:window:allow-set-focus"
   ]
 }

@@ -1,5 +1,7 @@
 // App state: relay connection, rooms, messages, and AI reply orchestration.
 
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isPermissionGranted, onAction, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { create, type StoreApi } from "zustand";
 import { backend, errorText } from "./lib/backend";
 import { prepareImage } from "./lib/images";
@@ -11,6 +13,7 @@ import type {
   HistoryItem,
   McpMode,
   Message,
+  NotifyMode,
   RoomInfo,
   SearchHit,
   ServerMsg,
@@ -106,6 +109,10 @@ interface ChatState {
   setRoomPrompt(roomId: string, prompt: string): void;
   chooseProfile(roomId: string, profileId: string): void;
   setRoomMcpMode(roomId: string, serverId: string, mode: McpMode): void;
+  /** Picks which messages in a room earn a system notification. */
+  setRoomNotify(roomId: string, mode: NotifyMode): void;
+  /** Settings → General: asks for the OS permission if needed, then shows a sample. */
+  testNotification(): Promise<void>;
   answerToolCall(id: string, callId: string, approved: boolean): void;
   loadImage(attachmentId: string): void;
   toast(text: string, kind?: Toast["kind"]): void;
@@ -154,6 +161,26 @@ const unclaimedAttachments = new Map<string, Attachment[]>();
 /** Room id → the message a search jump is waiting for, while older history that
  *  reaches back to it is being fetched. */
 const pendingJumps = new Map<string, { id: string; seq: number }>();
+
+/** System notifications: room id → when the last one went out, how many messages
+ *  have been held back since (counted into the next one), and whether one is
+ *  waiting on the permission ask. */
+const notifyState = new Map<string, { lastAt: number; held: number; pending: boolean }>();
+const NOTIFY_GAP = 5000;
+/** The OS permission this run: "unknown" until the first notification would be
+ *  shown, then "granted", or "denied" (which stops every attempt until restart). */
+let notifyPermission: "unknown" | "granted" | "denied" = "unknown";
+/** The one permission ask per run, shared by every room and the test button. */
+let notifyPermissionAsk: Promise<boolean> | null = null;
+/** Hooks notification clicks once; settles when the listener is in place. */
+let notifyClicks: Promise<unknown> | null = null;
+/** Saves of notification choices, run one at a time so the last choice wins. */
+let notifyWrites: Promise<unknown> = Promise.resolve();
+function queueNotifyWrite(write: () => Promise<void>): Promise<void> {
+  const run = notifyWrites.then(write);
+  notifyWrites = run.catch(() => {});
+  return run;
+}
 
 /** Adds attachments not already on the message, plus any waiting for it. */
 function withAttachments(m: Message, extra: Attachment[] = []): Message {
@@ -208,6 +235,110 @@ function dropTyping(s: ChatState, roomId: string, userId: string) {
   if (!room || !(userId in room)) return {};
   const { [userId]: _, ...rest } = room;
   return { typing: { ...s.typing, [roomId]: rest } };
+}
+
+/** The OS permission this run, asked for at most once. Resolves true when
+ *  notifications may be shown; false means "stop trying until restart" and
+ *  says so once with a toast. */
+function notificationPermission(get: () => ChatState): Promise<boolean> {
+  if (notifyPermission === "granted") return Promise.resolve(true);
+  if (notifyPermission === "denied") return Promise.resolve(false);
+  notifyPermissionAsk ??= (async () => {
+    // A failed check counts as denied: the ask must not stay rejected for the whole run.
+    const granted = await (async () => (await isPermissionGranted()) || (await requestPermission()) === "granted")().catch(() => false);
+    notifyPermission = granted ? "granted" : "denied";
+    if (!granted) get().toast("Notifications are off for Multichat in your system settings", "info");
+    return granted;
+  })();
+  return notifyPermissionAsk;
+}
+
+/** Clicking a notification focuses the window and opens its room. Where the
+ *  platform doesn't report the click, nothing extra happens. Await it before
+ *  sending: the plugin only tracks clicks on notifications sent after this. */
+function hookNotificationClicks() {
+  notifyClicks ??= onAction((event) => {
+    if (event.actionId !== "tap") return;
+    const roomId = event.notification?.extra?.roomId;
+    if (typeof roomId !== "string") return;
+    const win = getCurrentWindow();
+    void win.show().catch(() => {});
+    void win.unminimize().catch(() => {});
+    void win.setFocus().catch(() => {});
+    useChat.getState().selectRoom(roomId);
+  }).catch(() => {
+    /* the platform doesn't report clicks; the notifications still show */
+  });
+  return notifyClicks;
+}
+
+/** True while the user is actually looking at this room. */
+function roomOnScreen(s: ChatState, roomId: string): boolean {
+  return s.activeRoomId === roomId && document.visibilityState === "visible" && document.hasFocus();
+}
+
+/** Shows one system notification for `roomId`, or holds it (counted) while the
+ *  5-second window for that room hasn't passed, so the next one can say how
+ *  many messages piled up. */
+async function notifyRoom(get: () => ChatState, roomId: string, roomName: string, body: string) {
+  const st = notifyState.get(roomId);
+  if (st && (st.pending || Date.now() - st.lastAt < NOTIFY_GAP)) {
+    notifyState.set(roomId, { ...st, held: st.held + 1 });
+    return;
+  }
+  // Claim the room before the permission ask, so messages arriving while the OS
+  // prompt is open fold into this notification instead of sending their own.
+  notifyState.set(roomId, { lastAt: Date.now(), held: st?.held ?? 0, pending: true });
+  await hookNotificationClicks();
+  const allowed = await notificationPermission(get);
+  const claimed = notifyState.get(roomId);
+  if (!claimed) return; // Left the room during the wait.
+  // During the wait the room may have been set to Off (its text must not show)
+  // or opened on screen.
+  if (!allowed || get().client?.notify_by_room[roomId] === "off" || roomOnScreen(get(), roomId)) {
+    notifyState.set(roomId, { ...claimed, held: 0, pending: false });
+    return;
+  }
+  const count = claimed.held + 1;
+  notifyState.set(roomId, { lastAt: Date.now(), held: 0, pending: false });
+  sendNotification({
+    title: `#${roomName}`,
+    body: count > 1 ? `${count} new messages` : body,
+    extra: { roomId },
+  });
+}
+
+function withoutKey<T>(map: Record<string, T>, key: string): Record<string, T> {
+  const { [key]: _, ...rest } = map;
+  return rest;
+}
+
+/** One notifiable message arrived: someone else's human message, or one of their
+ *  finished AI replies. Applies the room's mode and the "app isn't showing this
+ *  room" rule; a room set to Off never puts message text in a notification. */
+function maybeNotifyMessage(get: () => ChatState, m: Message, content: string) {
+  const s = get();
+  const me = s.client;
+  if (!me || m.deleted) return;
+  // Own messages, from this device or any other of this user's, never notify.
+  if (m.author_id === me.user_id) return;
+  const mode = me.notify_by_room[m.room_id] ?? "mentions";
+  if (mode === "off") return;
+  // Only when the app isn't showing that room: the window is hidden or
+  // unfocused, or another room is open.
+  if (roomOnScreen(s, m.room_id)) return;
+  if (mode === "mentions") {
+    if (m.kind === "human") {
+      if (!mentions(content, me.display_name)) return;
+    } else {
+      // An AI reply counts only when it answers this user's message.
+      const anchor = m.anchor_id ? s.messages[m.room_id]?.find((x) => x.id === m.anchor_id) : undefined;
+      if (!anchor || anchor.author_id !== me.user_id) return;
+    }
+  }
+  const who = m.kind === "ai" ? `AI for ${m.author_name}` : m.author_name;
+  const text = content.replace(/\s+/g, " ").trim().slice(0, 120);
+  void notifyRoom(get, m.room_id, s.rooms[m.room_id]?.name ?? m.room_id, `${who}: ${text}`);
 }
 
 function request<T>(build: (requestId: string) => Parameters<Relay["send"]>[0]): Promise<T> {
@@ -541,6 +672,9 @@ export const useChat = create<ChatState>((set, get) => {
           relay?.send({ type: "ai_request_failed", request_id: p.requestId, to_device_id: p.fromDeviceId, message: "Couldn't load the room" });
         }
         pendingDelegatedOpens.delete(msg.room_id);
+        // The room is gone; its notification choice (and in-flight throttle) go too.
+        notifyState.delete(msg.room_id);
+        queueNotifyWrite(() => backend.forgetRoomNotify(msg.room_id)).catch(() => {});
         set((s) => {
           const { [msg.room_id]: _, ...rooms } = s.rooms;
           const roomOrder = s.roomOrder.filter((id) => id !== msg.room_id);
@@ -549,7 +683,9 @@ export const useChat = create<ChatState>((set, get) => {
           const { [msg.room_id]: _m, ...messages } = s.messages;
           const { [msg.room_id]: _l, ...loaded } = s.loaded;
           const { [msg.room_id]: _h, ...hasMore } = s.hasMore;
+          const client = s.client && { ...s.client, notify_by_room: withoutKey(s.client.notify_by_room, msg.room_id) };
           return {
+            client,
             rooms,
             roomOrder,
             messages,
@@ -632,6 +768,8 @@ export const useChat = create<ChatState>((set, get) => {
         const me = get().client;
         const pinged =
           !mine && m.kind === "human" && get().activeRoomId !== m.room_id && !!me && mentions(m.content, me.display_name);
+        // A human message from someone else may deserve a system notification.
+        if (!mine && m.kind === "human") maybeNotifyMessage(get, m, m.content);
         set((s) => ({
           ...(pinged ? { mentioned: { ...s.mentioned, [m.room_id]: true } } : {}),
           messages: { ...s.messages, [m.room_id]: upsert(s.messages[m.room_id], m) },
@@ -726,6 +864,11 @@ export const useChat = create<ChatState>((set, get) => {
             )!,
           },
         }));
+        // Their finished AI reply: notify like a human message, with its final text.
+        if (msg.type === "ai_complete") {
+          const ai = get().messages[msg.room_id]?.find((m) => m.id === msg.id);
+          if (ai && ai.author_id !== get().client?.user_id) maybeNotifyMessage(get, ai, msg.content);
+        }
         break;
       case "member_joined":
       case "member_updated":
@@ -1043,6 +1186,26 @@ export const useChat = create<ChatState>((set, get) => {
         return { client: { ...s.client, mcp_modes_by_room: modes } };
       });
       backend.setRoomMcpMode(roomId, serverId, mode).catch((e) => get().toast(errorText(e)));
+    },
+
+    setRoomNotify(roomId, mode) {
+      set((s) => {
+        if (!s.client) return {};
+        const rest = withoutKey(s.client.notify_by_room, roomId);
+        // The default ("mentions") is stored as no entry, like the backend keeps it.
+        const notify_by_room = mode === "mentions" ? rest : { ...rest, [roomId]: mode };
+        return { client: { ...s.client, notify_by_room } };
+      });
+      queueNotifyWrite(() => backend.setRoomNotify(roomId, mode)).catch((e) => get().toast(errorText(e)));
+    },
+
+    async testNotification() {
+      await hookNotificationClicks();
+      if (!(await notificationPermission(get))) return;
+      sendNotification({
+        title: "Multichat",
+        body: "Test notification — new messages will pop up like this.",
+      });
     },
 
     answerToolCall(id, callId, approved) {

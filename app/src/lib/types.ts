@@ -180,6 +180,9 @@ export interface ModelInfo {
 
 export type McpMode = "off" | "ask" | "auto";
 
+/** Which messages in a room earn a system notification (default "mentions"). */
+export type NotifyMode = "all" | "mentions" | "off";
+
 export interface McpServer {
   id: string;
   name: string;
@@ -232,6 +235,8 @@ export interface ClientState {
   profiles: ProfileView[];
   mcp_servers: McpServerView[];
   mcp_modes_by_room: Record<string, Record<string, McpMode>>;
+  /** Rooms without an entry use "mentions". */
+  notify_by_room: Record<string, NotifyMode>;
 }
 
 /** The relay this desktop app hosts (Settings > General). */
