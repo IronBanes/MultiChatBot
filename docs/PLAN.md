@@ -180,9 +180,11 @@ so the reply is authored by the same account either way. Keys, base URLs and MCP
 never leave the desktop; only id/label/model are shared, and nothing about the request is
 stored. If the desktop can't comply (profile gone, room not loadable, anchor beyond the
 loaded history) it answers `ai_request_failed`, which the relay turns into an `error`
-frame on the asking device. MCP tools set to **Ask** wait for a human who isn't there,
-so a delegated generation denies those calls immediately; Off/Auto behave as usual.
-(Approving from the phone is phase 3.)
+frame on the asking device. A delegated generation runs **without MCP tools**: nobody is
+at the desktop to approve them, and the relay identifies a user only by the id sent in
+`hello`, so it can't yet prove a request came from the user's own device. Tools come back
+for delegated replies once connections are authenticated, with approvals on the phone
+(phase 3).
 
 ## Context building (Rust, `app/src-tauri/src/context.rs`)
 

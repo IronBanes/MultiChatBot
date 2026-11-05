@@ -131,7 +131,7 @@ export function parseRemoteProfileId(id: string): { deviceId: string; profileId:
  *  can be found and the reply generated: room → pending requests. */
 const pendingDelegatedOpens = new Map<string, { requestId: string; anchorId: string; profileId: string; fromDeviceId: string }[]>();
 /** Generation ids this client is generating for another of this user's devices.
- *  Nobody is at this computer to approve tools, so Ask-mode calls are denied. */
+ *  These run without MCP tools (see `backend.generate`'s `delegated`). */
 const delegatedGenerations = new Set<string>();
 /** The profile list last shared on the current connection (null: none yet). */
 let lastSharedProfiles: string | null = null;
@@ -376,7 +376,7 @@ export const useChat = create<ChatState>((set, get) => {
     };
 
     backend
-      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", (ev) => {
+      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", !!stopDelegatedTracking, (ev) => {
         if (ev.event === "delta") {
           relay?.send({ type: "ai_delta", room_id: roomId, id, delta: ev.text });
         } else if (ev.event === "reasoning") {
@@ -390,11 +390,6 @@ export const useChat = create<ChatState>((set, get) => {
             const local: LocalTool = { status: ev.status, args: ev.args ?? prev?.args ?? null, detail: ev.detail ?? prev?.detail ?? null };
             return { localTools: { ...st.localTools, [id]: { ...st.localTools[id], [ev.call_id]: local } } };
           });
-          // A delegated reply has nobody at this computer to approve tools, so
-          // every call waiting for approval is denied the moment it appears.
-          if (ev.status === "awaiting_approval" && delegatedGenerations.has(id)) {
-            backend.resolveToolCall(id, ev.call_id, false).catch(() => {});
-          }
         } else if (ev.event === "image") {
           const callId = ev.call_id;
           const { mime, data } = ev;
@@ -464,6 +459,11 @@ export const useChat = create<ChatState>((set, get) => {
         break;
       }
       case "room_left":
+        // Requests from my other devices that waited for this room can't be answered now.
+        for (const p of pendingDelegatedOpens.get(msg.room_id) ?? []) {
+          relay?.send({ type: "ai_request_failed", request_id: p.requestId, to_device_id: p.fromDeviceId, message: "Couldn't load the room" });
+        }
+        pendingDelegatedOpens.delete(msg.room_id);
         set((s) => {
           const { [msg.room_id]: _, ...rooms } = s.rooms;
           const roomOrder = s.roomOrder.filter((id) => id !== msg.room_id);

@@ -525,9 +525,14 @@ fn generate(
     room_id: String,
     history: Vec<HistoryItem>,
     room_prompt: String,
+    delegated: Option<bool>,
     on_event: Channel<GenEvent>,
 ) -> Result<(), String> {
     let cfg = state.snapshot()?;
+    // A reply generated for another of this user's devices gets no MCP tools:
+    // nobody is at this computer to approve them, and the relay can't yet prove
+    // that the request really came from the user's own device.
+    let delegated = delegated.unwrap_or(false);
     let profile = state.profile(&profile_id)?;
     check_not_blocked(&state, &profile)?;
     let key = secrets::get_key(&profile.id)?;
@@ -539,8 +544,7 @@ fn generate(
     if prompt.trimmed > 0 {
         eprintln!("[context] dropped {} oldest message(s) to fit {} tokens", prompt.trimmed, profile.max_context_tokens);
     }
-    let servers = cfg
-        .active_mcp(&room_id)
+    let servers = if delegated { Vec::new() } else { cfg.active_mcp(&room_id) }
         .into_iter()
         .map(|(s, m)| {
             let sec = secrets::get_mcp(&s.id).unwrap_or_default();

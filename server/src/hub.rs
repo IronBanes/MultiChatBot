@@ -113,11 +113,14 @@ impl Hub {
     /// Sends the user's currently online devices to every one of their connections.
     fn send_devices(&self, user_id: &str) {
         let mut seen = HashSet::new();
-        let mut devices: Vec<Device> = self
-            .conns
-            .values()
+        // Newest connection first, so for a device with several (a reconnect in
+        // progress) the newest one's shared profiles win.
+        let mut conns: Vec<(&ConnId, &Conn)> = self.conns.iter().collect();
+        conns.sort_by(|a, b| b.0.cmp(a.0));
+        let mut devices: Vec<Device> = conns
+            .into_iter()
+            .map(|(_, c)| c)
             .filter(|c| c.user_id.as_deref() == Some(user_id) && !c.device_id.is_empty())
-            // Several connections of one device: the first one's shared profiles win.
             .filter(|c| seen.insert(c.device_id.clone()))
             .map(|c| Device {
                 device_id: c.device_id.clone(),
@@ -142,15 +145,18 @@ impl Hub {
         room_id: &str,
         except: Option<ConnId>,
     ) -> Option<ConnId> {
+        // The newest connection of the device (highest id): during a reconnect the
+        // old one may still be registered.
         self.conns
             .iter()
             .filter(|(id, _)| Some(**id) != except)
-            .find(|(_, c)| {
+            .filter(|(_, c)| {
                 c.user_id.as_deref() == Some(user_id)
                     && c.device_id == device_id
                     && c.rooms.contains(room_id)
             })
             .map(|(id, _)| *id)
+            .max()
     }
 }
 

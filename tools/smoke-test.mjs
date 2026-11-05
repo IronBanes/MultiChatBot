@@ -359,6 +359,10 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
 
   // Bob (another user) joins too, to see nothing of this.
   const bobd = new Client("Bob");
+  // A real device of another user, in the room: request_ai must still not reach it.
+  bobd.deviceId = "bob-dev";
+  bobd.deviceName = "Bob's PC";
+  bobd.platform = "windows";
   await bobd.open();
   bobd.send({ type: "join_room", request_id: "r8", invite_code: droom.invite_code });
   await bobd.wait(type("room_joined", (m) => m.request_id === "r8"), "room_joined (Bob, delegated room)");
@@ -404,6 +408,7 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   phone.send({ type: "request_ai", request_id: "rq-foreign", room_id: droom.id, anchor_id: anchorId, device_id: "bob-dev", profile_id: "prof-1" });
   const foreign = await phone.wait(type("error", (m) => m.request_id === "rq-foreign"), "error (another user's device)");
   ok(/offline/.test(foreign.message), "request_ai to another user's device id is refused");
+  ok(!bobd.inbox.some((m) => m.type === "ai_requested"), "another user's device never receives the request");
   phone.send({ type: "request_ai", request_id: "rq-anchor", room_id: droom.id, anchor_id: room.id, device_id: "pc-1", profile_id: "prof-1" });
   const badAnchor = await phone.wait(type("error", (m) => m.request_id === "rq-anchor"), "error (foreign anchor)");
   ok(/isn't in this room/.test(badAnchor.message), "request_ai anchored outside the room is refused");
