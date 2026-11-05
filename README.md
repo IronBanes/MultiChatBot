@@ -418,6 +418,10 @@ message, generated with your own model.
 
 ## Security notes
 
+- Each API key is stored together with the address it was saved for, and MCP env vars and
+  headers with their server's URL or command. The app won't send them anywhere else, even
+  after a save that failed part-way and a restart. Changing a profile's address keeps its
+  key; a key can't be tried on an address typed into the form until it's saved.
 - Message content is rendered as Markdown with raw HTML disabled. `javascript:` links
   are neutralized, links open in the system browser, and remote images are never loaded.
 - MCP tool arguments and results are never sent to the relay (only to the MCP server

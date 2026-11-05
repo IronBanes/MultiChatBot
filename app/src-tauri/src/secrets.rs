@@ -120,12 +120,61 @@ fn delete(account: &str) -> Result<(), String> {
     }
 }
 
-pub fn get_key(profile_id: &str) -> Result<Option<String>, String> {
+/// A profile's API key and the endpoint (base URL) it was saved for. Kept together in
+/// one keychain entry, so a key can never be used with an endpoint it wasn't saved
+/// for, even if a save failed part-way and the app restarted since (#8).
+#[derive(Serialize, Deserialize)]
+struct PairedKey {
+    key: String,
+    endpoint: String,
+}
+
+/// Shown when a stored key belongs to a different endpoint than the profile's.
+pub const KEY_ENDPOINT_MISMATCH: &str =
+    "The saved API key belongs to a different address. Enter the key again in Settings to use it with this one.";
+
+/// The API key for `profile_id`, if it was saved for `endpoint`. A key saved for another
+/// endpoint is refused with [`KEY_ENDPOINT_MISMATCH`]. A key stored before keys were
+/// paired (a plain string) is returned as is; see [`pair_legacy_key`].
+pub fn get_key(profile_id: &str, endpoint: &str) -> Result<Option<String>, String> {
+    let Some(raw) = get(&format!("profile:{profile_id}"))? else { return Ok(None) };
+    match serde_json::from_str::<PairedKey>(&raw) {
+        Ok(p) if p.endpoint == endpoint => Ok(Some(p.key)),
+        Ok(_) => Err(KEY_ENDPOINT_MISMATCH.into()),
+        Err(_) => Ok(Some(raw)),
+    }
+}
+
+/// True when a key is stored for the profile (whatever endpoint it belongs to).
+pub fn has_key(profile_id: &str) -> bool {
+    get(&format!("profile:{profile_id}")).ok().flatten().is_some()
+}
+
+/// Stores `key` for `profile_id`, paired with `endpoint`.
+pub fn set_key(profile_id: &str, key: &str, endpoint: &str) -> Result<(), String> {
+    let json = serde_json::to_string(&PairedKey { key: key.into(), endpoint: endpoint.into() })
+        .map_err(|e| e.to_string())?;
+    set(&format!("profile:{profile_id}"), &json)
+}
+
+/// Pairs a key stored before pairing existed with `endpoint` (best effort: the key is
+/// still used if this fails, and it's tried again next time).
+pub fn pair_legacy_key(profile_id: &str, endpoint: &str) {
+    if let Ok(Some(raw)) = get(&format!("profile:{profile_id}")) {
+        if serde_json::from_str::<PairedKey>(&raw).is_err() {
+            let _ = set_key(profile_id, &raw, endpoint);
+        }
+    }
+}
+
+/// The keychain entry exactly as stored, to put back if a save fails part-way.
+pub fn key_record(profile_id: &str) -> Result<Option<String>, String> {
     get(&format!("profile:{profile_id}"))
 }
 
-pub fn set_key(profile_id: &str, key: &str) -> Result<(), String> {
-    set(&format!("profile:{profile_id}"), key)
+/// Puts back a record from [`key_record`].
+pub fn set_key_record(profile_id: &str, record: &str) -> Result<(), String> {
+    set(&format!("profile:{profile_id}"), record)
 }
 
 pub fn delete_key(profile_id: &str) -> Result<(), String> {
@@ -139,6 +188,10 @@ pub struct McpSecrets {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// The server address (URL, or command and args) these were saved for. Secrets for
+    /// another address aren't used (#8). None for secrets saved before pairing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 pub fn get_mcp(server_id: &str) -> Result<McpSecrets, String> {

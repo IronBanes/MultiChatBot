@@ -73,7 +73,7 @@ struct ProfileView {
 }
 
 fn view(p: Profile) -> ProfileView {
-    let has_key = secrets::get_key(&p.id).ok().flatten().is_some();
+    let has_key = secrets::has_key(&p.id);
     ProfileView { profile: p, has_key }
 }
 
@@ -216,7 +216,8 @@ fn resolve_key(state: &AppState, profile: &Profile, api_key: Option<String>) -> 
         None if !profile.id.is_empty() => {
             // A key typed into the form still works, so the user can test and recover.
             check_not_blocked(state, profile)?;
-            secrets::get_key(&profile.id)
+            // Paired with the address in the form: a stored key isn't tried on a new one.
+            secrets::get_key(&profile.id, profile.base_url.trim().trim_end_matches('/'))
         }
         None => Ok(None),
     }
@@ -235,7 +236,7 @@ fn check_not_blocked(state: &AppState, profile: &Profile) -> Result<(), String> 
 /// the key is removed; if even that fails, the profile is disabled until saved again.
 fn restore_key(state: &AppState, id: &str, previous_key: Option<String>, e: String) -> String {
     let restored = match &previous_key {
-        Some(k) => secrets::set_key(id, k),
+        Some(record) => secrets::set_key_record(id, record),
         None => secrets::delete_key(id),
     };
     if restored.is_ok() {
@@ -264,10 +265,12 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     profile.reasoning_effort = profile.reasoning_effort.filter(|e| !e.trim().is_empty());
     let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
     let changing_key = api_key.is_some();
-    let previous_key = if changing_key { secrets::get_key(&profile.id)? } else { None };
+    let previous_key = if changing_key { secrets::key_record(&profile.id)? } else { None };
+    // The endpoint the stored key is paired with now, to move a kept key to a new one.
+    let old_endpoint = state.snapshot()?.profiles.iter().find(|p| p.id == profile.id).map(|p| p.base_url.clone());
     let written = match api_key.as_deref().map(str::trim) {
         Some("") => secrets::delete_key(&profile.id),
-        Some(k) => secrets::set_key(&profile.id, k),
+        Some(k) => secrets::set_key(&profile.id, k, &profile.base_url),
         None => Ok(()),
     };
     // A failed write may still have replaced the stored key (it can fail after the
@@ -287,6 +290,19 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     // Only a new or removed key, saved together with the settings, repairs the pairing.
     if changing_key && let Ok(mut blocked) = state.unsafe_keys.lock() {
         blocked.remove(&saved.id);
+    }
+    // The address changed but the key was kept: the user moved it on purpose, so pair
+    // it with the new address (after the settings, so a failure here leaves the key
+    // tied to the old address and refused, never sent somewhere unintended).
+    if !changing_key
+        && let Some(old) = old_endpoint.filter(|o| *o != saved.base_url)
+        && let Ok(Some(key)) = secrets::get_key(&saved.id, &old)
+        && secrets::set_key(&saved.id, &key, &saved.base_url).is_err()
+    {
+        return Err(format!(
+            "{} was saved, but its API key couldn't be moved to the new address. Enter the key again.",
+            saved.label
+        ));
     }
     Ok(view(saved))
 }
@@ -375,6 +391,33 @@ struct SecretEdit {
     value: Option<String>,
 }
 
+/// What a server's secrets are paired with: its URL, or its command and arguments.
+fn mcp_target(s: &McpServer) -> String {
+    match s.transport {
+        McpTransport::Http => s.url.clone(),
+        McpTransport::Stdio => std::iter::once(s.command.as_str()).chain(s.args.iter().map(String::as_str)).collect::<Vec<_>>().join("\u{0}"),
+    }
+}
+
+/// A server's env vars and headers, only if they were saved for its current address.
+/// Secrets from before pairing are used and paired now (best effort).
+fn mcp_secrets_for(s: &McpServer) -> McpSecrets {
+    let sec = secrets::get_mcp(&s.id).unwrap_or_default();
+    match &sec.target {
+        Some(t) if *t != mcp_target(s) => {
+            eprintln!("[mcp] {}: stored secrets belong to another address; not using them", s.name);
+            McpSecrets::default()
+        }
+        Some(_) => sec,
+        None => {
+            if !(sec.env.is_empty() && sec.headers.is_empty()) {
+                let _ = secrets::set_mcp(&s.id, &McpSecrets { target: Some(mcp_target(s)), ..sec.clone() });
+            }
+            sec
+        }
+    }
+}
+
 fn merge_secrets(server_id: &str, edits: Option<Vec<SecretEdit>>) -> Result<McpSecrets, String> {
     let old = if server_id.is_empty() { McpSecrets::default() } else { secrets::get_mcp(server_id)? };
     let Some(edits) = edits else { return Ok(old) };
@@ -438,6 +481,8 @@ async fn save_mcp_server(
         server.args.retain(|a| !a.is_empty());
         let saved = server.clone();
         let previous = secrets::get_mcp(&server.id)?;
+        // Saved together with this address, so they're never sent to another one.
+        let merged = McpSecrets { target: Some(mcp_target(&server)), ..merged };
         secrets::set_mcp(&server.id, &merged)?;
         let updated = state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
             Some(existing) => *existing = server,
@@ -530,7 +575,8 @@ fn generate(
     let cfg = state.snapshot()?;
     let profile = state.profile(&profile_id)?;
     check_not_blocked(&state, &profile)?;
-    let key = secrets::get_key(&profile.id)?;
+    secrets::pair_legacy_key(&profile.id, &profile.base_url);
+    let key = secrets::get_key(&profile.id, &profile.base_url)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let prompt = context::build(&history, &room_prompt, profile.max_context_tokens);
     if prompt.messages.is_empty() {
@@ -543,7 +589,7 @@ fn generate(
         .active_mcp(&room_id)
         .into_iter()
         .map(|(s, m)| {
-            let sec = secrets::get_mcp(&s.id).unwrap_or_default();
+            let sec = mcp_secrets_for(&s);
             (s, m, sec)
         })
         .collect();
