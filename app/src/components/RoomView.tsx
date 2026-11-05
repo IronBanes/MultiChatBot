@@ -482,7 +482,6 @@ const MessageItem = memo(function MessageItem({
   /** Scroll a reply's quote to the message it answers. */
   onJump: (id: string) => void;
 }) {
-  const regenerate = useChat((s) => s.regenerate);
   const stopAi = useChat((s) => s.stopAi);
   const deleteMessage = useChat((s) => s.deleteMessage);
   const answerToolCall = useChat((s) => s.answerToolCall);
@@ -688,9 +687,7 @@ const MessageItem = memo(function MessageItem({
         </button>
       )}
       {!streaming && myProfileId && anchor && !anchor.deleted && (
-        <button onClick={() => regenerate(m, myProfileId)} className={actionCls}>
-          <Icon name="refresh" size={12} /> {bubbles || myProfileId.startsWith("remote:") ? "Regenerate" : "Regenerate with my profile"}
-        </button>
+        <RegenerateButton m={m} myProfileId={myProfileId} bubbles={bubbles} className={actionCls} />
       )}
     </>
   );
@@ -1098,6 +1095,93 @@ function SearchPanel({ room, phone, onJump, onClose }: { room: RoomInfo; phone: 
 let lastTypingTrueAt = 0;
 const RELAY_TYPING_GAP = 1100;
 
+/** Every profile this device can answer with: its own, then those its user's other
+ *  online devices share (as `remote:<device>:<profile>` ids). */
+function useProfileChoices() {
+  const profiles = useChat((s) => s.client!.profiles);
+  const devices = useChat((s) => s.devices);
+  const myDeviceId = useChat((s) => s.client!.device_id);
+  return useMemo(
+    () => [
+      ...profiles.map((p) => ({ id: p.id, label: p.label, model: p.model, detail: p.model, remote: false, device: "" })),
+      ...devices
+        .filter((d) => d.device_id !== myDeviceId)
+        .flatMap((d) =>
+          d.profiles.map((p) => ({
+            id: remoteProfileId(d.device_id, p.id),
+            label: p.label,
+            model: p.model,
+            detail: `on ${d.device_name}`,
+            remote: true,
+            device: d.device_name,
+          })),
+        ),
+    ],
+    [profiles, devices, myDeviceId],
+  );
+}
+
+/** Regenerate an AI reply with the room's chosen profile, or (from the menu) with any
+ *  other one, so models can be compared side by side on the same message. Its own
+ *  component so profile and device updates don't re-render the message rows. */
+function RegenerateButton({ m, myProfileId, bubbles, className }: { m: Message; myProfileId: string; bubbles: boolean; className: string }) {
+  const regenerate = useChat((s) => s.regenerate);
+  const choices = useProfileChoices();
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLSpanElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: PointerEvent) => {
+      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+    };
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("pointerdown", close);
+    window.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("pointerdown", close);
+      window.removeEventListener("keydown", esc);
+    };
+  }, [open]);
+  const run = (profileId: string) => {
+    setOpen(false);
+    regenerate(m, profileId);
+  };
+  return (
+    <span ref={box} className="relative flex items-center">
+      <button onClick={() => run(myProfileId)} className={className}>
+        <Icon name="refresh" size={12} /> {bubbles || myProfileId.startsWith("remote:") ? "Regenerate" : "Regenerate with my profile"}
+      </button>
+      {choices.length > 1 && (
+        <button onClick={() => setOpen((o) => !o)} className={className} aria-label="Regenerate with another profile" aria-expanded={open}>
+          <Icon name="chevron" size={12} className="rotate-90" />
+        </button>
+      )}
+      {open && (
+        <span
+          role="menu"
+          className="absolute right-0 bottom-full z-30 mb-1 flex w-64 max-w-[80vw] flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white py-1 text-left shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+        >
+          <span className="px-3 pt-1 pb-1.5 text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Regenerate with</span>
+          {choices.map((c) => (
+            <button
+              key={c.id}
+              role="menuitem"
+              onClick={() => run(c.id)}
+              className={`flex w-full items-center gap-2 px-3 text-left hover:bg-zinc-50 active:bg-zinc-100 dark:hover:bg-zinc-800 dark:active:bg-zinc-800 ${bubbles ? "min-h-11 py-2" : "py-1.5"}`}
+            >
+              <span className="min-w-0 flex-1">
+                <span className={`block truncate font-medium text-zinc-800 dark:text-zinc-100 ${bubbles ? "text-[15px]" : "text-sm"}`}>{c.label}</span>
+                <span className="block truncate font-mono text-[11px] text-zinc-500">{c.detail}</span>
+              </span>
+              {c.id === myProfileId && <Icon name="check" size={14} className="shrink-0 text-indigo-600 dark:text-indigo-400" />}
+            </button>
+          ))}
+        </span>
+      )}
+    </span>
+  );
+}
+
 /** "Sam is typing…" — live relay state, subscribed on its own so typing updates never
  *  re-render the memoized message rows. Entries expire on their own, so a lost
  *  `typing: false` frame just makes the line vanish a few seconds later. */
@@ -1255,17 +1339,14 @@ function ComposerSheet({
   onClose: () => void;
 }) {
   const profiles = useChat((s) => s.client!.profiles);
-  const devices = useChat((s) => s.devices);
-  const myDeviceId = useChat((s) => s.client!.device_id);
   const chooseProfile = useChat((s) => s.chooseProfile);
   const settings = (tab: SettingsTab) => {
     onClose();
     onOpenSettings(tab);
   };
   // Other devices of this account that share their profiles.
-  const shared = devices
-    .filter((d) => d.device_id !== myDeviceId)
-    .flatMap((d) => d.profiles.map((p) => ({ id: remoteProfileId(d.device_id, p.id), label: p.label, model: p.model, device: d.device_name })));
+  const choices = useProfileChoices();
+  const shared = useMemo(() => choices.filter((c) => c.remote), [choices]);
   const anyProfile = profiles.length + shared.length > 0;
   return (
     <div className="fixed inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={onClose}>
@@ -1366,8 +1447,6 @@ function Composer({
   onClearReply: () => void;
 }) {
   const profiles = useChat((s) => s.client!.profiles);
-  const devices = useChat((s) => s.devices);
-  const myDeviceId = useChat((s) => s.client!.device_id);
   const platform = useChat((s) => s.client!.platform);
   const status = useChat((s) => s.status);
   const sendMessage = useChat((s) => s.sendMessage);
@@ -1381,9 +1460,8 @@ function Composer({
   const ta = useRef<HTMLTextAreaElement>(null);
   // While editing, the AI-reply option doesn't apply: the edit goes out as-is.
   // The pickers list local profiles first, then other devices' shared ones.
-  const shared = devices
-    .filter((d) => d.device_id !== myDeviceId)
-    .flatMap((d) => d.profiles.map((p) => ({ id: remoteProfileId(d.device_id, p.id), label: p.label, model: p.model, device: d.device_name })));
+  const choices = useProfileChoices();
+  const shared = useMemo(() => choices.filter((c) => c.remote), [choices]);
   const anyProfile = profiles.length + shared.length > 0;
 
   const ai = !editing && aiOn && !!profileId;
@@ -1897,7 +1975,6 @@ export function RoomView({
   onBack?: () => void;
 }) {
   const client = useChat((s) => s.client!);
-  const devices = useChat((s) => s.devices);
   const leaveRoom = useChat((s) => s.leaveRoom);
   const width = useWidth();
   const phone = !!onBack;
@@ -1947,17 +2024,8 @@ export function RoomView({
   // Local profiles first, then the shared ones of this user's other online
   // devices (a remote profile stays pickable while its device is online with
   // that profile). With none of either, there is no AI reply to get.
-  const myDeviceId = client.device_id;
-  const sharingDevices = devices.filter((d) => d.device_id !== myDeviceId && d.profiles.length > 0);
-  const sharedProfiles = useMemo(
-    () =>
-      sharingDevices.flatMap((d) =>
-        d.profiles.map((p) => ({ id: remoteProfileId(d.device_id, p.id), label: p.label, model: p.model, device: d.device_name })),
-      ),
-    // `sharingDevices` is derived here, so the memo tracks its parts.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [devices, myDeviceId],
-  );
+  const allChoices = useProfileChoices();
+  const sharedProfiles = useMemo(() => allChoices.filter((c) => c.remote), [allChoices]);
   // A remembered remote id stays chosen while that device is online with that
   // profile; otherwise fall back to the first local profile, then the first
   // shared one.
