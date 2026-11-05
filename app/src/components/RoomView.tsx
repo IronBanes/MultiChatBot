@@ -1614,8 +1614,12 @@ ${before}` : t);
   useEffect(() => {
     if (dismissedAt >= 0 && !/(^|\s)@[^\n@]{0,40}$/.test(text.slice(0, caret))) setDismissedAt(-1);
   }, [text, caret, dismissedAt]);
-  const insertMention = (name: string) => {
+  /** Label (lowercased) → the profile picked from the list for it, so two profiles
+   *  with the same label (one here, one on another device) stay apart on send. */
+  const pickedProfiles = useRef(new Map<string, string>());
+  const insertMention = (name: string, key?: string) => {
     if (!mention) return;
+    if (key?.startsWith("p:")) pickedProfiles.current.set(name.toLowerCase(), key.slice(2));
     const next = `${text.slice(0, mention.start)}@${name} ${text.slice(caret)}`;
     const at = mention.start + name.length + 2;
     // Picked: don't reopen for longer names that start the same ("Sam" → "Sam Smith"),
@@ -1635,7 +1639,8 @@ ${before}` : t);
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       setPick((i) => (i + (e.key === "ArrowDown" ? 1 : n - 1)) % n);
     } else if ((e.key === "Enter" && !e.shiftKey) || e.key === "Tab") {
-      insertMention(mention.options[Math.min(pick, n - 1)].name);
+      const o = mention.options[Math.min(pick, n - 1)];
+      insertMention(o.name, o.key);
     } else if (e.key === "Escape") {
       setDismissedAt(mention.start);
     } else {
@@ -1654,7 +1659,7 @@ ${before}` : t);
           // mousedown, not click: the textarea keeps focus and the caret stays put.
           onMouseDown={(e) => {
             e.preventDefault();
-            insertMention(o.name);
+            insertMention(o.name, o.key);
           }}
           className={`flex w-full items-center gap-2 px-3 text-left ${phone ? "min-h-11 py-2" : "py-1.5"} ${i === pick ? "bg-indigo-50 dark:bg-indigo-950/50" : ""}`}
         >
@@ -1683,16 +1688,21 @@ ${before}` : t);
     const reply = replyTo?.id ?? null;
     const typingAtSend = typingGeneration.current;
     // "@<profile>" picks who answers (unless a member has that same name).
-    const named = choices.find(
-      (c) => mentions(sent, c.label) && !room.members.some((mb) => mb.display_name.toLowerCase() === c.label.toLowerCase()),
-    );
+    // The longest matching label wins ("@Sam Smith" also matches "Sam"), and the exact
+    // profile picked from the list wins over another with the same label.
+    const named = [...choices]
+      .sort((a, b) => b.label.length - a.label.length)
+      .find((c) => mentions(sent, c.label) && !room.members.some((mb) => mb.display_name.toLowerCase() === c.label.toLowerCase()));
+    const pickedId = named && pickedProfiles.current.get(named.label.toLowerCase());
+    const namedId = pickedId && choices.some((c) => c.id === pickedId) ? pickedId : named?.id;
     const withAi = named ? true : ai;
-    const answerWith = named?.id ?? profileId;
+    const answerWith = namedId ?? profileId;
     sending.current = true;
     try {
       // Only clear the box once the message really went out. Text typed after the sent
       // part is kept; if the sent part itself was edited meanwhile, keep everything.
       if (await sendMessage(room.id, sent, withAi, withAi ? answerWith : null, reply)) {
+        pickedProfiles.current.clear();
         setText((t) => (t.startsWith(sent) ? t.slice(sent.length).trimStart() : t));
         if (reply) onClearReply();
         // Only if nothing was typed while it sent: newer text is still being typed.
