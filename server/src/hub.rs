@@ -49,6 +49,9 @@ pub type ConnId = u64;
 
 struct Conn {
     user_id: Option<String>,
+    /// Set when `welcome` was sent: before that, room notifications would arrive ahead of
+    /// the room list they belong after.
+    welcomed: bool,
     display_name: String,
     device_id: String,
     device_name: String,
@@ -196,6 +199,7 @@ impl State {
             id,
             Conn {
                 user_id: None,
+                welcomed: false,
                 display_name: String::new(),
                 device_id: String::new(),
                 device_name: String::new(),
@@ -260,7 +264,8 @@ impl State {
             .hub()
             .conns
             .iter()
-            .filter(|(id, c)| **id != conn && c.user_id.as_deref() == Some(user_id))
+            // Not-yet-welcomed connections get the room in their welcome instead.
+            .filter(|(id, c)| **id != conn && c.welcomed && c.user_id.as_deref() == Some(user_id))
             .map(|(id, _)| *id)
             .collect();
         for id in others {
@@ -1062,9 +1067,25 @@ impl State {
                 rooms.push(info);
             }
         }
-        self.send(conn, ServerMsg::Welcome { user_id: user_id.clone(), rooms });
-        let hub = self.hub();
-        hub.send_devices(&user_id);
+        {
+            let mut hub = self.hub();
+            // Sent and marked together under the lock, so a room_joined either goes out
+            // after this welcome or is skipped because the room is already in it.
+            hub.send(conn, &ServerMsg::Welcome { user_id: user_id.clone(), rooms });
+            if let Some(c) = hub.conns.get_mut(&conn) {
+                c.welcomed = true;
+            }
+            hub.send_devices(&user_id);
+        }
+        // A room another device created or joined while this welcome was being built is
+        // in neither the welcome nor a room_joined (this connection wasn't welcomed yet).
+        for id in db::user_room_ids(&self.db, &user_id).await? {
+            if !room_ids.contains(&id) {
+                if let Some(room) = self.room_info(&id).await? {
+                    self.send(conn, ServerMsg::RoomJoined { request_id: None, room });
+                }
+            }
+        }
         Ok(())
     }
 
