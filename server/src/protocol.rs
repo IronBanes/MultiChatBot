@@ -1,6 +1,7 @@
 //! WebSocket wire protocol. See docs/PLAN.md for the full table.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -123,6 +124,12 @@ pub enum ClientMsg {
     /// (id, label and model only; keys never leave the device).
     ShareProfiles {
         profiles: Vec<SharedProfile>,
+        /// The device's MCP servers; ignored unless `remote_control` is on.
+        #[serde(default)]
+        mcp_servers: Vec<SharedMcpServer>,
+        /// True when this device accepts `device_command`s from the user's other devices.
+        #[serde(default)]
+        remote_control: bool,
     },
     /// Asks one of the user's own devices to reply to `anchor_id` with its profile
     /// (delegated generation; the target answers `ai_requested` or `ai_request_failed`).
@@ -154,6 +161,20 @@ pub enum ClientMsg {
         request_id: String,
         room_id: String,
         query: String,
+    },
+    /// Something for another of the user's own devices to do or show. Forwarded to
+    /// that device only and never stored.
+    DeviceCommand {
+        request_id: String,
+        device_id: String,
+        command: DeviceCommand,
+    },
+    /// The target device's answer to a `device_command`; `error` is `None` on success.
+    DeviceReply {
+        request_id: String,
+        to_device_id: String,
+        #[serde(default)]
+        error: Option<String>,
     },
 }
 
@@ -284,6 +305,16 @@ pub enum ServerMsg {
         profile_id: String,
         from_device_id: String,
     },
+    /// Forwards `device_command`: delivered to the target device only, never stored.
+    DeviceCommand {
+        request_id: String,
+        from_device_id: String,
+        command: DeviceCommand,
+    },
+    /// The target device did what a `device_command` asked (failures arrive as `error`).
+    DeviceReply {
+        request_id: String,
+    },
     LinkCode {
         request_id: String,
         code: String,
@@ -331,15 +362,58 @@ pub struct Device {
     /// sent `share_profiles` on this connection).
     #[serde(default)]
     pub profiles: Vec<SharedProfile>,
+    /// Its MCP servers, shared only while `remote_control` is on.
+    #[serde(default)]
+    pub mcp_servers: Vec<SharedMcpServer>,
+    /// True when it accepts `device_command`s from the user's other devices.
+    #[serde(default)]
+    pub remote_control: bool,
 }
 
-/// A profile another of the user's devices may generate with. Only id, label and
-/// model cross the wire — never the key, provider or base URL.
+/// A profile another of the user's devices may generate with. Only id, label, model
+/// and whether it's on cross the wire — never the key, provider or base URL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedProfile {
     pub id: String,
     pub label: String,
     pub model: String,
+    /// Off profiles stay listed, so a linked device can turn them back on.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// An MCP server another of the user's devices may switch. Only its name and modes
+/// cross the wire — never its command, URL or secrets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedMcpServer {
+    pub id: String,
+    pub name: String,
+    /// "off" | "ask" | "auto"
+    pub default_mode: String,
+    /// room id → mode, for rooms that override `default_mode`.
+    #[serde(default)]
+    pub room_modes: HashMap<String, String>,
+}
+
+/// What one of the user's devices asks another to do or show. The relay only checks
+/// the size and that both ends are the same account; the receiving device decides
+/// whether to obey (see docs/PLAN.md, "Remote control").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeviceCommand {
+    /// Switch an MCP server in one room. A device only accepts "off" or "ask".
+    SetMcpMode { room_id: String, server_id: String, mode: String },
+    /// Turn a profile on or off.
+    SetProfileEnabled { profile_id: String, enabled: bool },
+    /// A delegated reply wants to run a tool: goes to the device that asked for the
+    /// reply. `args` is why this isn't a room frame; it stays between the two devices.
+    ToolApproval { room_id: String, message_id: String, call_id: String, server: String, tool: String, args: String },
+    /// The answer to a `tool_approval`.
+    AnswerTool { message_id: String, call_id: String, approved: bool },
 }
 
 /// An MCP tool call made while generating an AI reply. Only names and status

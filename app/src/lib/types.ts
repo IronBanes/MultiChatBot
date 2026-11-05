@@ -7,12 +7,32 @@ export interface Member {
 }
 
 /** A profile another of this user's devices shares for delegated generation.
- *  Only id, label and model cross the wire — never a key or base URL. */
+ *  Only id, label, model and on/off cross the wire — never a key or base URL. */
 export interface SharedProfile {
   id: string;
   label: string;
   model: string;
+  /** Off profiles stay listed, so a linked device can turn them back on. */
+  enabled: boolean;
 }
+
+/** An MCP server another of this user's devices lets this one switch.
+ *  Only its name and modes cross the wire — never its command, URL or secrets. */
+export interface SharedMcpServer {
+  id: string;
+  name: string;
+  default_mode: McpMode;
+  /** Rooms that override `default_mode`. */
+  room_modes: Record<string, McpMode>;
+}
+
+/** What one of this user's devices asks another to do or show (never stored). */
+export type DeviceCommand =
+  | { kind: "set_mcp_mode"; room_id: string; server_id: string; mode: McpMode }
+  | { kind: "set_profile_enabled"; profile_id: string; enabled: boolean }
+  /** A reply generated for this device wants to run a tool. */
+  | { kind: "tool_approval"; room_id: string; message_id: string; call_id: string; server: string; tool: string; args: string }
+  | { kind: "answer_tool"; message_id: string; call_id: string; approved: boolean };
 
 /** One of this user's devices that is online right now (ServerMsg "devices"). */
 export interface Device {
@@ -21,6 +41,10 @@ export interface Device {
   platform: string;
   /** Profiles that device shares (empty unless it sent `share_profiles`). */
   profiles: SharedProfile[];
+  /** Its MCP servers, shared only while `remote_control` is on. */
+  mcp_servers: SharedMcpServer[];
+  /** True when it accepts commands from this user's other devices. */
+  remote_control: boolean;
 }
 
 export interface RoomInfo {
@@ -117,7 +141,9 @@ export type ClientMsg =
   | { type: "typing"; room_id: string; typing: boolean }
   | { type: "edit_message"; room_id: string; message_id: string; content: string }
   | { type: "delete_message"; room_id: string; message_id: string }
-  | { type: "share_profiles"; profiles: SharedProfile[] }
+  | { type: "share_profiles"; profiles: SharedProfile[]; mcp_servers: SharedMcpServer[]; remote_control: boolean }
+  | { type: "device_command"; request_id: string; device_id: string; command: DeviceCommand }
+  | { type: "device_reply"; request_id: string; to_device_id: string; error: string | null }
   | { type: "request_ai"; request_id: string; room_id: string; anchor_id: string; device_id: string; profile_id: string }
   | { type: "ai_request_failed"; request_id: string; to_device_id: string; message: string }
   | { type: "create_link_code"; request_id: string; secret: string }
@@ -149,6 +175,8 @@ export type ServerMsg =
   | { type: "room_updated"; room_id: string; system_prompt: string; updated_by: string }
   | { type: "reactions"; room_id: string; message_id: string; reactions: Reaction[] }
   | { type: "ai_requested"; request_id: string; room_id: string; anchor_id: string; anchor_seq: number; profile_id: string; from_device_id: string }
+  | { type: "device_command"; request_id: string; from_device_id: string; command: DeviceCommand }
+  | { type: "device_reply"; request_id: string }
   | { type: "link_code"; request_id: string; code: string; expires_in_secs: number }
   | { type: "linked"; request_id: string; user_id: string; display_name: string; secret: string }
   | { type: "devices"; devices: Device[] }
@@ -168,6 +196,8 @@ export interface Profile {
   temperature: number | null;
   show_reasoning: boolean;
   reasoning_effort: string | null;
+  /** Off profiles can't reply, here or for this user's other devices. */
+  enabled: boolean;
 }
 
 export interface ModelInfo {
@@ -237,6 +267,8 @@ export interface ClientState {
   mcp_modes_by_room: Record<string, Record<string, McpMode>>;
   /** Rooms without an entry use "mentions". */
   notify_by_room: Record<string, NotifyMode>;
+  /** Lets this user's other devices control this one (desktop, off by default). */
+  remote_control: boolean;
 }
 
 /** The relay this desktop app hosts (Settings > General). */

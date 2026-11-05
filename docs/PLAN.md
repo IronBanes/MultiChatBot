@@ -104,9 +104,11 @@ all rooms. The first client frame must be `hello`.
 | `typing` | `room_id, typing` | live "I'm typing" state; members only, relayed as `typing` and never stored; the relay passes at most one `typing: true` per second per connection, and a `typing: false` only when it ends a relayed `true` and no other device of that user is still typing there |
 | `edit_message` | `room_id, message_id, content` | edit your own human message; same empty/length rule as `send_message` → `message_updated` |
 | `delete_message` | `room_id, message_id` | soft-delete your own message (human, or an AI reply you generated; not while streaming) → `message_updated` |
-| `share_profiles` | `profiles: SharedProfile[]` | this connection's profiles the user's other devices may generate with (≤ 50; label/model clipped like names); broadcast as a refreshed `devices` to the user's connections |
+| `share_profiles` | `profiles: SharedProfile[], mcp_servers?: SharedMcpServer[], remote_control?` | this connection's profiles the user's other devices may generate with (≤ 50; label/model clipped like names), and whether they may control it; its servers (≤ 50) are dropped unless `remote_control` is true; broadcast as a refreshed `devices` to the user's connections |
 | `request_ai` | `request_id, room_id, anchor_id, device_id, profile_id` | ask one of the user's own devices to reply to `anchor_id` with its local profile → `ai_requested` there (or `error` with the request_id); the sender must be in the room, the anchor a non-deleted human message of that room, the target an online connection of the same user's device that is in the room and not the sender's own connection; nothing is stored |
 | `ai_request_failed` | `request_id, to_device_id, message` | the target's answer when it can't; relayed to the asking device's connections of the same user as `error` with the request_id (message clipped like `ai_error`) |
+| `device_command` | `request_id, device_id, command: DeviceCommand` | for one of the user's own devices → `device_command` there (or `error` with the request_id); the target is another online connection of the same user's device, the command at most 64 KiB; nothing is stored |
+| `device_reply` | `request_id, to_device_id, error?` | the target's answer; relayed to the asking device's connections of the same user as `device_reply`, or as `error` with the request_id when `error` is set |
 | `create_link_code` | `request_id, secret` | → `link_code` (8 characters); one live code per user, valid 10 min, single use; `secret` must be the account's (it's handed to the redeeming device) |
 | `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
 | `search_messages` | `request_id, room_id, query` | full-text search of that room's messages (prefix match on the last word, ≤ 200 chars); → `search_results`; members only |
@@ -138,6 +140,8 @@ all rooms. The first client frame must be `hello`.
 | `reactions` | `room_id, message_id, reactions: Reaction[]` (the message's full current list) |
 | `message_updated` | `room_id, message: Message` (the full row after an edit or delete) |
 | `ai_requested` | `request_id, room_id, anchor_id, profile_id, from_device_id` (answers `request_ai`; delivered to the target device's first matching connection only, never stored) |
+| `device_command` | `request_id, from_device_id, command: DeviceCommand` (delivered to the target device's newest connection only, never stored) |
+| `device_reply` | `request_id` (the target did what a `device_command` asked) |
 | `link_code` | `request_id, code, expires_in_secs` |
 | `linked` | `request_id, user_id, display_name, secret` (the account's secret) |
 | `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline, or shares profiles) |
@@ -145,8 +149,10 @@ all rooms. The first client frame must be `hello`.
 
 `RoomInfo = {id, name, invite_code, system_prompt, members: Member[]}`
 `Member = {user_id, display_name, online}`
-`Device = {device_id, device_name, platform, profiles: SharedProfile[]}` (empty unless that device sent `share_profiles`)
-`SharedProfile = {id, label, model}`
+`Device = {device_id, device_name, platform, profiles: SharedProfile[], mcp_servers: SharedMcpServer[], remote_control}` (empty and false unless that device sent `share_profiles`)
+`SharedProfile = {id, label, model, enabled}`
+`SharedMcpServer = {id, name, default_mode, room_modes: {room_id: mode}}` (modes are `off`, `ask` or `auto`; a server with any other default isn't listed, and any other room mode is dropped)
+`DeviceCommand` is tagged by `kind`: `set_mcp_mode {room_id, server_id, mode}`, `set_profile_enabled {profile_id, enabled}`, `tool_approval {room_id, message_id, call_id, server, tool, args}`, `answer_tool {message_id, call_id, approved}`
 `Reaction = {emoji, user_ids}` (grouped per emoji, in first-use order)
 `Message = {id, room_id, seq, kind, author_id, author_name, content, reasoning, tools,
             attachments, reactions, ai_requested, anchor_id, model, reply_to, status, error,
@@ -193,11 +199,38 @@ so the reply is authored by the same account either way. Keys, base URLs and MCP
 never leave the desktop; only id/label/model are shared, and nothing about the request is
 stored. If the desktop can't comply (profile gone, room not loadable, anchor beyond the
 loaded history) it answers `ai_request_failed`, which the relay turns into an `error`
-frame on the asking device. A delegated generation runs **without MCP tools**: nobody is
-at the desktop to approve them, and the relay identifies a user only by the id sent in
-`hello`, so it can't yet prove a request came from the user's own device. Tools come back
-for delegated replies once connections are authenticated, with approvals on the phone
-(phase 3).
+frame on the asking device. A delegated generation runs **without MCP tools** unless the
+desktop allows remote control (below).
+
+### Remote control (device linking, phase 3)
+
+A linked device can turn the desktop's profiles on or off, switch its MCP servers per room
+and approve tool calls in the replies it asked for. All of it travels as `device_command`,
+which the relay forwards only between connections of one account and never stores.
+
+The commands come through the relay, and proving the account doesn't prove the user is
+behind them: whoever runs a relay sees account secrets in `hello`, so a hostile relay could
+forge a command. So the receiving device decides what happens, within these limits:
+
+- **Off by default.** "Let linked devices control this computer" (`remote_control`) is only
+  set at the desktop itself. Until then commands are refused, no server names are shared
+  and delegated replies get no tools.
+- **Never Auto.** A linked device can set a server to Off or Ask only.
+- **Every delegated call is approved,** even on a server set to Auto at the desktop
+  (`Config::mcp_for_reply`). The desktop shows the same prompt, and the first answer wins;
+  an unanswered call is denied after 10 minutes.
+- **Only the device that asked** can answer, and only for a reply it asked for. A reply
+  started at the desktop can't be answered from elsewhere.
+
+A forged command can still turn profiles and servers off or back to Ask, and a forged
+approval can run a tool of a server that's on, so remote control trusts the relay more
+than the rest of the app does; the setting says what it allows.
+
+To approve, a device needs the tool's arguments, so `tool_approval` carries them (cut to
+16,000 characters). They go to that one device through the relay's memory and are never
+stored or sent to the room. Results stay on the desktop, as for any other reply. A waiting
+approval is offered again on every `devices` frame, so a phone that dropped off gets it
+back when it signs in, even if its old connection hadn't closed yet.
 
 ## Context building (Rust, `app/src-tauri/src/context.rs`)
 
