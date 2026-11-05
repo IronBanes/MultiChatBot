@@ -272,6 +272,11 @@ function hookNotificationClicks() {
   return notifyClicks;
 }
 
+/** True while the user is actually looking at this room. */
+function roomOnScreen(s: ChatState, roomId: string): boolean {
+  return s.activeRoomId === roomId && document.visibilityState === "visible" && document.hasFocus();
+}
+
 /** Shows one system notification for `roomId`, or holds it (counted) while the
  *  5-second window for that room hasn't passed, so the next one can say how
  *  many messages piled up. */
@@ -288,8 +293,9 @@ async function notifyRoom(get: () => ChatState, roomId: string, roomName: string
   const allowed = await notificationPermission(get);
   const claimed = notifyState.get(roomId);
   if (!claimed) return; // Left the room during the wait.
-  // The room may have been set to Off during the wait; its text must not show.
-  if (!allowed || get().client?.notify_by_room[roomId] === "off") {
+  // During the wait the room may have been set to Off (its text must not show)
+  // or opened on screen.
+  if (!allowed || get().client?.notify_by_room[roomId] === "off" || roomOnScreen(get(), roomId)) {
     notifyState.set(roomId, { ...claimed, held: 0, pending: false });
     return;
   }
@@ -320,7 +326,7 @@ function maybeNotifyMessage(get: () => ChatState, m: Message, content: string) {
   if (mode === "off") return;
   // Only when the app isn't showing that room: the window is hidden or
   // unfocused, or another room is open.
-  if (s.activeRoomId === m.room_id && document.visibilityState === "visible" && document.hasFocus()) return;
+  if (roomOnScreen(s, m.room_id)) return;
   if (mode === "mentions") {
     if (m.kind === "human") {
       if (!mentions(content, me.display_name)) return;
