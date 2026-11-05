@@ -652,12 +652,20 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     selectRoom(id) {
-      set((s) => ({ activeRoomId: id, roomClosed: false, unread: { ...s.unread, [id]: 0 } }));
+      // A search jump belongs to the room it was started in: leaving drops it.
+      if (get().activeRoomId !== id) pendingJumps.clear();
+      set((s) => ({
+        activeRoomId: id,
+        roomClosed: false,
+        unread: { ...s.unread, [id]: 0 },
+        jumpTarget: s.jumpTarget?.roomId === id ? s.jumpTarget : null,
+      }));
       if (!get().loaded[id]) relay?.send({ type: "open_room", room_id: id });
     },
 
     closeRoom() {
-      set({ activeRoomId: null, roomClosed: true });
+      pendingJumps.clear();
+      set({ activeRoomId: null, roomClosed: true, jumpTarget: null });
     },
 
     createRoom: (name) => request<RoomInfo>((request_id) => ({ type: "create_room", request_id, name })),
