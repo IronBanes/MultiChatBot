@@ -1265,7 +1265,7 @@ function ToolsList({ room }: { room: RoomInfo }) {
 }
 
 /** Per-chat MCP switches: Off / Ask / Auto for each server the user added. */
-function ToolsMenu({ room, onOpenSettings }: { room: RoomInfo; onOpenSettings: (tab: SettingsTab) => void }) {
+function ToolsMenu({ room, onOpenSettings, remote }: { room: RoomInfo; onOpenSettings: (tab: SettingsTab) => void; remote: boolean }) {
   const servers = useChat((s) => s.client!.mcp_servers);
   const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
   const [open, setOpen] = useState(false);
@@ -1292,18 +1292,20 @@ function ToolsMenu({ room, onOpenSettings }: { room: RoomInfo; onOpenSettings: (
     <div ref={box} className="relative">
       <button
         onClick={() => setOpen((o) => !o)}
-        className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition ${
-          active
+        // Another device's profile replies without tools (see generate's `delegated`).
+        disabled={remote}
+        className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition disabled:opacity-40 ${
+          active && !remote
             ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300"
             : "border-zinc-300 text-zinc-500 dark:border-zinc-700"
         }`}
-        title="MCP tools for this chat"
+        title={remote ? "Replies from another device's profile run without tools" : "MCP tools for this chat"}
       >
         <Icon name="wrench" size={13} />
         <span className="hidden min-[480px]:inline">Tools</span>
-        {active > 0 && <span className="rounded-full bg-indigo-600 px-1.5 text-[10px] text-white">{active}</span>}
+        {active > 0 && !remote && <span className="rounded-full bg-indigo-600 px-1.5 text-[10px] text-white">{active}</span>}
       </button>
-      {open && (
+      {open && !remote && (
         <div className="fixed inset-x-3 bottom-24 z-30 rounded-xl sm:absolute sm:inset-x-auto sm:bottom-full sm:left-0 sm:mb-2 sm:w-80 border border-zinc-200 bg-white p-3 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
           <div className="mb-2 flex items-center justify-between">
             <span className="text-sm font-semibold">Tools in #{room.name}</span>
@@ -1418,6 +1420,9 @@ function ComposerSheet({
             Manage
           </button>
         </div>
+        {profileId?.startsWith("remote:") && (
+          <p className="mb-1 text-xs text-zinc-500">Replies from another device's profile run without tools.</p>
+        )}
         <ToolsList room={room} />
         <Button variant="outline" className="mt-5 w-full !py-3" onClick={onClose}>
           Done
@@ -1761,7 +1766,7 @@ ${before}` : t);
           <Icon name="sparkle" size={13} className={ai ? "text-indigo-600 dark:text-indigo-400" : ""} />
           <span className="truncate">
             {!anyProfile ? "Add an AI profile to get replies" : ai ? `AI reply · ${pickedLabel}` : "AI reply off"}
-            {toolsOn > 0 && ` · ${toolsOn} tool${toolsOn === 1 ? "" : "s"}`}
+            {toolsOn > 0 && !remote && ` · ${toolsOn} tool${toolsOn === 1 ? "" : "s"}`}
           </span>
           <Icon name="chevron" size={12} className="shrink-0 -rotate-90" />
         </button>
@@ -1872,7 +1877,7 @@ ${before}` : t);
               Add an AI profile
             </button>
           )}
-          <ToolsMenu room={room} onOpenSettings={onOpenSettings} />
+          <ToolsMenu room={room} onOpenSettings={onOpenSettings} remote={!!profileId?.startsWith("remote:")} />
           <div className="flex-1" />
           {platform === "desktop" && (
             <span className="hidden text-[11px] text-zinc-400 lg:inline">Shift+Enter for newline</span>
@@ -2128,7 +2133,9 @@ export function RoomView({
     ? remembered
     : sharedProfiles.some((p) => p.id === remembered)
       ? remembered
-      : (client.profiles[0]?.id ?? sharedProfiles[0]?.id ?? null);
+      : // Never fall back to another device's profile: that would send the room's
+        // history to a provider nobody picked. It's only used when chosen.
+        (client.profiles[0]?.id ?? null);
   const online = room.members.filter((m) => m.online).length;
 
   const copyCode = async () => {
