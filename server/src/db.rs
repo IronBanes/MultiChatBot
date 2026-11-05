@@ -125,14 +125,18 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
     .fetch_optional(&pool)
     .await?;
     if fts_existed.is_none() {
+        // One transaction: if the rebuild fails, the table isn't left behind empty
+        // (which would make the next start skip indexing the old messages).
+        let mut tx = pool.begin().await?;
         sqlx::raw_sql(FTS_SCHEMA)
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .context("creating messages_fts failed: this SQLite build lacks FTS5 (full-text search)")?;
         sqlx::query("INSERT INTO messages_fts(messages_fts) VALUES ('rebuild')")
-            .execute(&pool)
+            .execute(&mut *tx)
             .await
             .context("indexing existing messages into messages_fts")?;
+        tx.commit().await?;
     }
     // Streams cannot survive a server restart.
     sqlx::query("UPDATE messages SET status = 'interrupted' WHERE status = 'streaming'")

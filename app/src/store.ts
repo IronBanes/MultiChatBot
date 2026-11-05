@@ -222,7 +222,11 @@ export const useChat = create<ChatState>((set, get) => {
         onMessage: handle,
         onStatus: (status, error) => {
           // A lost answer can't arrive anymore; don't let it block loading forever.
-          if (status === "offline") set({ loadingOlder: {} });
+          if (status === "offline") {
+            set({ loadingOlder: {} });
+            // A jump waiting on that answer is dropped too, so it can't fire later.
+            pendingJumps.clear();
+          }
           // The relay marks our in-flight replies as interrupted when the socket drops.
           if (status === "offline") stopAllGenerations();
           if (status !== "online") set({ devices: [] });
@@ -336,6 +340,8 @@ export const useChat = create<ChatState>((set, get) => {
         // Image fetches still pending when the connection dropped never got an answer;
         // forget them so the images request again on this connection.
         const images = Object.fromEntries(Object.entries(get().images).filter(([, src]) => src));
+        // A new connection: no search jump is waiting on a page from the old one.
+        pendingJumps.clear();
         // hasMore stays: room_history needs it for older pages it keeps.
         set({ rooms, roomOrder: order, loaded: {}, loadingOlder: {}, activeRoomId: active, images });
         if (active) relay?.send({ type: "open_room", room_id: active });
