@@ -257,6 +257,27 @@ pub async fn recent_messages(db: &Db, room_id: &str, limit: i64) -> sqlx::Result
     with_reactions(db, with_attachments(db, messages).await?).await
 }
 
+/// The `limit` messages with `seq < before_seq` in the room, oldest first. Callers
+/// pass `limit + 1` and drop the extra row, so one query answers both the page and
+/// whether older messages still exist.
+pub async fn messages_before(
+    db: &Db,
+    room_id: &str,
+    before_seq: i64,
+    limit: i64,
+) -> sqlx::Result<Vec<Message>> {
+    let messages = sqlx::query_as(&format!(
+        "SELECT * FROM (SELECT {MESSAGE_COLS} FROM messages WHERE room_id = ? AND seq < ?
+         ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC"
+    ))
+    .bind(room_id)
+    .bind(before_seq)
+    .bind(limit)
+    .fetch_all(db)
+    .await?;
+    with_reactions(db, with_attachments(db, messages).await?).await
+}
+
 pub async fn message(db: &Db, id: &str) -> sqlx::Result<Option<Message>> {
     let m: Option<Message> = sqlx::query_as(&format!("SELECT {MESSAGE_COLS} FROM messages WHERE id = ?"))
         .bind(id)
@@ -707,6 +728,55 @@ mod tests {
         }
         assert_eq!(message(&db, "m1").await.unwrap().unwrap().reply_to, None);
         assert_eq!(message(&db, "m2").await.unwrap().unwrap().reply_to.as_deref(), Some("m1"));
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn messages_before_pages_older_messages_oldest_first() {
+        let dir = std::env::temp_dir().join(format!("mc-older-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users VALUES ('a', 'A', 0);
+             INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
+             INSERT INTO members VALUES ('r', 'a', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let ids = ["m1", "m2", "m3", "m4", "m5"];
+        for id in ids {
+            insert_message(
+                &db,
+                NewMessage {
+                    id,
+                    room_id: "r",
+                    kind: "human",
+                    author_id: "a",
+                    author_name: "A",
+                    content: "text",
+                    ai_requested: false,
+                    anchor_id: None,
+                    model: None,
+                    reply_to: None,
+                    status: "complete",
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let all = recent_messages(&db, "r", 10).await.unwrap();
+        let seqs: Vec<i64> = all.iter().map(|m| m.seq).collect();
+        let before = all[3].seq; // the 4th message
+        let page = messages_before(&db, "r", before, 2).await.unwrap();
+        assert_eq!(page.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), vec!["m2", "m3"]);
+        assert_eq!(page.iter().map(|m| m.seq).collect::<Vec<_>>(), seqs[1..3]);
+        // One extra row answers whether older messages still exist: 3 fetched, 2 kept.
+        let probe = messages_before(&db, "r", before, 3).await.unwrap();
+        assert_eq!(probe.len(), 3);
+        // Before the oldest message there is nothing, not even with a page size left over.
+        assert!(messages_before(&db, "r", all[0].seq, 2).await.unwrap().is_empty());
         db.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }

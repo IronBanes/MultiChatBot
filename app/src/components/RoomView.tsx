@@ -798,6 +798,9 @@ function MessageList({
 }) {
   const messages = useChat((s) => s.messages[room.id]);
   const loaded = useChat((s) => !!s.loaded[room.id]);
+  const hasMore = useChat((s) => !!s.hasMore[room.id]);
+  const loadingOlder = useChat((s) => !!s.loadingOlder[room.id]);
+  const loadOlder = useChat((s) => s.loadOlder);
   const myId = useChat((s) => s.client!.user_id);
   // Stable reference: MessageItem is memo'd, so it must not see a new array each render.
   const members = useMemo(() => room.members, [room.members]);
@@ -807,7 +810,11 @@ function MessageList({
   /** Distance from the bottom of the list, kept when the list is resized (window, or an
    *  on-screen keyboard opening) so the same messages stay in view. */
   const fromBottom = useRef(0);
+  /** The first message's id as of the last render. A change (with the same room) means
+   *  older messages were prepended, not that the list grew at the bottom. */
+  const firstId = useRef<string | null>(null);
   const byId = useMemo(() => new Map((messages ?? []).map((m) => [m.id, m])), [messages]);
+  const list = messages ?? [];
 
   useLayoutEffect(() => {
     stick.current = true;
@@ -817,8 +824,16 @@ function MessageList({
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    if (stick.current) el.scrollTop = el.scrollHeight;
-    else fromBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const first = list[0]?.id ?? null;
+    if (!stick.current && firstId.current !== null && firstId.current !== first) {
+      // Older messages were prepended: keep what the user is reading in place by
+      // restoring the distance from the bottom saved before the change (the raw
+      // scrollTop would land on the new rows instead). This isn't new content at the
+      // bottom, so the stick flag is left alone.
+      el.scrollTop = el.scrollHeight - el.clientHeight - fromBottom.current;
+    } else if (stick.current) el.scrollTop = el.scrollHeight;
+    fromBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight;
+    firstId.current = first;
   }, [messages, room.id]);
 
   // On resize (window, or the keyboard opening), keep the newest message in view, or
@@ -848,7 +863,17 @@ function MessageList({
     if (!el) return;
     fromBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight;
     stick.current = fromBottom.current < 80;
+    // Scrolled up to (or near) the top: fetch the previous page of older messages.
+    if (hasMore && !loadingOlder && el.scrollTop < 300) loadOlder(room.id);
   };
+
+  // A load can land short of filling the screen (no scrollbar): if older messages
+  // still exist, keep asking until the list overflows or the history runs out.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !loaded || !hasMore || loadingOlder) return;
+    if (el.scrollHeight <= el.clientHeight) loadOlder(room.id);
+  }, [messages, loaded, hasMore, loadingOlder, room.id, loadOlder]);
 
   /** Scrolls a reply's quote to its original and flashes it. */
   const onJump = useCallback((id: string) => {
@@ -866,7 +891,6 @@ function MessageList({
     window.setTimeout(() => el.classList.remove("flash-highlight"), 1500);
   }, []);
 
-  const list = messages ?? [];
   return (
     <div ref={ref} onScroll={onScroll} className={`min-h-0 flex-1 overflow-y-auto ${bubbles ? "overscroll-contain pb-9" : "pb-8"}`}>
       {/* The bottom padding keeps the last row clear of the floating typing indicator. */}
@@ -874,6 +898,12 @@ function MessageList({
           older messages move up as new ones arrive. */}
       <div ref={content} className={`mx-auto max-w-4xl ${bubbles ? "flex min-h-full flex-col justify-end" : ""}`}>
         {!loaded && list.length === 0 && <div className="p-8 text-center text-sm text-zinc-400">Loading history…</div>}
+        {/* Always the same height, so the status changing doesn't move what you're reading. */}
+        {loaded && list.length > 0 && (
+          <div className="h-9 pt-3 text-center text-xs text-zinc-500">
+            {loadingOlder ? "Loading earlier messages…" : hasMore ? "" : `Start of #${room.name}`}
+          </div>
+        )}
         {loaded && list.length === 0 && (
           <div className="mx-auto mt-16 max-w-sm px-6 text-center">
             <Logo size={48} className="mx-auto mb-3" />

@@ -84,7 +84,8 @@ all rooms. The first client frame must be `hello`.
 | `create_room` | `request_id, name` | → `room_joined` |
 | `join_room` | `request_id, invite_code` | → `room_joined` |
 | `leave_room` | `room_id` | |
-| `open_room` | `room_id` | → `room_history` |
+| `open_room` | `room_id` | → `room_history` (the newest 200 messages) |
+| `load_older` | `room_id, before_seq` | → `older_messages`: the next 100 messages older than `before_seq`, oldest first; members only |
 | `send_message` | `room_id, id, content, ai_requested, reply_to?` | human message; `reply_to` must be a non-deleted message in the room |
 | `ai_start` | `room_id, id, anchor_id, model` | anchor = human msg in room |
 | `ai_delta` | `room_id, id, delta` | only from the stream's owner connection |
@@ -109,7 +110,8 @@ all rooms. The first client frame must be `hello`.
 | `welcome` | `user_id, rooms: RoomInfo[]` |
 | `room_joined` | `request_id?, room: RoomInfo` |
 | `room_left` | `room_id` |
-| `room_history` | `room_id, messages: Message[]` |
+| `room_history` | `room_id, messages: Message[], has_more` (newest 200; `has_more` true when older messages exist) |
+| `older_messages` | `room_id, messages: Message[], has_more` (answers `load_older`; page of 100, oldest first) |
 | `message` | `room_id, message: Message` (human, or AI on `ai_start` with status `streaming`) |
 | `ai_delta` | `room_id, id, delta` |
 | `ai_reasoning` | `room_id, id, delta` |

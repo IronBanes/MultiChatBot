@@ -30,6 +30,11 @@ pub enum ClientMsg {
     OpenRoom {
         room_id: String,
     },
+    /// Asks for the next page of history older than `before_seq`.
+    LoadOlder {
+        room_id: String,
+        before_seq: i64,
+    },
     SendMessage {
         room_id: String,
         id: String,
@@ -132,6 +137,14 @@ pub enum ServerMsg {
     RoomHistory {
         room_id: String,
         messages: Vec<Message>,
+        /// True when older messages exist before the first one sent.
+        has_more: bool,
+    },
+    /// One page of older messages, answering `load_older`.
+    OlderMessages {
+        room_id: String,
+        messages: Vec<Message>,
+        has_more: bool,
     },
     Message {
         room_id: String,
