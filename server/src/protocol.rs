@@ -115,6 +115,26 @@ pub enum ClientMsg {
         room_id: String,
         message_id: String,
     },
+    /// This connection's profiles that the user's other devices may generate with
+    /// (id, label and model only; keys never leave the device).
+    ShareProfiles {
+        profiles: Vec<SharedProfile>,
+    },
+    /// Asks one of the user's own devices to reply to `anchor_id` with its profile
+    /// (delegated generation; the target answers `ai_requested` or `ai_request_failed`).
+    RequestAi {
+        request_id: String,
+        room_id: String,
+        anchor_id: String,
+        device_id: String,
+        profile_id: String,
+    },
+    /// The target device's answer when it can't fulfil an `ai_requested`.
+    AiRequestFailed {
+        request_id: String,
+        to_device_id: String,
+        message: String,
+    },
     CreateLinkCode {
         request_id: String,
     },
@@ -246,6 +266,17 @@ pub enum ServerMsg {
         room_id: String,
         message: Message,
     },
+    /// Answers `request_ai`: delivered to the target device only, never stored.
+    AiRequested {
+        request_id: String,
+        room_id: String,
+        anchor_id: String,
+        /// The anchor's position, so the device can load back to it if it's older than
+        /// what it has loaded (`load_older` with `until_seq`).
+        anchor_seq: i64,
+        profile_id: String,
+        from_device_id: String,
+    },
     LinkCode {
         request_id: String,
         code: String,
@@ -287,6 +318,19 @@ pub struct Device {
     pub device_id: String,
     pub device_name: String,
     pub platform: String,
+    /// Profiles this device shares with the user's other devices (empty unless it
+    /// sent `share_profiles` on this connection).
+    #[serde(default)]
+    pub profiles: Vec<SharedProfile>,
+}
+
+/// A profile another of the user's devices may generate with. Only id, label and
+/// model cross the wire — never the key, provider or base URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedProfile {
+    pub id: String,
+    pub label: String,
+    pub model: String,
 }
 
 /// An MCP tool call made while generating an AI reply. Only names and status

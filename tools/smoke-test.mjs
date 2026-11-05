@@ -8,6 +8,10 @@ class Client {
   constructor(name) {
     this.name = name;
     this.userId = uuid();
+    // Optional device identity for linked-device tests (same account, own device).
+    this.deviceId = "";
+    this.deviceName = "";
+    this.platform = "";
     this.inbox = [];
     this.waiters = [];
   }
@@ -15,7 +19,14 @@ class Client {
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(URL_);
       this.ws.onopen = () => {
-        this.send({ type: "hello", user_id: this.userId, display_name: this.name });
+        this.send({
+          type: "hello",
+          user_id: this.userId,
+          display_name: this.name,
+          device_id: this.deviceId,
+          device_name: this.deviceName,
+          platform: this.platform,
+        });
         resolve();
       };
       this.ws.onerror = () => reject(new Error(`${this.name}: cannot connect to ${URL_}`));
@@ -317,6 +328,103 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   const denied = await mallory.wait(type("error", (m) => m.request_id === "s4"), "search refused for a non-member");
   ok(/Not a member/.test(denied.message), "search from a non-member gets an error frame with the request_id");
   mallory.close();
+}
+
+// Delegated AI (device linking phase 2): a PC shares its profiles; a phone of
+// the SAME user (same user_id, its own device_id) asks it to reply.
+{
+  alice.send({ type: "create_room", request_id: "r5", name: "Delegated AI" });
+  const created = await alice.wait(type("room_joined", (m) => m.request_id === "r5"), "room_joined (delegated AI)");
+  const droom = created.room;
+
+  const pc = new Client("Alice");
+  pc.userId = alice.userId; // same account, another device
+  pc.deviceId = "pc-1";
+  pc.deviceName = "Office PC";
+  pc.platform = "windows";
+  await pc.open();
+  await pc.wait(type("welcome"), "welcome (PC)");
+  pc.send({ type: "join_room", request_id: "r6", invite_code: droom.invite_code });
+  await pc.wait(type("room_joined", (m) => m.request_id === "r6"), "room_joined (PC)");
+
+  const phone = new Client("Alice");
+  phone.userId = alice.userId; // same account, the phone
+  phone.deviceId = "phone-1";
+  phone.deviceName = "Pixel";
+  phone.platform = "android";
+  await phone.open();
+  await phone.wait(type("welcome"), "welcome (phone)");
+  phone.send({ type: "join_room", request_id: "r7", invite_code: droom.invite_code });
+  await phone.wait(type("room_joined", (m) => m.request_id === "r7"), "room_joined (phone)");
+  // The account's other devices hear about a room one of them creates, without a request id.
+  phone.send({ type: "create_room", request_id: "r7b", name: "Made on the phone" });
+  const made = await phone.wait(type("room_joined", (m) => m.request_id === "r7b"), "room_joined (phone creates)");
+  const told = await pc.wait(type("room_joined", (m) => m.room.id === made.room.id), "room_joined (PC told)");
+  ok(told.request_id === null && told.room.name === "Made on the phone", "a room created on one device reaches the account's other devices");
+
+  // Bob (another user) joins too, to see nothing of this.
+  const bobd = new Client("Bob");
+  // A real device of another user, in the room: request_ai must still not reach it.
+  bobd.deviceId = "bob-dev";
+  bobd.deviceName = "Bob's PC";
+  bobd.platform = "windows";
+  await bobd.open();
+  bobd.send({ type: "join_room", request_id: "r8", invite_code: droom.invite_code });
+  await bobd.wait(type("room_joined", (m) => m.request_id === "r8"), "room_joined (Bob, delegated room)");
+
+  // The PC shares one profile.
+  pc.send({ type: "share_profiles", profiles: [{ id: "prof-1", label: "Claude", model: "claude-opus-5-5" }] });
+  const devPc = await phone.wait(
+    type("devices", (m) => m.devices.some((d) => d.device_id === "pc-1" && d.profiles.some((p) => p.id === "prof-1"))),
+    "devices with the PC's shared profile (phone)",
+  );
+  ok(devPc.devices.some((d) => d.device_id === "pc-1" && d.profiles.length === 1 && d.profiles[0].model === "claude-opus-5-5"),
+    "the PC's shared profile reaches the user's other connections");
+  await pc.wait(
+    type("devices", (m) => m.devices.some((d) => d.device_id === "pc-1" && d.profiles.length === 1)),
+    "devices with the shared profile (PC)",
+  );
+
+  // The phone asks the PC to reply to its message with that profile.
+  const anchorId = uuid();
+  phone.send({ type: "send_message", room_id: droom.id, id: anchorId, content: "please answer from the PC", ai_requested: true });
+  const anchorMsg = await pc.wait(type("message", (m) => m.message.id === anchorId), "phone message reaches the PC");
+  const reqId = uuid();
+  phone.send({ type: "request_ai", request_id: reqId, room_id: droom.id, anchor_id: anchorId, device_id: "pc-1", profile_id: "prof-1" });
+  const asked = await pc.wait(type("ai_requested", (m) => m.request_id === reqId), "ai_requested");
+  ok(
+    asked.room_id === droom.id && asked.anchor_id === anchorId && asked.profile_id === "prof-1" && asked.from_device_id === "phone-1",
+    "ai_requested carries the same request, room, anchor, profile and the phone's device_id",
+  );
+  ok(asked.anchor_seq === anchorMsg.message.seq, "ai_requested carries the anchor's seq, to load back to it");
+  ok(
+    !bobd.inbox.some((m) => m.type === "ai_requested") && !alice.inbox.some((m) => m.type === "ai_requested"),
+    "other users and other connections get nothing",
+  );
+
+  // The PC can't do it: the phone gets an error with that request_id.
+  pc.send({ type: "ai_request_failed", request_id: reqId, to_device_id: "phone-1", message: "That AI profile isn't on this computer anymore" });
+  const failed = await phone.wait(type("error", (m) => m.request_id === reqId), "error for the failed request");
+  ok(/AI profile/.test(failed.message), "ai_request_failed reaches the asking device as an error frame");
+
+  // Refusals: offline device, another user's device, an anchor in another room.
+  phone.send({ type: "request_ai", request_id: "rq-off", room_id: droom.id, anchor_id: anchorId, device_id: "ghost", profile_id: "prof-1" });
+  const off = await phone.wait(type("error", (m) => m.request_id === "rq-off"), "error (offline device)");
+  ok(/offline/.test(off.message), "request_ai to an offline device is refused");
+  phone.send({ type: "request_ai", request_id: "rq-foreign", room_id: droom.id, anchor_id: anchorId, device_id: "bob-dev", profile_id: "prof-1" });
+  const foreign = await phone.wait(type("error", (m) => m.request_id === "rq-foreign"), "error (another user's device)");
+  ok(/offline/.test(foreign.message), "request_ai to another user's device id is refused");
+  ok(!bobd.inbox.some((m) => m.type === "ai_requested"), "another user's device never receives the request");
+  phone.send({ type: "request_ai", request_id: "rq-anchor", room_id: droom.id, anchor_id: room.id, device_id: "pc-1", profile_id: "prof-1" });
+  const badAnchor = await phone.wait(type("error", (m) => m.request_id === "rq-anchor"), "error (foreign anchor)");
+  ok(/isn't in this room/.test(badAnchor.message), "request_ai anchored outside the room is refused");
+  phone.send({ type: "request_ai", request_id: "rq-own", room_id: droom.id, anchor_id: anchorId, device_id: "phone-1", profile_id: "prof-1" });
+  const own = await phone.wait(type("error", (m) => m.request_id === "rq-own"), "error (own device)");
+  ok(/offline/.test(own.message), "request_ai to one's own connection is refused");
+
+  pc.close();
+  phone.close();
+  bobd.close();
 }
 
 alice.close();

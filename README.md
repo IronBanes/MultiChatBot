@@ -81,7 +81,9 @@ To use your phone as the same person as your computer, link them. On the compute
 **Settings → General → Devices → Create code**. On the phone, enter that code under
 **Link to another device**. The phone then shows the computer's rooms, and its messages
 count as yours. Codes work once and expire after 10 minutes. **Unlink** returns the phone
-to its own account and rooms. AI profiles and MCP servers stay on each device for now.
+to its own account and rooms. A linked phone can also use the computer's AI profiles
+while the computer is online — pick one labelled "· on <device>" and the computer
+generates the reply with its own keys.
 
 ### Playing with a friend
 

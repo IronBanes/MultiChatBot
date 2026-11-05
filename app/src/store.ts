@@ -4,7 +4,19 @@ import { create, type StoreApi } from "zustand";
 import { backend, errorText } from "./lib/backend";
 import { prepareImage } from "./lib/images";
 import { Relay, type ConnStatus } from "./lib/relay";
-import type { Attachment, ClientState, Device, HistoryItem, McpMode, Message, RoomInfo, SearchHit, ServerMsg, ToolStatus } from "./lib/types";
+import type {
+  Attachment,
+  ClientState,
+  Device,
+  HistoryItem,
+  McpMode,
+  Message,
+  RoomInfo,
+  SearchHit,
+  ServerMsg,
+  SharedProfile,
+  ToolStatus,
+} from "./lib/types";
 
 /** Tool call details only the sender sees (arguments and a result preview). */
 export interface LocalTool {
@@ -101,6 +113,28 @@ interface ChatState {
 let relay: Relay | null = null;
 /** Human message id → profile id, waiting for the server echo before the AI call starts. */
 const pendingAi = new Map<string, string>();
+
+/** A profile on another of this user's devices is referenced as `remote:<device_id>:<profile_id>`. */
+export function remoteProfileId(deviceId: string, profileId: string): string {
+  return `remote:${deviceId}:${profileId}`;
+}
+
+export function parseRemoteProfileId(id: string): { deviceId: string; profileId: string } | null {
+  if (!id.startsWith("remote:")) return null;
+  const rest = id.slice("remote:".length);
+  const cut = rest.indexOf(":");
+  if (cut <= 0 || cut === rest.length - 1) return null;
+  return { deviceId: rest.slice(0, cut), profileId: rest.slice(cut + 1) };
+}
+
+/** An `ai_requested` waiting for the room's history to load here, so the anchor
+ *  can be found and the reply generated: room → pending requests. */
+const pendingDelegatedOpens = new Map<string, { requestId: string; anchorId: string; anchorSeq: number; profileId: string; fromDeviceId: string }[]>();
+/** Generation ids this client is generating for another of this user's devices.
+ *  These run without MCP tools (see `backend.generate`'s `delegated`). */
+const delegatedGenerations = new Set<string>();
+/** The profile list last shared on the current connection (null: none yet). */
+let lastSharedProfiles: string | null = null;
 /** Images announced for a reply this client hasn't loaded yet (e.g. while joining). */
 const unclaimedAttachments = new Map<string, Attachment[]>();
 /** Room id → the message a search jump is waiting for, while older history that
@@ -205,6 +239,19 @@ export const useChat = create<ChatState>((set, get) => {
     for (const id of Object.keys(get().myGenerations)) void backend.stopGeneration(id);
   };
 
+  /** Desktops publish their profiles (id, label, model only) so the user's other
+   *  devices can generate with them; phones share nothing. */
+  function shareMyProfiles() {
+    const client = get().client;
+    if (!relay || client?.platform !== "desktop") return;
+    const profiles: SharedProfile[] = (client.profiles ?? []).map((p) => ({ id: p.id, label: p.label, model: p.model }));
+    // Only when the list changed on this connection: every share makes the relay
+    // send `devices` again, so sharing in answer to that would never stop.
+    const key = JSON.stringify(profiles);
+    if (key === lastSharedProfiles) return;
+    if (relay.send({ type: "share_profiles", profiles })) lastSharedProfiles = key;
+  }
+
   function connect() {
     const client = get().client;
     relay?.close();
@@ -226,6 +273,19 @@ export const useChat = create<ChatState>((set, get) => {
             set({ loadingOlder: {} });
             // A jump waiting on that answer is dropped too, so it can't fire later.
             pendingJumps.clear();
+            // An `ai_requested` waiting for this connection's room_history can't
+            // finish anymore; tell the asking device instead of waiting forever.
+            for (const [roomId, pending] of pendingDelegatedOpens) {
+              for (const p of pending) {
+                relay?.send({
+                  type: "ai_request_failed",
+                  request_id: p.requestId,
+                  to_device_id: p.fromDeviceId,
+                  message: "Couldn't load the room",
+                });
+              }
+              pendingDelegatedOpens.delete(roomId);
+            }
           }
           // The relay marks our in-flight replies as interrupted when the socket drops.
           if (status === "offline") stopAllGenerations();
@@ -248,11 +308,99 @@ export const useChat = create<ChatState>((set, get) => {
     return `(replying to ${quote})\n${m.content}`;
   }
 
-  function startAi(roomId: string, anchor: Message, profileId: string) {
+  /** Asks another of this user's devices to reply to `anchorId` with its profile. Only
+   *  counts once the frame was really written, so a drop right after queueing it is
+   *  reported (not retried: it may have reached the relay). */
+  function askRemote(roomId: string, anchorId: string, deviceId: string, profileId: string) {
+    const msg = { type: "request_ai", request_id: crypto.randomUUID(), room_id: roomId, anchor_id: anchorId, device_id: deviceId, profile_id: profileId } as const;
+    void (relay ? relay.sendConfirmed(msg) : Promise.resolve(false)).then((ok) => {
+      if (!ok) get().toast("The AI reply wasn't requested: not connected to the server");
+    });
+  }
+
+  /** Serves an `ai_requested` from another of this user's devices: find the anchor
+   *  in the loaded messages (or wait for `room_history`), then generate with the
+   *  local profile exactly as a local request. Failures go back to the asking
+   *  device as `ai_request_failed`; nothing is stored for the request itself. */
+  function runDelegatedAi(
+    requestId: string,
+    roomId: string,
+    anchorId: string,
+    anchorSeq: number,
+    profileId: string,
+    fromDeviceId: string,
+  ) {
+    const fail = (message: string) =>
+      relay?.send({ type: "ai_request_failed", request_id: requestId, to_device_id: fromDeviceId, message });
+    // Only a local profile id that still exists can answer; the relay already
+    // guarantees the request came from one of this user's own devices.
+    if (!get().client?.profiles.some((p) => p.id === profileId)) {
+      fail("That AI profile isn't on this computer anymore");
+      return;
+    }
+    // Left the room meanwhile: opening it would fail without telling the asking device.
+    if (!get().rooms[roomId]) {
+      fail("This computer isn't in that room anymore");
+      return;
+    }
+    // The room's messages aren't loaded here yet: ask for them and retry when
+    // the history arrives (or give up if the connection drops first).
+    if (!get().loaded[roomId]) {
+      const waiting = pendingDelegatedOpens.get(roomId) ?? [];
+      waiting.push({ requestId, anchorId, anchorSeq, profileId, fromDeviceId });
+      pendingDelegatedOpens.set(roomId, waiting);
+      if (waiting.length === 1) relay?.send({ type: "open_room", room_id: roomId });
+      return;
+    }
+    const s = get();
+    const anchor = s.messages[roomId]?.find((m) => m.id === anchorId);
+    if (!anchor) {
+      // Older than what's loaded here: load back to it (one page reaching the anchor,
+      // as a search jump does) and try again when it arrives.
+      const first = s.messages[roomId]?.[0];
+      if (first && s.hasMore[roomId] && anchorSeq < first.seq) {
+        const waiting = pendingDelegatedOpens.get(roomId) ?? [];
+        waiting.push({ requestId, anchorId, anchorSeq, profileId, fromDeviceId });
+        pendingDelegatedOpens.set(roomId, waiting);
+        if (!s.loadingOlder[roomId]) {
+          const ok = relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq, until_seq: anchorSeq });
+          if (ok) set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));
+          else {
+            pendingDelegatedOpens.delete(roomId);
+            fail("Couldn't load the room");
+          }
+        }
+        return;
+      }
+      fail("That message isn't in this room's history");
+      return;
+    }
+    startAi(
+      roomId,
+      anchor,
+      profileId,
+      (id) => {
+        delegatedGenerations.add(id);
+        return () => delegatedGenerations.delete(id);
+      },
+      // The asking device hears about a failed reply directly, not only via the room.
+      fail,
+    );
+  }
+
+  function startAi(
+    roomId: string,
+    anchor: Message,
+    profileId: string,
+    delegated?: (id: string) => () => void,
+    /** Also told when the reply fails (a delegated request's asking device). */
+    onFail?: (message: string) => void,
+  ) {
     const s = get();
     const profile = s.client?.profiles.find((p) => p.id === profileId);
     if (!profile) {
       get().toast("That AI profile no longer exists. Pick another one.");
+      onFail?.("That AI profile isn't on this computer anymore");
       return;
     }
     const room = s.rooms[roomId];
@@ -265,22 +413,26 @@ export const useChat = create<ChatState>((set, get) => {
     const id = crypto.randomUUID();
     if (!relay?.send({ type: "ai_start", room_id: roomId, id, anchor_id: anchor.id, model: profile.model })) {
       get().toast("Not connected to the server");
+      onFail?.("The other device couldn't reach the server");
       return;
     }
     set((st) => ({ myGenerations: { ...st.myGenerations, [id]: true } }));
+    const stopDelegatedTracking = delegated?.(id);
     // Images are compressed before relaying; the reply only ends after they're sent.
     let uploads: Promise<void> = Promise.resolve();
     const afterUploads = (f: () => void) => {
       uploads = uploads.then(f, f);
     };
-    const finish = () =>
+    const finish = () => {
+      stopDelegatedTracking?.();
       set((st) => {
         const { [id]: _, ...rest } = st.myGenerations;
         return { myGenerations: rest };
       });
+    };
 
     backend
-      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", (ev) => {
+      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", !!stopDelegatedTracking, (ev) => {
         if (ev.event === "delta") {
           relay?.send({ type: "ai_delta", room_id: roomId, id, delta: ev.text });
         } else if (ev.event === "reasoning") {
@@ -319,12 +471,14 @@ export const useChat = create<ChatState>((set, get) => {
           const error = ev.message;
           afterUploads(() => {
             relay?.send({ type: "ai_error", room_id: roomId, id, error });
+            onFail?.(error);
             finish();
           });
         }
       })
       .catch((e) => {
         relay?.send({ type: "ai_error", room_id: roomId, id, error: errorText(e) });
+        onFail?.(errorText(e));
         finish();
       });
   }
@@ -332,6 +486,9 @@ export const useChat = create<ChatState>((set, get) => {
   function handle(msg: ServerMsg) {
     switch (msg.type) {
       case "welcome": {
+        // A new connection starts with nothing shared: publish this desktop's profiles.
+        lastSharedProfiles = null;
+        shareMyProfiles();
         const rooms: Record<string, RoomInfo> = {};
         for (const r of msg.rooms) rooms[r.id] = r;
         const order = msg.rooms.map((r) => r.id);
@@ -356,22 +513,42 @@ export const useChat = create<ChatState>((set, get) => {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
         if (msg.request_id) pendingRequests.delete(msg.request_id);
         pending?.resolve(r);
-        get().selectRoom(r.id);
+        // Without a request id it's a room another of my devices created or joined:
+        // list it, but don't switch to it here.
+        if (msg.request_id) get().selectRoom(r.id);
         break;
       }
       case "room_left":
+        // Requests from my other devices that waited for this room can't be answered now.
+        for (const p of pendingDelegatedOpens.get(msg.room_id) ?? []) {
+          relay?.send({ type: "ai_request_failed", request_id: p.requestId, to_device_id: p.fromDeviceId, message: "Couldn't load the room" });
+        }
+        pendingDelegatedOpens.delete(msg.room_id);
         set((s) => {
           const { [msg.room_id]: _, ...rooms } = s.rooms;
           const roomOrder = s.roomOrder.filter((id) => id !== msg.room_id);
+          // Forget the room's cached history too: if the account rejoins later, it loads
+          // fresh instead of showing (or generating from) messages that changed meanwhile.
+          const { [msg.room_id]: _m, ...messages } = s.messages;
+          const { [msg.room_id]: _l, ...loaded } = s.loaded;
+          const { [msg.room_id]: _h, ...hasMore } = s.hasMore;
           return {
             rooms,
             roomOrder,
+            messages,
+            loaded,
+            hasMore,
             activeRoomId: s.activeRoomId === msg.room_id ? (roomOrder[0] ?? null) : s.activeRoomId,
           };
         });
         break;
-      case "room_history":
+      case "room_history": {
+        const waiting = pendingDelegatedOpens.get(msg.room_id) ?? [];
+        if (waiting.length) pendingDelegatedOpens.delete(msg.room_id);
         set((s) => {
+          // Left the room before its history arrived: don't keep (or mark loaded) a room
+          // this device is no longer in, or a rejoin would skip loading it fresh.
+          if (!s.rooms[msg.room_id]) return {};
           // Keep anything live that arrived after the history snapshot, including images
           // announced while the snapshot was being read.
           const current = s.messages[msg.room_id] ?? [];
@@ -391,9 +568,14 @@ export const useChat = create<ChatState>((set, get) => {
             hasMore: { ...s.hasMore, [msg.room_id]: older.length ? (s.hasMore[msg.room_id] ?? true) : msg.has_more },
           };
         });
+        // Delegated `ai_requested`s that waited for this history: run them now
+        // that the anchor is (or isn't) among the loaded messages.
+        for (const p of waiting) runDelegatedAi(p.requestId, msg.room_id, p.anchorId, p.anchorSeq, p.profileId, p.fromDeviceId);
         break;
+      }
       case "older_messages":
         set((s) => {
+          if (!s.rooms[msg.room_id]) return { loadingOlder: { ...s.loadingOlder, [msg.room_id]: false } };
           const current = s.messages[msg.room_id] ?? [];
           // Keep only what's older than the current first message; skip ids already
           // present (a duplicate answer to a retry, or a race with room_history).
@@ -411,6 +593,12 @@ export const useChat = create<ChatState>((set, get) => {
         // A search jump waiting for this page: point MessageList at the target,
         // or ask again when the page was capped short of it.
         continueJump(set, get, msg.room_id);
+        {
+          // Delegated requests that waited for older history: try them again.
+          const waiting = pendingDelegatedOpens.get(msg.room_id) ?? [];
+          pendingDelegatedOpens.delete(msg.room_id);
+          for (const p of waiting) runDelegatedAi(p.requestId, msg.room_id, p.anchorId, p.anchorSeq, p.profileId, p.fromDeviceId);
+        }
         break;
       case "search_results": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
@@ -434,10 +622,21 @@ export const useChat = create<ChatState>((set, get) => {
         const profileId = pendingAi.get(m.id);
         if (profileId && m.kind === "human") {
           pendingAi.delete(m.id);
-          startAi(m.room_id, m, profileId);
+          // A remote profile ("remote:<device>:<profile>") is generated by that
+          // device: send it a `request_ai` instead of starting one here.
+          const remote = parseRemoteProfileId(profileId);
+          if (remote) {
+            askRemote(m.room_id, m.id, remote.deviceId, remote.profileId);
+          } else {
+            startAi(m.room_id, m, profileId);
+          }
         }
         break;
       }
+      case "ai_requested":
+        // Another of this user's devices asked this one to reply with its profile.
+        runDelegatedAi(msg.request_id, msg.room_id, msg.anchor_id, msg.anchor_seq, msg.profile_id, msg.from_device_id);
+        break;
       case "ai_delta":
         set((s) => ({
           messages: {
@@ -588,7 +787,8 @@ export const useChat = create<ChatState>((set, get) => {
         break;
       }
       case "devices":
-        set({ devices: msg.devices });
+        // An older relay may leave `profiles` out: treat that as sharing nothing.
+        set({ devices: msg.devices.map((d) => ({ ...d, profiles: d.profiles ?? [] })) });
         break;
       case "error": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
@@ -631,6 +831,9 @@ export const useChat = create<ChatState>((set, get) => {
 
     async refreshClient() {
       set({ client: await backend.getState() });
+      // Profiles added, edited or deleted here change what this user's other
+      // devices can pick; publish the fresh list (desktop only).
+      shareMyProfiles();
     },
 
     reconnect() {
@@ -698,6 +901,8 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     async sendMessage(roomId, content, aiRequested, profileId, replyTo) {
+      // A remote profile id ("remote:<device>:<profile>") is kept like any other:
+      // the request goes to that device once the message echoes back.
       const id = crypto.randomUUID();
       if (aiRequested && profileId) pendingAi.set(id, profileId);
       const ok = relay
@@ -727,6 +932,12 @@ export const useChat = create<ChatState>((set, get) => {
       const anchor = get().messages[ai.room_id]?.find((m) => m.id === ai.anchor_id);
       if (!anchor) {
         get().toast("The message this reply answers is no longer loaded");
+        return;
+      }
+      // With a remote profile id, the other device generates from the same anchor.
+      const remote = parseRemoteProfileId(profileId);
+      if (remote) {
+        askRemote(ai.room_id, anchor.id, remote.deviceId, remote.profileId);
         return;
       }
       startAi(ai.room_id, anchor, profileId);

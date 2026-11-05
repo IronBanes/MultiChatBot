@@ -53,11 +53,14 @@ export const backend = {
     roomId: string,
     history: HistoryItem[],
     roomPrompt: string,
+    /** For another of this user's devices: no MCP tools (nobody here to approve, and
+     *  the relay can't yet prove who asked). */
+    delegated: boolean,
     onEvent: (e: GenEvent) => void,
   ) => {
     const channel = new Channel<GenEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, onEvent: channel });
+    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, delegated, onEvent: channel });
   },
   stopGeneration: (id: string) => invoke<void>("stop_generation", { id }),
 
