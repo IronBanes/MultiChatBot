@@ -132,6 +132,36 @@ pub fn delete_key(profile_id: &str) -> Result<(), String> {
     delete(&format!("profile:{profile_id}"))
 }
 
+/// The keychain name of the secret that signs this app instance in to `user_id`. Each
+/// instance (`MULTICHAT_INSTANCE`) keeps its own copy, so unlinking one doesn't sign the
+/// others out; the default instance keeps the plain name.
+fn account_entry(instance: &str, user_id: &str) -> String {
+    if instance == "default" { format!("account:{user_id}") } else { format!("account:{instance}:{user_id}") }
+}
+
+/// The secret that signs this app instance in to account `user_id` on the relay. A
+/// non-default instance without its own copy picks up the shared one (from before
+/// secrets were per instance) without making a new secret.
+pub fn get_account(instance: &str, user_id: &str) -> Result<Option<String>, String> {
+    let own = get(&account_entry(instance, user_id))?;
+    if own.is_some() || instance == "default" {
+        return Ok(own);
+    }
+    let shared = get(&format!("account:{user_id}"))?;
+    if let Some(s) = &shared {
+        set(&account_entry(instance, user_id), s)?;
+    }
+    Ok(shared)
+}
+
+pub fn set_account(instance: &str, user_id: &str, secret: &str) -> Result<(), String> {
+    set(&account_entry(instance, user_id), secret)
+}
+
+pub fn delete_account(instance: &str, user_id: &str) -> Result<(), String> {
+    delete(&account_entry(instance, user_id))
+}
+
 /// Env vars (stdio servers) and HTTP headers (remote servers) for an MCP server.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpSecrets {

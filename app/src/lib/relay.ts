@@ -101,11 +101,12 @@ export class Relay {
     device_id: string;
     device_name: string;
     platform: string;
+    secret: string;
   };
 
   constructor(
     private url: string,
-    identity: { user_id: string; display_name: string; device_id: string; platform: string },
+    identity: { user_id: string; display_name: string; device_id: string; platform: string; secret: string },
     private handlers: Handlers,
   ) {
     this.hello = { ...identity, device_name: deviceName(identity.platform) };

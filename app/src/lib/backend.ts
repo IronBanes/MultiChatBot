@@ -21,8 +21,8 @@ export const backend = {
   setIdentity: (displayName: string, serverUrl: string) =>
     invoke<void>("set_identity", { displayName, serverUrl }),
   /** Switches this device to another device's account (device linking). */
-  linkDevice: (userId: string, displayName: string) =>
-    invoke<void>("link_device", { userId, displayName }),
+  linkDevice: (userId: string, displayName: string, secret: string) =>
+    invoke<void>("link_device", { userId, displayName, secret }),
   /** Returns this device to its own account after `linkDevice`. */
   unlinkDevice: () => invoke<void>("unlink_device"),
   /** apiKey: undefined keeps the stored key, "" removes it. */

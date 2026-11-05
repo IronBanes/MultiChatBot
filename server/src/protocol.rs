@@ -15,6 +15,10 @@ pub enum ClientMsg {
         device_name: String,
         #[serde(default)]
         platform: String,
+        /// The account's secret: proves this connection may act as `user_id`. The
+        /// relay keeps only its hash. Empty from clients older than authentication.
+        #[serde(default)]
+        secret: String,
     },
     CreateRoom {
         request_id: String,
@@ -137,6 +141,9 @@ pub enum ClientMsg {
     },
     CreateLinkCode {
         request_id: String,
+        /// This account's secret, handed to the device that redeems the code.
+        #[serde(default)]
+        secret: String,
     },
     RedeemLinkCode {
         request_id: String,
@@ -286,6 +293,8 @@ pub enum ServerMsg {
         request_id: String,
         user_id: String,
         display_name: String,
+        /// The account's secret, so the linked device can sign in as it.
+        secret: String,
     },
     Devices {
         devices: Vec<Device>,

@@ -1031,17 +1031,17 @@ function LinkSection() {
         <span className="block text-xs font-medium text-zinc-700 dark:text-zinc-300">Link to another device</span>
         <div className="flex flex-wrap items-center gap-2">
           <input
-            className="w-36 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-center font-mono text-base uppercase tracking-widest outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 dark:border-zinc-700 dark:bg-zinc-950"
+            className="w-44 rounded-lg border border-zinc-300 bg-white px-3 py-2 text-center font-mono text-base uppercase tracking-widest outline-none transition focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 dark:border-zinc-700 dark:bg-zinc-950"
             value={entered}
-            maxLength={6}
+            maxLength={8}
             inputMode="text"
             autoCapitalize="characters"
             spellCheck={false}
             autoComplete="off"
-            placeholder="ABC234"
+            placeholder="ABCD2345"
             onChange={(e) => setEntered(e.target.value.toUpperCase())}
           />
-          <Button disabled={busy || entered.length !== 6} onClick={link}>
+          <Button disabled={busy || entered.length !== 8} onClick={link}>
             Link
           </Button>
         </div>

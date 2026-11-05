@@ -420,6 +420,11 @@ message, generated with your own model.
 
 ## Security notes
 
+- Each account has a secret kept in the OS keychain, and the relay checks it on every
+  connection, so knowing someone's user id isn't enough to sign in as them. Linking a
+  device hands it the secret; unlinking removes it. The app sends the secret on every
+  connection, and plain `ws://` sends it unencrypted, so use `wss://` for any relay
+  outside your local network.
 - Message content is rendered as Markdown with raw HTML disabled. `javascript:` links
   are neutralized, links open in the system browser, and remote images are never loaded.
 - MCP tool arguments and results are never sent to the relay (only to the MCP server
@@ -433,6 +438,5 @@ message, generated with your own model.
 - On Android keys are not in a hardware-backed keystore: they sit in plain JSON in the
   app's private storage. Other apps can't read that, but a rooted phone or a debug build
   can.
-- v1 has no accounts. Anyone with an invite code can join that room, and a user id is
-  just a locally generated UUID. Run the relay only where you trust the network, or put
-  it behind TLS (`wss://`) and a reverse proxy.
+- Anyone with an invite code can join that room. Run the relay only where you trust the
+  network, or put it behind TLS (`wss://`) and a reverse proxy.
