@@ -2,7 +2,7 @@
 
 use crate::db::{self, Db, NewMessage};
 use crate::db::AiResult;
-use crate::protocol::{Attachment, ClientMsg, Device, Member, RoomInfo, ServerMsg, ToolActivity};
+use crate::protocol::{Attachment, ClientMsg, Device, Member, RoomInfo, ServerMsg, SharedProfile, ToolActivity};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,6 +26,8 @@ const MAX_SEARCH_HITS: usize = 50;
 /// Characters kept from a `search_messages` query.
 const MAX_SEARCH_QUERY: usize = 200;
 const MAX_TOOL_CALLS: usize = 100;
+/// Profiles one connection may share with the user's other devices.
+const MAX_SHARED_PROFILES: usize = 50;
 const MAX_ATTACHMENTS: usize = 8;
 /// Distinct emoji one message accepts across all members.
 const MAX_REACTION_EMOJI: usize = 20;
@@ -51,6 +53,8 @@ struct Conn {
     device_id: String,
     device_name: String,
     platform: String,
+    /// Profiles this connection shared for the user's other devices to generate with.
+    shared_profiles: Vec<SharedProfile>,
     failed_redeems: u32,
     /// When this connection last had a `typing: true` accepted (server-side throttle).
     last_typing: Option<Instant>,
@@ -113,11 +117,13 @@ impl Hub {
             .conns
             .values()
             .filter(|c| c.user_id.as_deref() == Some(user_id) && !c.device_id.is_empty())
+            // Several connections of one device: the first one's shared profiles win.
             .filter(|c| seen.insert(c.device_id.clone()))
             .map(|c| Device {
                 device_id: c.device_id.clone(),
                 device_name: c.device_name.clone(),
                 platform: c.platform.clone(),
+                profiles: c.shared_profiles.clone(),
             })
             .collect();
         devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
@@ -125,6 +131,26 @@ impl Hub {
         for c in self.conns.values().filter(|c| c.user_id.as_deref() == Some(user_id)) {
             let _ = c.tx.send(text.clone());
         }
+    }
+
+    /// The first connection of `user_id`'s device `device_id` that is in `room_id`
+    /// (and isn't `except`): the one an `ai_requested` goes to.
+    fn device_conn_in_room(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        room_id: &str,
+        except: Option<ConnId>,
+    ) -> Option<ConnId> {
+        self.conns
+            .iter()
+            .filter(|(id, _)| Some(**id) != except)
+            .find(|(_, c)| {
+                c.user_id.as_deref() == Some(user_id)
+                    && c.device_id == device_id
+                    && c.rooms.contains(room_id)
+            })
+            .map(|(id, _)| *id)
     }
 }
 
@@ -168,6 +194,7 @@ impl State {
                 device_id: String::new(),
                 device_name: String::new(),
                 platform: String::new(),
+                shared_profiles: Vec::new(),
                 failed_redeems: 0,
                 last_typing: None,
                 typing_rooms: HashSet::new(),
@@ -785,6 +812,80 @@ impl State {
                 db::delete_message(&self.db, &message_id).await?;
                 let message = db::message(&self.db, &message_id).await?.expect("row still there");
                 self.broadcast(&room_id, ServerMsg::MessageUpdated { room_id: room_id.clone(), message });
+            }
+
+            ClientMsg::ShareProfiles { profiles } => {
+                if let Some(c) = self.hub().conns.get_mut(&conn) {
+                    let mut shared: Vec<SharedProfile> = profiles
+                        .into_iter()
+                        .take(MAX_SHARED_PROFILES)
+                        .map(|p| SharedProfile {
+                            id: clip(&p.id, 100),
+                            label: clip(&p.label, MAX_NAME),
+                            model: clip(&p.model, 120),
+                        })
+                        .filter(|p| !p.id.is_empty() && !p.label.is_empty())
+                        .collect();
+                    shared.dedup_by(|a, b| a.id == b.id);
+                    shared.truncate(MAX_SHARED_PROFILES);
+                    c.shared_profiles = shared;
+                }
+                // The user's devices changed what they can pick from.
+                let hub = self.hub();
+                if let Some(user_id) = hub.conns.get(&conn).and_then(|c| c.user_id.clone()) {
+                    hub.send_devices(&user_id);
+                }
+            }
+
+            ClientMsg::RequestAi { request_id, room_id, anchor_id, device_id, profile_id } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(Some(request_id), "Not a member of that room"));
+                    return Ok(());
+                }
+                let anchor = db::message(&self.db, &anchor_id).await?;
+                if !anchor.is_some_and(|a| a.room_id == room_id && a.kind == "human" && !a.deleted) {
+                    self.send(conn, err(Some(request_id), "That message isn't in this room"));
+                    return Ok(());
+                }
+                let target = {
+                    let hub = self.hub();
+                    // Only an online connection of this same user's device that is
+                    // in the room counts, never the connection that asked.
+                    hub.device_conn_in_room(&user_id, &device_id, &room_id, Some(conn))
+                };
+                let Some(target) = target else {
+                    self.send(conn, err(Some(request_id), "That device is offline"));
+                    return Ok(());
+                };
+                let from_device_id = self.hub().conns.get(&conn).map(|c| c.device_id.clone()).unwrap_or_default();
+                // Ephemeral: forwarded, never stored.
+                self.send(
+                    target,
+                    ServerMsg::AiRequested {
+                        request_id,
+                        room_id,
+                        anchor_id,
+                        profile_id,
+                        from_device_id,
+                    },
+                );
+            }
+
+            ClientMsg::AiRequestFailed { request_id, to_device_id, message } => {
+                let hub = self.hub();
+                let msg = err(Some(request_id), clip(&message, MAX_ERROR));
+                // Back to the asking device's connections only, and only within
+                // this user — another user's device ids can't be reached.
+                for id in hub
+                    .conns
+                    .iter()
+                    .filter(|(_, c)| {
+                        c.user_id.as_deref() == Some(user_id.as_str()) && c.device_id == to_device_id
+                    })
+                    .map(|(id, _)| *id)
+                {
+                    hub.send(id, &msg);
+                }
             }
 
             ClientMsg::CreateLinkCode { request_id } => {

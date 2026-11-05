@@ -1056,11 +1056,18 @@ function LinkSection() {
         ) : (
           <ul className="space-y-1">
             {devices.map((d) => (
-              <li key={d.device_id} className="flex flex-wrap items-center gap-2 text-sm">
-                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                <span className="font-medium">{d.device_name}</span>
-                <span className="text-xs text-zinc-500">{d.platform}</span>
-                {d.device_id === client.device_id && <Badge>This device</Badge>}
+              <li key={d.device_id}>
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                  <span className="font-medium">{d.device_name}</span>
+                  <span className="text-xs text-zinc-500">{d.platform}</span>
+                  {d.device_id === client.device_id && <Badge>This device</Badge>}
+                </div>
+                {d.profiles.length > 0 && (
+                  <div className="pl-3.5 text-xs text-zinc-500">
+                    Shares {d.profiles.length} AI profile{d.profiles.length === 1 ? "" : "s"}
+                  </div>
+                )}
               </li>
             ))}
           </ul>

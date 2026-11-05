@@ -104,6 +104,9 @@ all rooms. The first client frame must be `hello`.
 | `typing` | `room_id, typing` | live "I'm typing" state; members only, relayed as `typing` and never stored; the relay passes at most one `typing: true` per second per connection, and a `typing: false` only when it ends a relayed `true` and no other device of that user is still typing there |
 | `edit_message` | `room_id, message_id, content` | edit your own human message; same empty/length rule as `send_message` → `message_updated` |
 | `delete_message` | `room_id, message_id` | soft-delete your own message (human, or an AI reply you generated; not while streaming) → `message_updated` |
+| `share_profiles` | `profiles: SharedProfile[]` | this connection's profiles the user's other devices may generate with (≤ 50; label/model clipped like names); broadcast as a refreshed `devices` to the user's connections |
+| `request_ai` | `request_id, room_id, anchor_id, device_id, profile_id` | ask one of the user's own devices to reply to `anchor_id` with its local profile → `ai_requested` there (or `error` with the request_id); the sender must be in the room, the anchor a non-deleted human message of that room, the target an online connection of the same user's device that is in the room and not the sender's own connection; nothing is stored |
+| `ai_request_failed` | `request_id, to_device_id, message` | the target's answer when it can't; relayed to the asking device's connections of the same user as `error` with the request_id (message clipped like `ai_error`) |
 | `create_link_code` | `request_id` | → `link_code`; one live code per user, valid 10 min, single use |
 | `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
 | `search_messages` | `request_id, room_id, query` | full-text search of that room's messages (prefix match on the last word, ≤ 200 chars); → `search_results`; members only |
@@ -134,14 +137,16 @@ all rooms. The first client frame must be `hello`.
 | `room_updated` | `room_id, system_prompt, updated_by` |
 | `reactions` | `room_id, message_id, reactions: Reaction[]` (the message's full current list) |
 | `message_updated` | `room_id, message: Message` (the full row after an edit or delete) |
+| `ai_requested` | `request_id, room_id, anchor_id, profile_id, from_device_id` (answers `request_ai`; delivered to the target device's first matching connection only, never stored) |
 | `link_code` | `request_id, code, expires_in_secs` |
 | `linked` | `request_id, user_id, display_name` |
-| `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline) |
+| `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline, or shares profiles) |
 | `error` | `request_id?, message` |
 
 `RoomInfo = {id, name, invite_code, system_prompt, members: Member[]}`
 `Member = {user_id, display_name, online}`
-`Device = {device_id, device_name, platform}`
+`Device = {device_id, device_name, platform, profiles: SharedProfile[]}` (empty unless that device sent `share_profiles`)
+`SharedProfile = {id, label, model}`
 `Reaction = {emoji, user_ids}` (grouped per emoji, in first-use order)
 `Message = {id, room_id, seq, kind, author_id, author_name, content, reasoning, tools,
             attachments, reactions, ai_requested, anchor_id, model, reply_to, status, error,
@@ -161,6 +166,23 @@ ai_complete ────────────────►  persist final t
    or ai_error ─────────────►  persist status=error, broadcast ──►
 socket closes mid-stream  ──►  status=interrupted (partial kept), broadcast ai_interrupted
 ```
+
+### Delegated replies (device linking, phase 2)
+
+Linked devices share one account, so a phone with no API keys can still get AI replies:
+the desktop client publishes its profiles' `{id, label, model}` with `share_profiles`
+(desktop platforms only; phones share nothing), and the relay lists them in that user's
+`devices` frame. The phone picks one as `remote:<device_id>:<profile_id>` and, once its
+message echoes back, sends `request_ai` instead of `ai_start`. The relay forwards it as
+`ai_requested` to that device — same user, in the room, not the asking connection — and
+the desktop generates the reply exactly like a local one (`ai_start` → `ai_delta` → …),
+so the reply is authored by the same account either way. Keys, base URLs and MCP secrets
+never leave the desktop; only id/label/model are shared, and nothing about the request is
+stored. If the desktop can't comply (profile gone, room not loadable, anchor beyond the
+loaded history) it answers `ai_request_failed`, which the relay turns into an `error`
+frame on the asking device. MCP tools set to **Ask** wait for a human who isn't there,
+so a delegated generation denies those calls immediately; Off/Auto behave as usual.
+(Approving from the phone is phase 3.)
 
 ## Context building (Rust, `app/src-tauri/src/context.rs`)
 
