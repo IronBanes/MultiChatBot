@@ -1087,9 +1087,13 @@ impl State {
         for id in db::user_room_ids(&self.db, &user_id).await? {
             if !room_ids.contains(&id) {
                 if let Some(room) = self.room_info(&id).await? {
-                    // Subscribe first, so opening the room right after works.
-                    self.subscribe_user(&user_id, &id);
-                    self.send(conn, ServerMsg::RoomJoined { request_id: None, room });
+                    // Subscribe and announce in one step under the lock, so nothing can
+                    // pick this connection for the room before it has heard about it.
+                    let mut hub = self.hub();
+                    for c in hub.conns.values_mut().filter(|c| c.user_id.as_deref() == Some(user_id.as_str())) {
+                        c.rooms.insert(id.clone());
+                    }
+                    hub.send(conn, &ServerMsg::RoomJoined { request_id: None, room });
                 }
             }
         }
