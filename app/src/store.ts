@@ -301,7 +301,8 @@ export const useChat = create<ChatState>((set, get) => {
         // Image fetches still pending when the connection dropped never got an answer;
         // forget them so the images request again on this connection.
         const images = Object.fromEntries(Object.entries(get().images).filter(([, src]) => src));
-        set({ rooms, roomOrder: order, loaded: {}, hasMore: {}, loadingOlder: {}, activeRoomId: active, images });
+        // hasMore stays: room_history needs it for older pages it keeps.
+        set({ rooms, roomOrder: order, loaded: {}, loadingOlder: {}, activeRoomId: active, images });
         if (active) relay?.send({ type: "open_room", room_id: active });
         break;
       }
@@ -337,10 +338,16 @@ export const useChat = create<ChatState>((set, get) => {
           const newer = current.filter((m) => m.seq > maxSeq);
           const live = new Map(current.map((m) => [m.id, m]));
           const merged = msg.messages.map((m) => withAttachments(m, live.get(m.id)?.attachments));
+          // Older pages loaded before a reconnect stay, so the reader isn't moved, as long
+          // as the fresh page connects to them (its first message is one we have). With a
+          // gap in between (many messages while away), start again from the fresh page.
+          const minSeq = merged.length ? merged[0].seq : Infinity;
+          const older = merged.length && live.has(merged[0].id) ? current.filter((m) => m.seq < minSeq) : [];
           return {
-            messages: { ...s.messages, [msg.room_id]: [...merged, ...newer] },
+            messages: { ...s.messages, [msg.room_id]: [...older, ...merged, ...newer] },
             loaded: { ...s.loaded, [msg.room_id]: true },
-            hasMore: { ...s.hasMore, [msg.room_id]: msg.has_more },
+            // With older rows kept, what was known about the history before them still holds.
+            hasMore: { ...s.hasMore, [msg.room_id]: older.length ? (s.hasMore[msg.room_id] ?? true) : msg.has_more },
           };
         });
         break;
