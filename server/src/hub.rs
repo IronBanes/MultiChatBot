@@ -364,6 +364,9 @@ impl State {
                 if !self.in_room(conn, &room_id) {
                     return Ok(());
                 }
+                // Under the updates lock, so a connection catching up after its welcome
+                // can't subscribe to this room again between the delete and the unsubscribe.
+                let _ordered = self.updates_lock.lock().await;
                 db::remove_member(&self.db, &room_id, &user_id).await?;
                 let mut hub = self.hub();
                 let mine: Vec<ConnId> = hub
@@ -1138,16 +1141,24 @@ impl State {
         // A room another device created or joined while this welcome was being built is
         // in neither the welcome nor a room_joined (this connection wasn't welcomed yet).
         for id in db::user_room_ids(&self.db, &user_id).await? {
-            if !room_ids.contains(&id) {
-                if let Some(room) = self.room_info(&id).await? {
-                    // Subscribe and announce in one step under the lock, so nothing can
-                    // pick this connection for the room before it has heard about it.
-                    let mut hub = self.hub();
-                    for c in hub.conns.values_mut().filter(|c| c.user_id.as_deref() == Some(user_id.as_str())) {
-                        c.rooms.insert(id.clone());
-                    }
-                    hub.send(conn, &ServerMsg::RoomJoined { request_id: None, room });
+            if room_ids.contains(&id) {
+                continue;
+            }
+            // Same lock as LeaveRoom, and membership checked again inside it, so a room
+            // left meanwhile isn't subscribed again.
+            let _ordered = self.updates_lock.lock().await;
+            if !db::is_member(&self.db, &id, &user_id).await? {
+                continue;
+            }
+            if let Some(room) = self.room_info(&id).await? {
+                // Subscribe and announce in one step under the hub lock, so nothing can
+                // pick this connection for the room before it has heard about it. The
+                // account's other connections were subscribed when the room was joined.
+                let mut hub = self.hub();
+                if let Some(c) = hub.conns.get_mut(&conn) {
+                    c.rooms.insert(id.clone());
                 }
+                hub.send(conn, &ServerMsg::RoomJoined { request_id: None, room });
             }
         }
         Ok(())
