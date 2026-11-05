@@ -319,6 +319,16 @@ export const useChat = create<ChatState>((set, get) => {
     return `(replying to ${quote})\n${m.content}`;
   }
 
+  /** Asks another of this user's devices to reply to `anchorId` with its profile. Only
+   *  counts once the frame was really written, so a drop right after queueing it is
+   *  reported (not retried: it may have reached the relay). */
+  function askRemote(roomId: string, anchorId: string, deviceId: string, profileId: string) {
+    const msg = { type: "request_ai", request_id: crypto.randomUUID(), room_id: roomId, anchor_id: anchorId, device_id: deviceId, profile_id: profileId } as const;
+    void (relay ? relay.sendConfirmed(msg) : Promise.resolve(false)).then((ok) => {
+      if (!ok) get().toast("The AI reply wasn't requested: not connected to the server");
+    });
+  }
+
   /** Serves an `ai_requested` from another of this user's devices: find the anchor
    *  in the loaded messages (or wait for `room_history`), then generate with the
    *  local profile exactly as a local request. Failures go back to the asking
@@ -610,15 +620,7 @@ export const useChat = create<ChatState>((set, get) => {
           // device: send it a `request_ai` instead of starting one here.
           const remote = parseRemoteProfileId(profileId);
           if (remote) {
-            const asked = relay?.send({
-              type: "request_ai",
-              request_id: crypto.randomUUID(),
-              room_id: m.room_id,
-              anchor_id: m.id,
-              device_id: remote.deviceId,
-              profile_id: remote.profileId,
-            });
-            if (!asked) get().toast("Not connected to the server");
+            askRemote(m.room_id, m.id, remote.deviceId, remote.profileId);
           } else {
             startAi(m.room_id, m, profileId);
           }
@@ -931,15 +933,7 @@ export const useChat = create<ChatState>((set, get) => {
       // With a remote profile id, the other device generates from the same anchor.
       const remote = parseRemoteProfileId(profileId);
       if (remote) {
-        const asked = relay?.send({
-          type: "request_ai",
-          request_id: crypto.randomUUID(),
-          room_id: ai.room_id,
-          anchor_id: anchor.id,
-          device_id: remote.deviceId,
-          profile_id: remote.profileId,
-        });
-        if (!asked) get().toast("Not connected to the server");
+        askRemote(ai.room_id, anchor.id, remote.deviceId, remote.profileId);
         return;
       }
       startAi(ai.room_id, anchor, profileId);
