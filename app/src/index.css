@@ -145,6 +145,52 @@ html[data-keyboard] .safe-bottom {
   }
 }
 
+/* The three dots before "Sam is typing…". Each dot fades in a little after the
+   previous one, so they ripple; reduced-motion users see them steady. */
+@keyframes typing-dot {
+  0%,
+  60%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 1em;
+}
+
+.typing-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 9999px;
+  background: currentColor;
+  opacity: 0.25;
+  animation: typing-dot 1.2s ease-in-out infinite;
+}
+
+.typing-dots i:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.typing-dots i:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .typing-dots i {
+    animation: none;
+    opacity: 0.6;
+  }
+}
+
 /* Briefly flashes a message row when a reply quote jumps to it. */
 @keyframes flash-highlight {
   0% {

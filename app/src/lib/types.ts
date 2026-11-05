@@ -92,6 +92,7 @@ export type ClientMsg =
   | { type: "ai_error"; room_id: string; id: string; error: string }
   | { type: "set_room_prompt"; room_id: string; system_prompt: string }
   | { type: "react"; room_id: string; message_id: string; emoji: string; on: boolean }
+  | { type: "typing"; room_id: string; typing: boolean }
   | { type: "edit_message"; room_id: string; message_id: string; content: string }
   | { type: "delete_message"; room_id: string; message_id: string }
   | { type: "create_link_code"; request_id: string }
@@ -116,6 +117,7 @@ export type ServerMsg =
   | { type: "member_updated"; room_id: string; member: Member }
   | { type: "member_left"; room_id: string; user_id: string }
   | { type: "presence"; room_id: string; user_id: string; online: boolean }
+  | { type: "typing"; room_id: string; user_id: string; display_name: string; typing: boolean }
   | { type: "room_updated"; room_id: string; system_prompt: string; updated_by: string }
   | { type: "reactions"; room_id: string; message_id: string; reactions: Reaction[] }
   | { type: "link_code"; request_id: string; code: string; expires_in_secs: number }

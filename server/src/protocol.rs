@@ -92,6 +92,11 @@ pub enum ClientMsg {
         /// true adds the reaction, false removes it.
         on: bool,
     },
+    /// Live "I'm typing" state; relayed to the room and never stored.
+    Typing {
+        room_id: String,
+        typing: bool,
+    },
     EditMessage {
         room_id: String,
         message_id: String,
@@ -188,6 +193,13 @@ pub enum ServerMsg {
         room_id: String,
         user_id: String,
         online: bool,
+    },
+    /// Who is typing right now; ephemeral, relayed live and never persisted.
+    Typing {
+        room_id: String,
+        user_id: String,
+        display_name: String,
+        typing: bool,
     },
     RoomUpdated {
         room_id: String,

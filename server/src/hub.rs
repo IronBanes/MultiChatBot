@@ -29,6 +29,8 @@ const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/
 const LINK_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Failed link-code redeems allowed per connection before further tries are refused.
 const MAX_FAILED_REDEEMS: u32 = 5;
+/// Minimum gap between two accepted `typing: true` frames from one connection.
+const TYPING_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type ConnId = u64;
 
@@ -39,6 +41,11 @@ struct Conn {
     device_name: String,
     platform: String,
     failed_redeems: u32,
+    /// When this connection last had a `typing: true` accepted (server-side throttle).
+    last_typing: Option<Instant>,
+    /// Rooms where this connection's last broadcast typing state was `true`, so a
+    /// `typing: false` is only relayed when it changes something.
+    typing_rooms: HashSet<String>,
     tx: UnboundedSender<String>,
     rooms: HashSet<String>,
 }
@@ -151,6 +158,8 @@ impl State {
                 device_name: String::new(),
                 platform: String::new(),
                 failed_redeems: 0,
+                last_typing: None,
+                typing_rooms: HashSet::new(),
                 tx,
                 rooms: HashSet::new(),
             },
@@ -289,6 +298,7 @@ impl State {
                     hub.send(*id, &ServerMsg::RoomLeft { room_id: room_id.clone() });
                     if let Some(c) = hub.conns.get_mut(id) {
                         c.rooms.remove(&room_id);
+                        c.typing_rooms.remove(&room_id);
                     }
                 }
                 hub.broadcast(
@@ -590,6 +600,47 @@ impl State {
                 self.broadcast(
                     &room_id,
                     ServerMsg::Reactions { room_id: room_id.clone(), message_id, reactions },
+                );
+            }
+
+            ClientMsg::Typing { room_id, typing } => {
+                // Live state only: nothing touches the database, and a frame from a
+                // non-member is dropped silently (it's sent often, so no error frame).
+                let mut hub = self.hub();
+                let Some(c) = hub.conns.get_mut(&conn) else { return Ok(()) };
+                if !c.rooms.contains(&room_id) {
+                    return Ok(());
+                }
+                // Sent on every keystroke, so throttle: one `true` broadcast per second
+                // per connection. A `false` passes only when it ends a `true` this
+                // connection broadcast in that room, so repeated `false`s can't flood it.
+                if typing {
+                    if c.last_typing.is_some_and(|t| t.elapsed() < TYPING_MIN_INTERVAL) {
+                        return Ok(());
+                    }
+                    c.last_typing = Some(Instant::now());
+                    c.typing_rooms.insert(room_id.clone());
+                } else {
+                    if !c.typing_rooms.remove(&room_id) {
+                        return Ok(());
+                    }
+                    // Others see typing per account: while another device of this user
+                    // is still typing here, this one stopping changes nothing for them.
+                    let still_typing = hub.conns.values().any(|o| {
+                        o.user_id.as_deref() == Some(user_id.as_str()) && o.typing_rooms.contains(&room_id)
+                    });
+                    if still_typing {
+                        return Ok(());
+                    }
+                }
+                hub.broadcast(
+                    &room_id,
+                    &ServerMsg::Typing {
+                        room_id: room_id.clone(),
+                        user_id: user_id.clone(),
+                        display_name: display_name.clone(),
+                        typing,
+                    },
                 );
             }
 

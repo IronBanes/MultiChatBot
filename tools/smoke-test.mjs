@@ -81,6 +81,73 @@ bob.send({ type: "send_message", room_id: room.id, id: uuid(), content: "hi huma
 const human = await alice.wait(type("message", (m) => m.message.content === "hi humans"), "human message");
 ok(human.message.author_name === "Bob" && !human.message.ai_requested, "human-only message relayed");
 
+// Typing indicators: live relayed, throttled, and never stored.
+{
+  // A third client that never joins the room: its typing frames must be ignored
+  // silently (no error, nothing broadcast).
+  const mallory = new Client("Mallory");
+  await mallory.open();
+  await mallory.wait(type("welcome"), "welcome");
+  mallory.send({ type: "typing", room_id: room.id, typing: true });
+  mallory.send({ type: "typing", room_id: room.id, typing: false });
+
+  alice.send({ type: "typing", room_id: room.id, typing: true });
+  const t1 = await bob.wait(type("typing", (m) => m.user_id === alice.userId), "typing true");
+  ok(t1.typing === true && t1.display_name === "Alice" && t1.room_id === room.id, "typing true relayed with Alice's id and name");
+  // A second `true` right away is throttled away server-side; `false` always passes.
+  alice.send({ type: "typing", room_id: room.id, typing: true });
+  alice.send({ type: "typing", room_id: room.id, typing: false });
+  const t2 = await bob.wait(type("typing", (m) => m.user_id === alice.userId && !m.typing), "typing false");
+  ok(t2.typing === false, "typing false relayed (never throttled)");
+  // Nothing else about typing arrived from Alice: the throttled frame never reached Bob.
+  ok(
+    !bob.inbox.some((m) => m.type === "typing" && m.user_id === alice.userId),
+    "second typing true within 1s was not delivered",
+  );
+  // A repeated `false` (nothing to end) is dropped.
+  alice.send({ type: "typing", room_id: room.id, typing: false });
+  // After 1.1s the throttle window has passed and a `true` goes through again.
+  await new Promise((r) => setTimeout(r, 1100));
+  alice.send({ type: "typing", room_id: room.id, typing: true });
+  await bob.wait(type("typing", (m) => m.user_id === alice.userId && m.typing), "typing true after throttle window");
+  ok(true, "typing true accepted again after the 1s window");
+  ok(
+    !bob.inbox.some((m) => m.type === "typing" && m.user_id === alice.userId),
+    "a repeated typing false is not relayed",
+  );
+  // A second device of Alice's account: one device stopping while the other still
+  // types doesn't end Alice's indicator; the last one stopping does.
+  const alice2 = new Client("Alice");
+  alice2.userId = alice.userId;
+  await alice2.open();
+  await alice2.wait(type("welcome"), "welcome (second device)");
+  alice2.send({ type: "typing", room_id: room.id, typing: true });
+  await bob.wait(type("typing", (m) => m.user_id === alice.userId && m.typing), "typing true (second device)");
+  alice2.send({ type: "typing", room_id: room.id, typing: false });
+  // Barrier: a reaction alice2 sends after its stop reaches Bob after anything that
+  // stop would have broadcast, so by then Bob must have seen no typing false.
+  const barrier = { type: "react", room_id: room.id, message_id: human.message.id, emoji: "👀" };
+  alice2.send({ ...barrier, on: true });
+  await bob.wait(type("reactions", (m) => m.message_id === human.message.id), "barrier reaction");
+  ok(
+    !bob.inbox.some((m) => m.type === "typing" && m.user_id === alice.userId),
+    "one device stopping while another types sends no typing false",
+  );
+  alice2.send({ ...barrier, on: false });
+  await bob.wait(type("reactions", (m) => m.message_id === human.message.id), "barrier reaction removed");
+  alice.send({ type: "typing", room_id: room.id, typing: false });
+  const last = await bob.wait(type("typing", (m) => m.user_id === alice.userId), "typing false (last device)");
+  ok(last.typing === false, "the last device stopping sends typing false");
+  alice2.close();
+  // By now Mallory's frames (sent first) have long been handled.
+  ok(!mallory.inbox.some((m) => m.type === "error"), "typing from a non-member gets no error frame");
+  ok(
+    ![alice, bob].some((c) => c.inbox.some((m) => m.type === "typing" && m.user_id === mallory.userId)),
+    "typing from a non-member is not broadcast",
+  );
+  mallory.close();
+}
+
 // Alice triggers an AI reply; her client streams it.
 const trigger = uuid();
 alice.send({ type: "send_message", room_id: room.id, id: trigger, content: "Let's generate a square.", ai_requested: true });
