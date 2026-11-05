@@ -129,7 +129,7 @@ export function parseRemoteProfileId(id: string): { deviceId: string; profileId:
 
 /** An `ai_requested` waiting for the room's history to load here, so the anchor
  *  can be found and the reply generated: room → pending requests. */
-const pendingDelegatedOpens = new Map<string, { requestId: string; anchorId: string; profileId: string; fromDeviceId: string }[]>();
+const pendingDelegatedOpens = new Map<string, { requestId: string; anchorId: string; anchorSeq: number; profileId: string; fromDeviceId: string }[]>();
 /** Generation ids this client is generating for another of this user's devices.
  *  These run without MCP tools (see `backend.generate`'s `delegated`). */
 const delegatedGenerations = new Set<string>();
@@ -312,7 +312,14 @@ export const useChat = create<ChatState>((set, get) => {
    *  in the loaded messages (or wait for `room_history`), then generate with the
    *  local profile exactly as a local request. Failures go back to the asking
    *  device as `ai_request_failed`; nothing is stored for the request itself. */
-  function runDelegatedAi(requestId: string, roomId: string, anchorId: string, profileId: string, fromDeviceId: string) {
+  function runDelegatedAi(
+    requestId: string,
+    roomId: string,
+    anchorId: string,
+    anchorSeq: number,
+    profileId: string,
+    fromDeviceId: string,
+  ) {
     const fail = (message: string) =>
       relay?.send({ type: "ai_request_failed", request_id: requestId, to_device_id: fromDeviceId, message });
     // Only a local profile id that still exists can answer; the relay already
@@ -330,14 +337,32 @@ export const useChat = create<ChatState>((set, get) => {
     // the history arrives (or give up if the connection drops first).
     if (!get().loaded[roomId]) {
       const waiting = pendingDelegatedOpens.get(roomId) ?? [];
-      waiting.push({ requestId, anchorId, profileId, fromDeviceId });
+      waiting.push({ requestId, anchorId, anchorSeq, profileId, fromDeviceId });
       pendingDelegatedOpens.set(roomId, waiting);
       if (waiting.length === 1) relay?.send({ type: "open_room", room_id: roomId });
       return;
     }
-    const anchor = get().messages[roomId]?.find((m) => m.id === anchorId);
+    const s = get();
+    const anchor = s.messages[roomId]?.find((m) => m.id === anchorId);
     if (!anchor) {
-      fail("That message is too far back to reply to from here");
+      // Older than what's loaded here: load back to it (one page reaching the anchor,
+      // as a search jump does) and try again when it arrives.
+      const first = s.messages[roomId]?.[0];
+      if (first && s.hasMore[roomId] && anchorSeq < first.seq) {
+        const waiting = pendingDelegatedOpens.get(roomId) ?? [];
+        waiting.push({ requestId, anchorId, anchorSeq, profileId, fromDeviceId });
+        pendingDelegatedOpens.set(roomId, waiting);
+        if (!s.loadingOlder[roomId]) {
+          const ok = relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq, until_seq: anchorSeq });
+          if (ok) set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));
+          else {
+            pendingDelegatedOpens.delete(roomId);
+            fail("Couldn't load the room");
+          }
+        }
+        return;
+      }
+      fail("That message isn't in this room's history");
       return;
     }
     startAi(roomId, anchor, profileId, (id) => {
@@ -514,7 +539,7 @@ export const useChat = create<ChatState>((set, get) => {
         });
         // Delegated `ai_requested`s that waited for this history: run them now
         // that the anchor is (or isn't) among the loaded messages.
-        for (const p of waiting) runDelegatedAi(p.requestId, msg.room_id, p.anchorId, p.profileId, p.fromDeviceId);
+        for (const p of waiting) runDelegatedAi(p.requestId, msg.room_id, p.anchorId, p.anchorSeq, p.profileId, p.fromDeviceId);
         break;
       }
       case "older_messages":
@@ -536,6 +561,12 @@ export const useChat = create<ChatState>((set, get) => {
         // A search jump waiting for this page: point MessageList at the target,
         // or ask again when the page was capped short of it.
         continueJump(set, get, msg.room_id);
+        {
+          // Delegated requests that waited for older history: try them again.
+          const waiting = pendingDelegatedOpens.get(msg.room_id) ?? [];
+          pendingDelegatedOpens.delete(msg.room_id);
+          for (const p of waiting) runDelegatedAi(p.requestId, msg.room_id, p.anchorId, p.anchorSeq, p.profileId, p.fromDeviceId);
+        }
         break;
       case "search_results": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
@@ -580,7 +611,7 @@ export const useChat = create<ChatState>((set, get) => {
       }
       case "ai_requested":
         // Another of this user's devices asked this one to reply with its profile.
-        runDelegatedAi(msg.request_id, msg.room_id, msg.anchor_id, msg.profile_id, msg.from_device_id);
+        runDelegatedAi(msg.request_id, msg.room_id, msg.anchor_id, msg.anchor_seq, msg.profile_id, msg.from_device_id);
         break;
       case "ai_delta":
         set((s) => ({

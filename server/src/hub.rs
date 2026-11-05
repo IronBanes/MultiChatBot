@@ -873,10 +873,12 @@ impl State {
                     return Ok(());
                 }
                 let anchor = db::message(&self.db, &anchor_id).await?;
-                if !anchor.is_some_and(|a| a.room_id == room_id && a.kind == "human" && !a.deleted) {
+                let Some(anchor_seq) =
+                    anchor.filter(|a| a.room_id == room_id && a.kind == "human" && !a.deleted).map(|a| a.seq)
+                else {
                     self.send(conn, err(Some(request_id), "That message isn't in this room"));
                     return Ok(());
-                }
+                };
                 let target = {
                     let hub = self.hub();
                     // Only an online connection of this same user's device that is
@@ -895,6 +897,7 @@ impl State {
                         request_id,
                         room_id,
                         anchor_id,
+                        anchor_seq,
                         profile_id,
                         from_device_id,
                     },
@@ -1084,6 +1087,8 @@ impl State {
         for id in db::user_room_ids(&self.db, &user_id).await? {
             if !room_ids.contains(&id) {
                 if let Some(room) = self.room_info(&id).await? {
+                    // Subscribe first, so opening the room right after works.
+                    self.subscribe_user(&user_id, &id);
                     self.send(conn, ServerMsg::RoomJoined { request_id: None, room });
                 }
             }
