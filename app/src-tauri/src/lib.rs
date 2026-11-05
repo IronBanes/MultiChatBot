@@ -73,7 +73,7 @@ struct ProfileView {
 }
 
 fn view(p: Profile) -> ProfileView {
-    let has_key = secrets::get_key(&p.id).ok().flatten().is_some();
+    let has_key = secrets::has_key(&p.id);
     ProfileView { profile: p, has_key }
 }
 
@@ -256,7 +256,16 @@ fn resolve_key(state: &AppState, profile: &Profile, api_key: Option<String>) -> 
         None if !profile.id.is_empty() => {
             // A key typed into the form still works, so the user can test and recover.
             check_not_blocked(state, profile)?;
-            secrets::get_key(&profile.id)
+            // A key from before pairing belongs to the profile's saved address: pair it
+            // there first, so it isn't tried on a different address typed into the form.
+            // One read decides: a paired key only for its own address, and a key from
+            // before pairing only at the profile's saved address (whether or not pairing
+            // it there succeeds). Keychain errors are passed on, never read as "paired".
+            let saved = state.snapshot()?.profiles.iter().find(|p| p.id == profile.id).map(|p| p.base_url.clone());
+            // Taking turns with saves: pairing an old key here must not overwrite a key
+            // a save is putting in place at the same moment.
+            let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
+            secrets::get_key_for_form(&profile.id, &profile.base_url, saved.as_deref())
         }
         None => Ok(None),
     }
@@ -275,7 +284,7 @@ fn check_not_blocked(state: &AppState, profile: &Profile) -> Result<(), String> 
 /// the key is removed; if even that fails, the profile is disabled until saved again.
 fn restore_key(state: &AppState, id: &str, previous_key: Option<String>, e: String) -> String {
     let restored = match &previous_key {
-        Some(k) => secrets::set_key(id, k),
+        Some(record) => secrets::set_key_record(id, record),
         None => secrets::delete_key(id),
     };
     if restored.is_ok() {
@@ -304,10 +313,12 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     profile.reasoning_effort = profile.reasoning_effort.filter(|e| !e.trim().is_empty());
     let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
     let changing_key = api_key.is_some();
-    let previous_key = if changing_key { secrets::get_key(&profile.id)? } else { None };
+    let previous_key = if changing_key { secrets::key_record(&profile.id)? } else { None };
+    // The endpoint the stored key is paired with now, to move a kept key to a new one.
+    let old_endpoint = state.snapshot()?.profiles.iter().find(|p| p.id == profile.id).map(|p| p.base_url.clone());
     let written = match api_key.as_deref().map(str::trim) {
         Some("") => secrets::delete_key(&profile.id),
-        Some(k) => secrets::set_key(&profile.id, k),
+        Some(k) => secrets::set_key(&profile.id, k, &profile.base_url),
         None => Ok(()),
     };
     // A failed write may still have replaced the stored key (it can fail after the
@@ -327,6 +338,24 @@ fn save_profile(state: State<'_, AppState>, mut profile: Profile, api_key: Optio
     // Only a new or removed key, saved together with the settings, repairs the pairing.
     if changing_key && let Ok(mut blocked) = state.unsafe_keys.lock() {
         blocked.remove(&saved.id);
+    }
+    // The address changed but the key was kept: the user moved it on purpose, so pair
+    // it with the new address (after the settings, so a failure here leaves the key
+    // tied to the old address and refused, never sent somewhere unintended).
+    if !changing_key && let Some(old) = old_endpoint.filter(|o| *o != saved.base_url) {
+        // A failed read counts as a failed move too: the save would otherwise look fine
+        // while the key stays tied to the old address (and a later save wouldn't retry).
+        let moved = match secrets::get_key(&saved.id, &old) {
+            Ok(Some(key)) => secrets::set_key(&saved.id, &key, &saved.base_url),
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        };
+        if moved.is_err() {
+            return Err(format!(
+                "{} was saved, but its API key couldn't be moved to the new address. Enter the key again.",
+                saved.label
+            ));
+        }
     }
     Ok(view(saved))
 }
@@ -415,8 +444,54 @@ struct SecretEdit {
     value: Option<String>,
 }
 
-fn merge_secrets(server_id: &str, edits: Option<Vec<SecretEdit>>) -> Result<McpSecrets, String> {
-    let old = if server_id.is_empty() { McpSecrets::default() } else { secrets::get_mcp(server_id)? };
+/// What a server's secrets are paired with: its URL, or its command and arguments.
+fn mcp_target(s: &McpServer) -> String {
+    match s.transport {
+        McpTransport::Http => s.url.clone(),
+        McpTransport::Stdio => std::iter::once(s.command.as_str()).chain(s.args.iter().map(String::as_str)).collect::<Vec<_>>().join("\u{0}"),
+    }
+}
+
+/// A server's env vars and headers, only if they were saved for its current address.
+/// Secrets from before pairing are used and paired now (best effort).
+fn mcp_secrets_for(s: &McpServer) -> McpSecrets {
+    let sec = secrets::get_mcp(&s.id).unwrap_or_default();
+    match &sec.target {
+        Some(t) if *t != mcp_target(s) => {
+            eprintln!("[mcp] {}: stored secrets belong to another address; not using them", s.name);
+            McpSecrets::default()
+        }
+        Some(_) => sec,
+        None => {
+            if !(sec.env.is_empty() && sec.headers.is_empty()) {
+                let _ = secrets::set_mcp(&s.id, &McpSecrets { target: Some(mcp_target(s)), ..sec.clone() });
+            }
+            sec
+        }
+    }
+}
+
+/// The server as it will be saved (trimmed), for comparing addresses.
+fn normalized(server: &McpServer) -> McpServer {
+    let mut s = server.clone();
+    s.command = s.command.trim().to_string();
+    s.url = s.url.trim().to_string();
+    s.args.retain(|a| !a.is_empty());
+    s
+}
+
+/// The new values from the editor, plus stored ones kept (`value: None`) — but stored
+/// values only if they were saved for `address`, the one being saved or tested.
+/// Secrets from before pairing count as saved for the server's saved address. So
+/// changing a server's URL or command never carries its secrets along unless they're
+/// entered again.
+fn merge_secrets(state: &AppState, server_id: &str, address: &str, edits: Option<Vec<SecretEdit>>) -> Result<McpSecrets, String> {
+    let stored = if server_id.is_empty() { McpSecrets::default() } else { secrets::get_mcp(server_id)? };
+    let stored_for = match &stored.target {
+        Some(t) => Some(t.clone()),
+        None => state.snapshot()?.mcp_servers.iter().find(|s| s.id == server_id).map(mcp_target),
+    };
+    let old = if stored_for.as_deref() == Some(address) { stored } else { McpSecrets::default() };
     let Some(edits) = edits else { return Ok(old) };
     let mut new = McpSecrets::default();
     for e in edits {
@@ -428,7 +503,11 @@ fn merge_secrets(server_id: &str, edits: Option<Vec<SecretEdit>>) -> Result<McpS
             if e.kind == "header" { (&mut new.headers, &old.headers) } else { (&mut new.env, &old.env) };
         let value = match e.value {
             Some(v) => v,
-            None => previous.get(&name).cloned().unwrap_or_default(),
+            // A kept value that can't be reused here is dropped, not sent empty.
+            None => match previous.get(&name) {
+                Some(v) => v.clone(),
+                None => continue,
+            },
         };
         target.insert(name, value);
     }
@@ -468,7 +547,7 @@ async fn save_mcp_server(
         // Merge against the stored secrets inside the lock, so a concurrent save of the
         // same server can't be overwritten with stale values.
         let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
-        let merged = merge_secrets(&server.id, secrets)?;
+        let merged = merge_secrets(&state, &server.id, &mcp_target(&normalized(&server)), secrets)?;
         if server.id.is_empty() {
             server.id = uuid::Uuid::new_v4().to_string();
         }
@@ -478,6 +557,8 @@ async fn save_mcp_server(
         server.args.retain(|a| !a.is_empty());
         let saved = server.clone();
         let previous = secrets::get_mcp(&server.id)?;
+        // Saved together with this address, so they're never sent to another one.
+        let merged = McpSecrets { target: Some(mcp_target(&server)), ..merged };
         secrets::set_mcp(&server.id, &merged)?;
         let updated = state.update(move |c| match c.mcp_servers.iter_mut().find(|s| s.id == server.id) {
             Some(existing) => *existing = server,
@@ -521,8 +602,10 @@ async fn test_mcp_server(
     secrets: Option<Vec<SecretEdit>>,
 ) -> Result<Vec<mcp::ToolInfo>, String> {
     validate_mcp(&server)?;
-    let merged = merge_secrets(&server.id, secrets)?;
-    let mut probe = server.clone();
+    // Stored secrets only go to the address they were saved for, even in a test.
+    let merged = merge_secrets(&state, &server.id, &mcp_target(&normalized(&server)), secrets)?;
+    // Test exactly what would be saved (and what the secrets are paired with).
+    let mut probe = normalized(&server);
     if probe.id.is_empty() {
         probe.id = format!("test-{}", uuid::Uuid::new_v4());
     }
@@ -575,7 +658,12 @@ fn generate(
     let delegated = delegated.unwrap_or(false);
     let profile = state.profile(&profile_id)?;
     check_not_blocked(&state, &profile)?;
-    let key = secrets::get_key(&profile.id)?;
+    {
+        // Same as resolve_key: pairing takes turns with saves.
+        let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
+        secrets::pair_legacy_key(&profile.id, &profile.base_url);
+    }
+    let key = secrets::get_key(&profile.id, &profile.base_url)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     let prompt = context::build(&history, &room_prompt, profile.max_context_tokens);
     if prompt.messages.is_empty() {
@@ -587,7 +675,7 @@ fn generate(
     let servers = if delegated { Vec::new() } else { cfg.active_mcp(&room_id) }
         .into_iter()
         .map(|(s, m)| {
-            let sec = secrets::get_mcp(&s.id).unwrap_or_default();
+            let sec = mcp_secrets_for(&s);
             (s, m, sec)
         })
         .collect();
