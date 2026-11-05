@@ -105,9 +105,11 @@ impl Hub {
             .any(|c| c.user_id.as_deref() == Some(user_id) && c.rooms.contains(room_id))
     }
 
-    fn send(&self, conn_id: ConnId, msg: &ServerMsg) {
-        if let Some(c) = self.conns.get(&conn_id) {
-            let _ = c.tx.send(serde_json::to_string(msg).expect("serializable"));
+    /// Queues `msg` for one connection. False when it's gone (or its queue closed).
+    fn send(&self, conn_id: ConnId, msg: &ServerMsg) -> bool {
+        match self.conns.get(&conn_id) {
+            Some(c) => c.tx.send(serde_json::to_string(msg).expect("serializable")).is_ok(),
+            None => false,
         }
     }
 
@@ -315,6 +317,9 @@ impl State {
             ClientMsg::Hello { .. } => unreachable!(),
 
             ClientMsg::CreateRoom { request_id, name } => {
+                // Ordered with LeaveRoom (same lock), so a leave can't land between the
+                // subscription and the room_joined notifications.
+                let _ordered = self.updates_lock.lock().await;
                 let name = clip(&name, MAX_ROOM_NAME);
                 if name.is_empty() {
                     self.send(conn, err(Some(request_id), "Room name is required"));
@@ -328,6 +333,8 @@ impl State {
             }
 
             ClientMsg::JoinRoom { request_id, invite_code } => {
+                // Ordered with LeaveRoom, like CreateRoom.
+                let _ordered = self.updates_lock.lock().await;
                 let code = invite_code.trim().to_uppercase();
                 let Some(room_id) = db::room_id_by_code(&self.db, &code).await? else {
                     self.send(conn, err(Some(request_id), "No room with that invite code"));
@@ -887,29 +894,30 @@ impl State {
                     self.send(conn, err(Some(request_id), "That message isn't in this room"));
                     return Ok(());
                 };
-                let target = {
-                    let hub = self.hub();
-                    // Only an online connection of this same user's device that is
-                    // in the room counts, never the connection that asked.
-                    hub.device_conn_in_room(&user_id, &device_id, &room_id, Some(conn))
-                };
-                let Some(target) = target else {
-                    self.send(conn, err(Some(request_id), "That device is offline"));
-                    return Ok(());
-                };
-                let from_device_id = self.hub().conns.get(&conn).map(|c| c.device_id.clone()).unwrap_or_default();
+                // Pick the target and forward under one hub lock, so it can't disconnect
+                // in between; if it's gone anyway, the asking device hears so.
+                let hub = self.hub();
+                // Only an online connection of this same user's device that is in the
+                // room counts, never the connection that asked.
+                let target = hub.device_conn_in_room(&user_id, &device_id, &room_id, Some(conn));
+                let from_device_id = hub.conns.get(&conn).map(|c| c.device_id.clone()).unwrap_or_default();
                 // Ephemeral: forwarded, never stored.
-                self.send(
-                    target,
-                    ServerMsg::AiRequested {
-                        request_id,
-                        room_id,
-                        anchor_id,
-                        anchor_seq,
-                        profile_id,
-                        from_device_id,
-                    },
-                );
+                let delivered = target.is_some_and(|t| {
+                    hub.send(
+                        t,
+                        &ServerMsg::AiRequested {
+                            request_id: request_id.clone(),
+                            room_id,
+                            anchor_id,
+                            anchor_seq,
+                            profile_id,
+                            from_device_id,
+                        },
+                    )
+                });
+                if !delivered {
+                    hub.send(conn, &err(Some(request_id), "That device is offline"));
+                }
             }
 
             ClientMsg::AiRequestFailed { request_id, to_device_id, message } => {
