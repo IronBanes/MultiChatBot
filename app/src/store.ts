@@ -741,6 +741,8 @@ export const useChat = create<ChatState>((set, get) => {
       request<SearchHit[]>((request_id) => ({ type: "search_messages", request_id, room_id: roomId, query })),
 
     jumpTo(roomId, messageId, seq) {
+      // The latest pick wins: an earlier jump still waiting for a page is dropped.
+      pendingJumps.delete(roomId);
       const s = get();
       if (s.messages[roomId]?.some((m) => m.id === messageId)) {
         set({ jumpTarget: { roomId, id: messageId } });
