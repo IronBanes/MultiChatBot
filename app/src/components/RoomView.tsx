@@ -2075,7 +2075,7 @@ function NotifyMenuButton({ room }: { room: RoomInfo }) {
           </div>
           <NotifyMenu room={room} phone={false} />
           <p className="mt-1 border-t border-zinc-100 px-3 pt-2 pb-1 text-[11px] leading-snug text-zinc-500 dark:border-zinc-800">
-            While the app is in the background, a notification pops up for each choice above.
+            These appear while the app is in the background.
           </p>
         </div>
       )}

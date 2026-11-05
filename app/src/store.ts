@@ -171,7 +171,8 @@ const NOTIFY_GAP = 5000;
 let notifyPermission: "unknown" | "granted" | "denied" = "unknown";
 /** The one permission ask per run, shared by every room and the test button. */
 let notifyPermissionAsk: Promise<boolean> | null = null;
-let notifyClicksHooked = false;
+/** Hooks notification clicks once; settles when the listener is in place. */
+let notifyClicks: Promise<unknown> | null = null;
 
 /** Adds attachments not already on the message, plus any waiting for it. */
 function withAttachments(m: Message, extra: Attachment[] = []): Message {
@@ -235,8 +236,8 @@ function notificationPermission(get: () => ChatState): Promise<boolean> {
   if (notifyPermission === "granted") return Promise.resolve(true);
   if (notifyPermission === "denied") return Promise.resolve(false);
   notifyPermissionAsk ??= (async () => {
-    let granted = await isPermissionGranted();
-    if (!granted) granted = (await requestPermission()) === "granted";
+    // A failed check counts as denied: the ask must not stay rejected for the whole run.
+    const granted = await (async () => (await isPermissionGranted()) || (await requestPermission()) === "granted")().catch(() => false);
     notifyPermission = granted ? "granted" : "denied";
     if (!granted) get().toast("Notifications are off for Multichat in your system settings", "info");
     return granted;
@@ -244,13 +245,11 @@ function notificationPermission(get: () => ChatState): Promise<boolean> {
   return notifyPermissionAsk;
 }
 
-/** Clicking a notification focuses the window and opens its room. The event
- *  only exists where the plugin reports clicks (desktop); elsewhere the room
- *  is unknown, so nothing extra happens when the app is opened by hand. */
+/** Clicking a notification focuses the window and opens its room. Where the
+ *  platform doesn't report the click, nothing extra happens. Await it before
+ *  sending: the plugin only tracks clicks on notifications sent after this. */
 function hookNotificationClicks() {
-  if (notifyClicksHooked) return;
-  notifyClicksHooked = true;
-  onAction((event) => {
+  notifyClicks ??= onAction((event) => {
     if (event.actionId !== "tap") return;
     const roomId = event.notification?.extra?.roomId;
     if (typeof roomId !== "string") return;
@@ -262,6 +261,7 @@ function hookNotificationClicks() {
   }).catch(() => {
     /* the platform doesn't report clicks; the notifications still show */
   });
+  return notifyClicks;
 }
 
 /** Shows one system notification for `roomId`, or holds it (counted) while the
@@ -276,15 +276,23 @@ async function notifyRoom(get: () => ChatState, roomId: string, roomName: string
   }
   // Claim the window before the permission ask, so messages arriving while the
   // OS prompt is open fold into this notification instead of sending their own.
-  notifyState.set(roomId, { lastAt: now, held: 0 });
-  hookNotificationClicks();
+  notifyState.set(roomId, { lastAt: now, held: st?.held ?? 0 });
+  await hookNotificationClicks();
   if (!(await notificationPermission(get))) return;
-  const count = (st?.held ?? 0) + 1;
+  const claimed = notifyState.get(roomId);
+  if (!claimed) return; // Left the room while the prompt was open.
+  const count = claimed.held + 1;
+  notifyState.set(roomId, { ...claimed, held: 0 });
   sendNotification({
     title: `#${roomName}`,
     body: count > 1 ? `${count} new messages` : body,
     extra: { roomId },
   });
+}
+
+function withoutKey<T>(map: Record<string, T>, key: string): Record<string, T> {
+  const { [key]: _, ...rest } = map;
+  return rest;
 }
 
 /** One notifiable message arrived: someone else's human message, or one of their
@@ -657,7 +665,9 @@ export const useChat = create<ChatState>((set, get) => {
           const { [msg.room_id]: _m, ...messages } = s.messages;
           const { [msg.room_id]: _l, ...loaded } = s.loaded;
           const { [msg.room_id]: _h, ...hasMore } = s.hasMore;
+          const client = s.client && { ...s.client, notify_by_room: withoutKey(s.client.notify_by_room, msg.room_id) };
           return {
+            client,
             rooms,
             roomOrder,
             messages,
@@ -1163,7 +1173,7 @@ export const useChat = create<ChatState>((set, get) => {
     setRoomNotify(roomId, mode) {
       set((s) => {
         if (!s.client) return {};
-        const { [roomId]: _old, ...rest } = s.client.notify_by_room;
+        const rest = withoutKey(s.client.notify_by_room, roomId);
         // The default ("mentions") is stored as no entry, like the backend keeps it.
         const notify_by_room = mode === "mentions" ? rest : { ...rest, [roomId]: mode };
         return { client: { ...s.client, notify_by_room } };
@@ -1172,8 +1182,8 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     async testNotification() {
+      await hookNotificationClicks();
       if (!(await notificationPermission(get))) return;
-      hookNotificationClicks();
       sendNotification({
         title: "Multichat",
         body: "Test notification — new messages will pop up like this.",
