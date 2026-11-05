@@ -97,7 +97,7 @@ export interface SearchHit {
 }
 
 export type ClientMsg =
-  | { type: "hello"; user_id: string; display_name: string; device_id: string; device_name: string; platform: string }
+  | { type: "hello"; user_id: string; display_name: string; device_id: string; device_name: string; platform: string; secret: string }
   | { type: "create_room"; request_id: string; name: string }
   | { type: "join_room"; request_id: string; invite_code: string }
   | { type: "leave_room"; room_id: string }
@@ -120,7 +120,7 @@ export type ClientMsg =
   | { type: "share_profiles"; profiles: SharedProfile[] }
   | { type: "request_ai"; request_id: string; room_id: string; anchor_id: string; device_id: string; profile_id: string }
   | { type: "ai_request_failed"; request_id: string; to_device_id: string; message: string }
-  | { type: "create_link_code"; request_id: string }
+  | { type: "create_link_code"; request_id: string; secret: string }
   | { type: "redeem_link_code"; request_id: string; code: string }
   | { type: "search_messages"; request_id: string; room_id: string; query: string };
 
@@ -150,7 +150,7 @@ export type ServerMsg =
   | { type: "reactions"; room_id: string; message_id: string; reactions: Reaction[] }
   | { type: "ai_requested"; request_id: string; room_id: string; anchor_id: string; anchor_seq: number; profile_id: string; from_device_id: string }
   | { type: "link_code"; request_id: string; code: string; expires_in_secs: number }
-  | { type: "linked"; request_id: string; user_id: string; display_name: string }
+  | { type: "linked"; request_id: string; user_id: string; display_name: string; secret: string }
   | { type: "devices"; devices: Device[] }
   | { type: "error"; request_id: string | null; message: string };
 
@@ -222,6 +222,8 @@ export interface ClientState {
   user_id: string;
   display_name: string;
   device_id: string;
+  /** Signs this device in to `user_id` on the relay; sent in `hello`. */
+  account_secret: string;
   /** True while this device acts as another device's account (device linking). */
   linked: boolean;
   server_url: string;

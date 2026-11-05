@@ -42,6 +42,8 @@ const IMAGE_MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/
 const LINK_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Failed link-code redeems allowed per connection before further tries are refused.
 const MAX_FAILED_REDEEMS: u32 = 5;
+/// Longest account secret `hello` accepts (the app sends 64 hex characters).
+const MAX_SECRET: usize = 256;
 /// Minimum gap between two accepted `typing: true` frames from one connection.
 const TYPING_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -82,6 +84,9 @@ struct Stream {
 struct LinkCode {
     user_id: String,
     display_name: String,
+    /// The account's secret, given to the device that redeems the code. Held in
+    /// memory only, for the code's ten minutes.
+    secret: String,
     expires: Instant,
 }
 
@@ -174,6 +179,10 @@ pub struct State {
     /// every client in the order they were written, and a history snapshot read before
     /// an update is always delivered before it, never after.
     updates_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held in `hello` from the secret check until the connection is bound to the
+    /// account, so a claim can't slip between an older client's check and its bind
+    /// (the claim's sign-out would miss a connection not bound yet).
+    auth_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -186,7 +195,7 @@ fn err(request_id: Option<String>, message: impl Into<String>) -> ServerMsg {
 
 impl State {
     pub fn new(db: Db) -> Self {
-        Self { db, hub: Arc::new(Mutex::new(Hub::default())), updates_lock: Default::default() }
+        Self { db, hub: Arc::new(Mutex::new(Hub::default())), updates_lock: Default::default(), auth_lock: Default::default() }
     }
 
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
@@ -300,8 +309,8 @@ impl State {
     }
 
     async fn dispatch(&self, conn: ConnId, msg: ClientMsg) -> sqlx::Result<()> {
-        if let ClientMsg::Hello { user_id, display_name, device_id, device_name, platform } = msg {
-            return self.hello(conn, user_id, display_name, device_id, device_name, platform).await;
+        if let ClientMsg::Hello { user_id, display_name, device_id, device_name, platform, secret } = msg {
+            return self.hello(conn, user_id, display_name, device_id, device_name, platform, secret).await;
         }
         let Some((user_id, display_name)) = self.identity(conn) else {
             self.send(conn, err(None, "Send hello first"));
@@ -932,17 +941,29 @@ impl State {
                 }
             }
 
-            ClientMsg::CreateLinkCode { request_id } => {
+            ClientMsg::CreateLinkCode { request_id, secret } => {
+                // The code hands the account's secret to the linked device, so it must
+                // be the account's real one.
+                let real = db::stored_secret_hash(&self.db, &user_id).await?.flatten();
+                if secret.is_empty() || real != Some(db::secret_hash(&secret)) {
+                    self.send(conn, err(Some(request_id), "Update the app to link devices"));
+                    return Ok(());
+                }
                 let mut hub = self.hub();
                 hub.link_codes.retain(|_, c| c.expires > Instant::now());
                 // One live code per user: a fresh code replaces the previous one.
                 hub.link_codes.retain(|_, c| c.user_id != user_id);
-                let code = db::invite_code();
+                // Longer than room codes: a code hands over the account's secret, and with
+                // 31^8 (~850 billion) possibilities guessing one within its ten minutes is
+                // hopeless even across many connections, without a relay-wide limit that
+                // one guesser could use to block everyone's linking.
+                let code = db::random_code(8);
                 hub.link_codes.insert(
                     code.clone(),
                     LinkCode {
                         user_id: user_id.clone(),
                         display_name: display_name.clone(),
+                        secret,
                         expires: Instant::now() + LINK_CODE_TTL,
                     },
                 );
@@ -972,9 +993,11 @@ impl State {
                 };
                 // Clone the owner out of the map so the else branch can mutably
                 // borrow the hub (the map borrow ends with this statement).
-                let link =
-                    hub.link_codes.get(&code).map(|l| (l.user_id.clone(), l.display_name.clone()));
-                let Some((owner_id, owner_name)) = link else {
+                let link = hub
+                    .link_codes
+                    .get(&code)
+                    .map(|l| (l.user_id.clone(), l.display_name.clone(), l.secret.clone()));
+                let Some((owner_id, owner_name, owner_secret)) = link else {
                     miss(&mut hub);
                     hub.send(
                         conn,
@@ -993,6 +1016,7 @@ impl State {
                     request_id,
                     user_id: owner_id,
                     display_name: owner_name,
+                    secret: owner_secret,
                 };
                 hub.send(conn, &msg);
             }
@@ -1009,6 +1033,7 @@ impl State {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn hello(
         &self,
         conn: ConnId,
@@ -1017,6 +1042,7 @@ impl State {
         device_id: String,
         device_name: String,
         platform: String,
+        secret: String,
     ) -> sqlx::Result<()> {
         let display_name = clip(&display_name, MAX_NAME);
         let device_name = clip(&device_name, MAX_NAME);
@@ -1029,6 +1055,47 @@ impl State {
         if let Some((existing, _)) = self.identity(conn) {
             if existing != user_id {
                 self.send(conn, err(None, "Cannot change user on an open connection"));
+                return Ok(());
+            }
+        }
+        // The account's secret decides whether this connection may be `user_id`:
+        // the id alone is visible to every room member, so it proves nothing.
+        if secret.len() > MAX_SECRET {
+            self.send(conn, err(None, "That account secret is too long"));
+            return Ok(());
+        }
+        let auth = self.auth_lock.lock().await;
+        match db::check_secret(&self.db, &user_id, &display_name, &secret).await? {
+            db::SecretCheck::Ok => {}
+            db::SecretCheck::Claimed => {
+                // Until now the account had no secret, so any connection already signed in
+                // as it never proved one: sign those out; they can reconnect with the secret.
+                let mut hub = self.hub();
+                let others: Vec<ConnId> = hub
+                    .conns
+                    .iter()
+                    .filter(|(id, c)| **id != conn && c.user_id.as_deref() == Some(user_id.as_str()))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in others {
+                    if let Some(c) = hub.conns.get_mut(&id) {
+                        c.user_id = None;
+                        c.welcomed = false;
+                        c.rooms.clear();
+                        c.typing_rooms.clear();
+                        c.shared_profiles.clear();
+                    }
+                    hub.send(id, &err(None, "This device isn't signed in to that account. Link it again from a device on the account."));
+                }
+            }
+            db::SecretCheck::Legacy => {
+                tracing::warn!("hello without an account secret for {user_id} (older client)");
+            }
+            db::SecretCheck::Wrong => {
+                self.send(
+                    conn,
+                    err(None, "This device isn't signed in to that account. Link it again from a device on the account."),
+                );
                 return Ok(());
             }
         }
@@ -1053,6 +1120,8 @@ impl State {
             }
             newly
         };
+        // Bound: a claim from here on will see (and sign out) this connection.
+        drop(auth);
 
         let renamed = prev_name.is_some_and(|p| p != display_name);
         {

@@ -116,6 +116,9 @@ let relay: Relay | null = null;
 /** Human message id → profile id, waiting for the server echo before the AI call starts. */
 const pendingAi = new Map<string, string>();
 
+/** The relay's answer to a `hello` whose account secret is wrong (see server `hello`). */
+export const SIGN_IN_REFUSED = /isn't signed in to that account/;
+
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /** True when `content` mentions `name` as `@name` (case-insensitive, not followed by
@@ -175,6 +178,8 @@ interface LinkCodeReply {
 interface LinkedReply {
   user_id: string;
   display_name: string;
+  /** The account's secret, so this device can sign in to it. */
+  secret: string;
 }
 
 function upsert(list: Message[] | undefined, m: Message): Message[] {
@@ -275,6 +280,7 @@ export const useChat = create<ChatState>((set, get) => {
         display_name: client.display_name,
         device_id: client.device_id,
         platform: client.platform,
+        secret: client.account_secret,
       },
       {
         onMessage: handle,
@@ -799,7 +805,8 @@ export const useChat = create<ChatState>((set, get) => {
       case "linked": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
         if (msg.request_id) pendingRequests.delete(msg.request_id);
-        pending?.resolve({ user_id: msg.user_id, display_name: msg.display_name });
+        // The secret too: without it the device can't sign in to the linked account.
+        pending?.resolve({ user_id: msg.user_id, display_name: msg.display_name, secret: msg.secret });
         break;
       }
       case "devices":
@@ -811,6 +818,9 @@ export const useChat = create<ChatState>((set, get) => {
         if (pending && msg.request_id) {
           pendingRequests.delete(msg.request_id);
           pending.reject(new Error(msg.message));
+        } else if (!msg.request_id && SIGN_IN_REFUSED.test(msg.message)) {
+          // Signing in was refused: keep saying why, not just "Connecting…".
+          set({ connError: msg.message });
         } else {
           get().toast(msg.message);
         }
@@ -893,13 +903,14 @@ export const useChat = create<ChatState>((set, get) => {
     joinRoom: (code) => request<RoomInfo>((request_id) => ({ type: "join_room", request_id, invite_code: code })),
 
     async createLinkCode() {
-      const reply = await request<LinkCodeReply>((request_id) => ({ type: "create_link_code", request_id }));
+      const secret = get().client?.account_secret ?? "";
+      const reply = await request<LinkCodeReply>((request_id) => ({ type: "create_link_code", request_id, secret }));
       return { code: reply.code, expiresInSecs: reply.expires_in_secs };
     },
 
     async redeemLinkCode(code) {
       const reply = await request<LinkedReply>((request_id) => ({ type: "redeem_link_code", request_id, code }));
-      await backend.linkDevice(reply.user_id, reply.display_name);
+      await backend.linkDevice(reply.user_id, reply.display_name, reply.secret);
       await get().refreshClient();
       // The relay refuses a user change on an open connection, so reconnect
       // fresh (the same reset saveIdentity does when the server URL changes).

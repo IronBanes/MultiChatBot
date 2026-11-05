@@ -84,7 +84,7 @@ all rooms. The first client frame must be `hello`.
 
 | type | fields | notes |
 |---|---|---|
-| `hello` | `user_id, display_name, device_id?, device_name?, platform?` | also used to rename; optional fields identify the device for linking |
+| `hello` | `user_id, display_name, device_id?, device_name?, platform?, secret` | also used to rename; optional fields identify the device for linking; `secret` signs in to the account (see Accounts) |
 | `create_room` | `request_id, name` | → `room_joined` |
 | `join_room` | `request_id, invite_code` | → `room_joined` |
 | `leave_room` | `room_id` | |
@@ -107,7 +107,7 @@ all rooms. The first client frame must be `hello`.
 | `share_profiles` | `profiles: SharedProfile[]` | this connection's profiles the user's other devices may generate with (≤ 50; label/model clipped like names); broadcast as a refreshed `devices` to the user's connections |
 | `request_ai` | `request_id, room_id, anchor_id, device_id, profile_id` | ask one of the user's own devices to reply to `anchor_id` with its local profile → `ai_requested` there (or `error` with the request_id); the sender must be in the room, the anchor a non-deleted human message of that room, the target an online connection of the same user's device that is in the room and not the sender's own connection; nothing is stored |
 | `ai_request_failed` | `request_id, to_device_id, message` | the target's answer when it can't; relayed to the asking device's connections of the same user as `error` with the request_id (message clipped like `ai_error`) |
-| `create_link_code` | `request_id` | → `link_code`; one live code per user, valid 10 min, single use |
+| `create_link_code` | `request_id, secret` | → `link_code` (8 characters); one live code per user, valid 10 min, single use; `secret` must be the account's (it's handed to the redeeming device) |
 | `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
 | `search_messages` | `request_id, room_id, query` | full-text search of that room's messages (prefix match on the last word, ≤ 200 chars); → `search_results`; members only |
 
@@ -139,7 +139,7 @@ all rooms. The first client frame must be `hello`.
 | `message_updated` | `room_id, message: Message` (the full row after an edit or delete) |
 | `ai_requested` | `request_id, room_id, anchor_id, profile_id, from_device_id` (answers `request_ai`; delivered to the target device's first matching connection only, never stored) |
 | `link_code` | `request_id, code, expires_in_secs` |
-| `linked` | `request_id, user_id, display_name` |
+| `linked` | `request_id, user_id, display_name, secret` (the account's secret) |
 | `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline, or shares profiles) |
 | `error` | `request_id?, message` |
 
@@ -166,6 +166,19 @@ ai_complete ────────────────►  persist final t
    or ai_error ─────────────►  persist status=error, broadcast ──►
 socket closes mid-stream  ──►  status=interrupted (partial kept), broadcast ai_interrupted
 ```
+
+### Accounts
+
+A user id is visible to every member of a room, so it can't prove who's connecting. Each
+account also has a secret (64 random hex characters, made by the app and kept in the OS
+keychain, or the app's private file store on Android). `hello` sends it; the relay keeps
+only its SHA-256 (`users.secret_hash`) and refuses a `hello` whose secret doesn't match
+("This device isn't signed in to that account"), so an impostor gets no rooms, history,
+device list or `request_ai`. A new account must set its secret on first connect (a `hello` without one is refused); an account
+from before secrets claims one on its next connect (trust on first use), and until then a
+client too old to send one is still let in. A link code carries the account's secret (in
+the relay's memory, for the code's ten minutes) to the device that redeems it; unlinking
+deletes it from that device.
 
 ### Delegated replies (device linking, phase 2)
 
