@@ -218,18 +218,11 @@ fn resolve_key(state: &AppState, profile: &Profile, api_key: Option<String>) -> 
             check_not_blocked(state, profile)?;
             // A key from before pairing belongs to the profile's saved address: pair it
             // there first, so it isn't tried on a different address typed into the form.
-            // An unpaired key is only ever used at the saved address, whether or not
-            // pairing it now succeeds.
-            let form = secrets::endpoint(&profile.base_url);
-            if secrets::key_is_unpaired(&profile.id) {
-                let saved = state.snapshot()?.profiles.iter().find(|p| p.id == profile.id).map(|p| secrets::endpoint(&p.base_url));
-                if saved.as_deref() != Some(form.as_str()) {
-                    return Err(secrets::KEY_ENDPOINT_MISMATCH.into());
-                }
-                secrets::pair_legacy_key(&profile.id, &form);
-            }
-            // Paired with the address in the form: a stored key isn't tried on a new one.
-            secrets::get_key(&profile.id, &form)
+            // One read decides: a paired key only for its own address, and a key from
+            // before pairing only at the profile's saved address (whether or not pairing
+            // it there succeeds). Keychain errors are passed on, never read as "paired".
+            let saved = state.snapshot()?.profiles.iter().find(|p| p.id == profile.id).map(|p| p.base_url.clone());
+            secrets::get_key_for_form(&profile.id, &profile.base_url, saved.as_deref())
         }
         None => Ok(None),
     }

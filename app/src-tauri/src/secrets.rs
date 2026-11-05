@@ -151,9 +151,20 @@ pub fn endpoint(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-/// True when the stored key is from before pairing (a plain string, no endpoint yet).
-pub fn key_is_unpaired(profile_id: &str) -> bool {
-    matches!(get(&format!("profile:{profile_id}")), Ok(Some(raw)) if serde_json::from_str::<PairedKey>(&raw).is_err())
+/// The key for a form's address `form`, read once: a paired key only for its own
+/// endpoint; a key from before pairing only when `form` is the profile's saved address
+/// `saved` (and it's paired there, best effort). Read errors are passed on.
+pub fn get_key_for_form(profile_id: &str, form: &str, saved: Option<&str>) -> Result<Option<String>, String> {
+    let Some(raw) = get(&format!("profile:{profile_id}"))? else { return Ok(None) };
+    match serde_json::from_str::<PairedKey>(&raw) {
+        Ok(p) if endpoint(&p.endpoint) == endpoint(form) => Ok(Some(p.key)),
+        Ok(_) => Err(KEY_ENDPOINT_MISMATCH.into()),
+        Err(_) if saved.map(endpoint).as_deref() == Some(endpoint(form).as_str()) => {
+            let _ = set_key(profile_id, &raw, form);
+            Ok(Some(raw))
+        }
+        Err(_) => Err(KEY_ENDPOINT_MISMATCH.into()),
+    }
 }
 
 /// True when a key is stored for the profile (whatever endpoint it belongs to).
