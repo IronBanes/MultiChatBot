@@ -418,8 +418,27 @@ fn mcp_secrets_for(s: &McpServer) -> McpSecrets {
     }
 }
 
-fn merge_secrets(server_id: &str, edits: Option<Vec<SecretEdit>>) -> Result<McpSecrets, String> {
-    let old = if server_id.is_empty() { McpSecrets::default() } else { secrets::get_mcp(server_id)? };
+/// The server as it will be saved (trimmed), for comparing addresses.
+fn normalized(server: &McpServer) -> McpServer {
+    let mut s = server.clone();
+    s.command = s.command.trim().to_string();
+    s.url = s.url.trim().to_string();
+    s.args.retain(|a| !a.is_empty());
+    s
+}
+
+/// The new values from the editor, plus stored ones kept (`value: None`) — but stored
+/// values only if they were saved for `address`, the one being saved or tested.
+/// Secrets from before pairing count as saved for the server's saved address. So
+/// changing a server's URL or command never carries its secrets along unless they're
+/// entered again.
+fn merge_secrets(state: &AppState, server_id: &str, address: &str, edits: Option<Vec<SecretEdit>>) -> Result<McpSecrets, String> {
+    let stored = if server_id.is_empty() { McpSecrets::default() } else { secrets::get_mcp(server_id)? };
+    let stored_for = match &stored.target {
+        Some(t) => Some(t.clone()),
+        None => state.snapshot()?.mcp_servers.iter().find(|s| s.id == server_id).map(mcp_target),
+    };
+    let old = if stored_for.as_deref() == Some(address) { stored } else { McpSecrets::default() };
     let Some(edits) = edits else { return Ok(old) };
     let mut new = McpSecrets::default();
     for e in edits {
@@ -431,7 +450,11 @@ fn merge_secrets(server_id: &str, edits: Option<Vec<SecretEdit>>) -> Result<McpS
             if e.kind == "header" { (&mut new.headers, &old.headers) } else { (&mut new.env, &old.env) };
         let value = match e.value {
             Some(v) => v,
-            None => previous.get(&name).cloned().unwrap_or_default(),
+            // A kept value that can't be reused here is dropped, not sent empty.
+            None => match previous.get(&name) {
+                Some(v) => v.clone(),
+                None => continue,
+            },
         };
         target.insert(name, value);
     }
@@ -471,7 +494,7 @@ async fn save_mcp_server(
         // Merge against the stored secrets inside the lock, so a concurrent save of the
         // same server can't be overwritten with stale values.
         let _saving = state.saving.lock().map_err(|_| "save lock poisoned")?;
-        let merged = merge_secrets(&server.id, secrets)?;
+        let merged = merge_secrets(&state, &server.id, &mcp_target(&normalized(&server)), secrets)?;
         if server.id.is_empty() {
             server.id = uuid::Uuid::new_v4().to_string();
         }
@@ -526,7 +549,8 @@ async fn test_mcp_server(
     secrets: Option<Vec<SecretEdit>>,
 ) -> Result<Vec<mcp::ToolInfo>, String> {
     validate_mcp(&server)?;
-    let merged = merge_secrets(&server.id, secrets)?;
+    // Stored secrets only go to the address they were saved for, even in a test.
+    let merged = merge_secrets(&state, &server.id, &mcp_target(&normalized(&server)), secrets)?;
     let mut probe = server.clone();
     if probe.id.is_empty() {
         probe.id = format!("test-{}", uuid::Uuid::new_v4());
