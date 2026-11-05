@@ -718,7 +718,8 @@ export const useChat = create<ChatState>((set, get) => {
           const askedBy = delegatedGenerations.get(id);
           if (askedBy && ev.status === "awaiting_approval") {
             const raw = ev.args ?? "{}";
-            const args = raw.length > MAX_APPROVAL_ARGS ? `… [cut short: the full call is on the computer]\n${raw.slice(0, MAX_APPROVAL_ARGS)}` : raw;
+            // Half an emoji at the cut would make the relay refuse the whole frame.
+            const args = raw.length > MAX_APPROVAL_ARGS ? `… [cut short: the full call is on the computer]\n${raw.slice(0, MAX_APPROVAL_ARGS).replace(/[\uD800-\uDBFF]$/, "")}` : raw;
             const pending = {
               deviceId: askedBy,
               command: { kind: "tool_approval", room_id: roomId, message_id: id, call_id: ev.call_id, server: ev.server, tool: ev.tool, args } as const,
