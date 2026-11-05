@@ -69,6 +69,7 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
   const rooms = useChat((s) => s.rooms);
   const roomOrder = useChat((s) => s.roomOrder);
   const unread = useChat((s) => s.unread);
+  const mentioned = useChat((s) => s.mentioned);
   const activeRoomId = useChat((s) => s.activeRoomId);
   const selectRoom = useChat((s) => s.selectRoom);
   const [dialog, setDialog] = useState<"create" | "join" | null>(null);
@@ -135,6 +136,9 @@ export function Sidebar({ onSettings }: { onSettings: () => void }) {
             >
               <Icon name="hash" size={15} className="shrink-0 text-zinc-400" />
               <span className="min-w-0 flex-1 truncate">{r.name}</span>
+              {mentioned[id] && !active && (
+                <span className="rounded-full bg-amber-500 px-1.5 text-[11px] font-bold text-white" title="You were mentioned">@</span>
+              )}
               {!!unread[id] && !active ? (
                 <span className="rounded-full bg-indigo-600 px-1.5 text-[11px] font-semibold text-white">{unread[id]}</span>
               ) : (
@@ -175,6 +179,7 @@ export function PhoneRoomList({ onSettings }: { onSettings: () => void }) {
   const rooms = useChat((s) => s.rooms);
   const roomOrder = useChat((s) => s.roomOrder);
   const unread = useChat((s) => s.unread);
+  const mentioned = useChat((s) => s.mentioned);
   const messages = useChat((s) => s.messages);
   const selectRoom = useChat((s) => s.selectRoom);
   const [dialog, setDialog] = useState<"create" | "join" | null>(null);
@@ -253,6 +258,9 @@ export function PhoneRoomList({ onSettings }: { onSettings: () => void }) {
                 </span>
                 <span className="mt-0.5 flex items-center gap-2">
                   <span className={`min-w-0 flex-1 truncate text-sm ${count ? "text-zinc-700 dark:text-zinc-300" : "text-zinc-500"}`}>{preview}</span>
+                  {mentioned[id] && (
+                    <span className="shrink-0 rounded-full bg-amber-500 px-2 py-0.5 text-[11px] font-bold text-white" aria-label="You were mentioned">@</span>
+                  )}
                   {count > 0 && (
                     <span className="shrink-0 rounded-full bg-indigo-600 px-2 py-0.5 text-[11px] font-semibold text-white">{count}</span>
                   )}
