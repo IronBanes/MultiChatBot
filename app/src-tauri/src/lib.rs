@@ -216,6 +216,11 @@ fn resolve_key(state: &AppState, profile: &Profile, api_key: Option<String>) -> 
         None if !profile.id.is_empty() => {
             // A key typed into the form still works, so the user can test and recover.
             check_not_blocked(state, profile)?;
+            // A key from before pairing belongs to the profile's saved address: pair it
+            // there first, so it isn't tried on a different address typed into the form.
+            if let Some(saved) = state.snapshot()?.profiles.iter().find(|p| p.id == profile.id) {
+                secrets::pair_legacy_key(&profile.id, &saved.base_url);
+            }
             // Paired with the address in the form: a stored key isn't tried on a new one.
             secrets::get_key(&profile.id, profile.base_url.trim().trim_end_matches('/'))
         }
