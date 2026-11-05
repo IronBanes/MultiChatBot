@@ -139,10 +139,21 @@ pub const KEY_ENDPOINT_MISMATCH: &str =
 pub fn get_key(profile_id: &str, endpoint: &str) -> Result<Option<String>, String> {
     let Some(raw) = get(&format!("profile:{profile_id}"))? else { return Ok(None) };
     match serde_json::from_str::<PairedKey>(&raw) {
-        Ok(p) if p.endpoint == endpoint => Ok(Some(p.key)),
+        Ok(p) if self::endpoint(&p.endpoint) == self::endpoint(endpoint) => Ok(Some(p.key)),
         Ok(_) => Err(KEY_ENDPOINT_MISMATCH.into()),
         Err(_) => Ok(Some(raw)),
     }
+}
+
+/// The form keys are paired with: trimmed, without a trailing `/`, so the same
+/// address always compares equal however it was typed.
+pub fn endpoint(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
+/// True when the stored key is from before pairing (a plain string, no endpoint yet).
+pub fn key_is_unpaired(profile_id: &str) -> bool {
+    matches!(get(&format!("profile:{profile_id}")), Ok(Some(raw)) if serde_json::from_str::<PairedKey>(&raw).is_err())
 }
 
 /// True when a key is stored for the profile (whatever endpoint it belongs to).
@@ -152,7 +163,7 @@ pub fn has_key(profile_id: &str) -> bool {
 
 /// Stores `key` for `profile_id`, paired with `endpoint`.
 pub fn set_key(profile_id: &str, key: &str, endpoint: &str) -> Result<(), String> {
-    let json = serde_json::to_string(&PairedKey { key: key.into(), endpoint: endpoint.into() })
+    let json = serde_json::to_string(&PairedKey { key: key.into(), endpoint: self::endpoint(endpoint) })
         .map_err(|e| e.to_string())?;
     set(&format!("profile:{profile_id}"), &json)
 }
@@ -210,4 +221,17 @@ pub fn set_mcp(server_id: &str, secrets: &McpSecrets) -> Result<(), String> {
 
 pub fn delete_mcp(server_id: &str) -> Result<(), String> {
     delete(&format!("mcp:{server_id}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint;
+
+    #[test]
+    fn endpoints_compare_however_they_were_typed() {
+        assert_eq!(endpoint(" https://api.example.com/v1/ "), "https://api.example.com/v1");
+        assert_eq!(endpoint("https://api.example.com/v1//"), "https://api.example.com/v1");
+        assert_eq!(endpoint("https://api.example.com/v1"), endpoint("https://api.example.com/v1/"));
+        assert_ne!(endpoint("https://api.example.com/v1"), endpoint("https://evil.example.com/v1"));
+    }
 }
