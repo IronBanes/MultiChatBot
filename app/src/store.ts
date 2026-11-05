@@ -771,7 +771,8 @@ export const useChat = create<ChatState>((set, get) => {
       case "linked": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
         if (msg.request_id) pendingRequests.delete(msg.request_id);
-        pending?.resolve({ user_id: msg.user_id, display_name: msg.display_name });
+        // The secret too: without it the device can't sign in to the linked account.
+        pending?.resolve({ user_id: msg.user_id, display_name: msg.display_name, secret: msg.secret });
         break;
       }
       case "devices":
