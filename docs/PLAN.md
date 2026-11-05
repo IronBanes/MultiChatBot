@@ -174,7 +174,7 @@ account also has a secret (64 random hex characters, made by the app and kept in
 keychain, or the app's private file store on Android). `hello` sends it; the relay keeps
 only its SHA-256 (`users.secret_hash`) and refuses a `hello` whose secret doesn't match
 ("This device isn't signed in to that account"), so an impostor gets no rooms, history,
-device list or `request_ai`. A new account sets its secret on first connect; an account
+device list or `request_ai`. A new account must set its secret on first connect (a `hello` without one is refused); an account
 from before secrets claims one on its next connect (trust on first use), and until then a
 client too old to send one is still let in. A link code carries the account's secret (in
 the relay's memory, for the code's ten minutes) to the device that redeems it; unlinking

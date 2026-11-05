@@ -1053,7 +1053,28 @@ impl State {
             return Ok(());
         }
         match db::check_secret(&self.db, &user_id, &display_name, &secret).await? {
-            db::SecretCheck::Ok | db::SecretCheck::Claimed => {}
+            db::SecretCheck::Ok => {}
+            db::SecretCheck::Claimed => {
+                // Until now the account had no secret, so any connection already signed in
+                // as it never proved one: sign those out; they can reconnect with the secret.
+                let mut hub = self.hub();
+                let others: Vec<ConnId> = hub
+                    .conns
+                    .iter()
+                    .filter(|(id, c)| **id != conn && c.user_id.as_deref() == Some(user_id.as_str()))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in others {
+                    if let Some(c) = hub.conns.get_mut(&id) {
+                        c.user_id = None;
+                        c.welcomed = false;
+                        c.rooms.clear();
+                        c.typing_rooms.clear();
+                        c.shared_profiles.clear();
+                    }
+                    hub.send(id, &err(None, "This device isn't signed in to that account. Link it again from a device on the account."));
+                }
+            }
             db::SecretCheck::Legacy => {
                 tracing::warn!("hello without an account secret for {user_id} (older client)");
             }

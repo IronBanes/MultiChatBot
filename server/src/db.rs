@@ -214,7 +214,9 @@ pub async fn check_secret(db: &Db, user_id: &str, name: &str, secret: &str) -> s
             let again = stored_secret_hash(db, user_id).await?.flatten();
             Ok(if again == Some(secret_hash(secret)) { SecretCheck::Ok } else { SecretCheck::Wrong })
         }
-        None if secret.is_empty() => Ok(SecretCheck::Legacy),
+        // A new account must bring a secret; only accounts from before secrets may
+        // connect without one (until they claim one).
+        None if secret.is_empty() => Ok(SecretCheck::Wrong),
         None => {
             sqlx::query(
                 "INSERT INTO users (id, display_name, updated_at, secret_hash) VALUES (?, ?, ?, ?)
@@ -1186,6 +1188,9 @@ mod tests {
         assert_eq!(check_secret(&db, "u2", "B", "theirs").await.unwrap(), SecretCheck::Wrong);
         assert_eq!(check_secret(&db, "u2", "B", "").await.unwrap(), SecretCheck::Wrong);
         assert_eq!(check_secret(&db, "u2", "B", "mine").await.unwrap(), SecretCheck::Ok);
+        // A brand-new account can't be created without a secret.
+        assert_eq!(check_secret(&db, "u3", "C", "").await.unwrap(), SecretCheck::Wrong);
+        assert!(stored_secret_hash(&db, "u3").await.unwrap().is_none());
         db.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
