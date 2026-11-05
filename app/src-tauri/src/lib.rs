@@ -171,8 +171,12 @@ fn link_device(
         return Err("The link code didn't include the account's sign-in. Update the other device.".into());
     }
     let name: String = display_name.trim().chars().take(40).collect();
+    let instance = config::instance_name();
+    // Re-linking from one linked account to another: that one's secret goes afterwards.
+    let cfg = state.snapshot()?;
+    let previous_link = cfg.linked_from.is_some().then(|| cfg.user_id.clone()).filter(|p| *p != user_id);
     // The secret first: without it this device couldn't sign in to the account.
-    secrets::set_account(&config::instance_name(), &user_id, &secret)?;
+    secrets::set_account(&instance, &user_id, &secret)?;
     state.update(|c| {
         // Remember this device's own account so unlinking can return to it.
         if c.linked_from.is_none() {
@@ -181,7 +185,11 @@ fn link_device(
         }
         c.user_id = user_id;
         c.display_name = name;
-    })
+    })?;
+    if let Some(prev) = previous_link {
+        let _ = secrets::delete_account(&instance, &prev);
+    }
+    Ok(())
 }
 
 #[tauri::command]
