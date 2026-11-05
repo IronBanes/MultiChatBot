@@ -1103,10 +1103,19 @@ function useProfileChoices() {
   const myDeviceId = useChat((s) => s.client!.device_id);
   return useMemo(
     () => [
-      ...profiles.map((p) => ({ id: p.id, label: p.label, detail: p.model })),
+      ...profiles.map((p) => ({ id: p.id, label: p.label, model: p.model, detail: p.model, remote: false, device: "" })),
       ...devices
         .filter((d) => d.device_id !== myDeviceId)
-        .flatMap((d) => d.profiles.map((p) => ({ id: remoteProfileId(d.device_id, p.id), label: p.label, detail: `on ${d.device_name}` }))),
+        .flatMap((d) =>
+          d.profiles.map((p) => ({
+            id: remoteProfileId(d.device_id, p.id),
+            label: p.label,
+            model: p.model,
+            detail: `on ${d.device_name}`,
+            remote: true,
+            device: d.device_name,
+          })),
+        ),
     ],
     [profiles, devices, myDeviceId],
   );
@@ -1328,17 +1337,14 @@ function ComposerSheet({
   onClose: () => void;
 }) {
   const profiles = useChat((s) => s.client!.profiles);
-  const devices = useChat((s) => s.devices);
-  const myDeviceId = useChat((s) => s.client!.device_id);
   const chooseProfile = useChat((s) => s.chooseProfile);
   const settings = (tab: SettingsTab) => {
     onClose();
     onOpenSettings(tab);
   };
   // Other devices of this account that share their profiles.
-  const shared = devices
-    .filter((d) => d.device_id !== myDeviceId)
-    .flatMap((d) => d.profiles.map((p) => ({ id: remoteProfileId(d.device_id, p.id), label: p.label, model: p.model, device: d.device_name })));
+  const choices = useProfileChoices();
+  const shared = useMemo(() => choices.filter((c) => c.remote), [choices]);
   const anyProfile = profiles.length + shared.length > 0;
   return (
     <div className="fixed inset-0 z-40 flex flex-col justify-end bg-black/40" onClick={onClose}>
@@ -1436,8 +1442,6 @@ function Composer({
   onClearReply: () => void;
 }) {
   const profiles = useChat((s) => s.client!.profiles);
-  const devices = useChat((s) => s.devices);
-  const myDeviceId = useChat((s) => s.client!.device_id);
   const platform = useChat((s) => s.client!.platform);
   const status = useChat((s) => s.status);
   const sendMessage = useChat((s) => s.sendMessage);
@@ -1451,9 +1455,8 @@ function Composer({
   const ta = useRef<HTMLTextAreaElement>(null);
   // While editing, the AI-reply option doesn't apply: the edit goes out as-is.
   // The pickers list local profiles first, then other devices' shared ones.
-  const shared = devices
-    .filter((d) => d.device_id !== myDeviceId)
-    .flatMap((d) => d.profiles.map((p) => ({ id: remoteProfileId(d.device_id, p.id), label: p.label, model: p.model, device: d.device_name })));
+  const choices = useProfileChoices();
+  const shared = useMemo(() => choices.filter((c) => c.remote), [choices]);
   const anyProfile = profiles.length + shared.length > 0;
 
   const ai = !editing && aiOn && !!profileId;
@@ -1961,7 +1964,6 @@ export function RoomView({
   onBack?: () => void;
 }) {
   const client = useChat((s) => s.client!);
-  const devices = useChat((s) => s.devices);
   const leaveRoom = useChat((s) => s.leaveRoom);
   const width = useWidth();
   const phone = !!onBack;
@@ -2011,17 +2013,8 @@ export function RoomView({
   // Local profiles first, then the shared ones of this user's other online
   // devices (a remote profile stays pickable while its device is online with
   // that profile). With none of either, there is no AI reply to get.
-  const myDeviceId = client.device_id;
-  const sharingDevices = devices.filter((d) => d.device_id !== myDeviceId && d.profiles.length > 0);
-  const sharedProfiles = useMemo(
-    () =>
-      sharingDevices.flatMap((d) =>
-        d.profiles.map((p) => ({ id: remoteProfileId(d.device_id, p.id), label: p.label, model: p.model, device: d.device_name })),
-      ),
-    // `sharingDevices` is derived here, so the memo tracks its parts.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [devices, myDeviceId],
-  );
+  const allChoices = useProfileChoices();
+  const sharedProfiles = useMemo(() => allChoices.filter((c) => c.remote), [allChoices]);
   // A remembered remote id stays chosen while that device is online with that
   // profile; otherwise fall back to the first local profile, then the first
   // shared one.
