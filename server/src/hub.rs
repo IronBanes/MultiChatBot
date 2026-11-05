@@ -179,6 +179,10 @@ pub struct State {
     /// every client in the order they were written, and a history snapshot read before
     /// an update is always delivered before it, never after.
     updates_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held in `hello` from the secret check until the connection is bound to the
+    /// account, so a claim can't slip between an older client's check and its bind
+    /// (the claim's sign-out would miss a connection not bound yet).
+    auth_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -191,7 +195,7 @@ fn err(request_id: Option<String>, message: impl Into<String>) -> ServerMsg {
 
 impl State {
     pub fn new(db: Db) -> Self {
-        Self { db, hub: Arc::new(Mutex::new(Hub::default())), updates_lock: Default::default() }
+        Self { db, hub: Arc::new(Mutex::new(Hub::default())), updates_lock: Default::default(), auth_lock: Default::default() }
     }
 
     fn hub(&self) -> std::sync::MutexGuard<'_, Hub> {
@@ -1060,6 +1064,7 @@ impl State {
             self.send(conn, err(None, "That account secret is too long"));
             return Ok(());
         }
+        let auth = self.auth_lock.lock().await;
         match db::check_secret(&self.db, &user_id, &display_name, &secret).await? {
             db::SecretCheck::Ok => {}
             db::SecretCheck::Claimed => {
@@ -1115,6 +1120,8 @@ impl State {
             }
             newly
         };
+        // Bound: a claim from here on will see (and sign out) this connection.
+        drop(auth);
 
         let renamed = prev_name.is_some_and(|p| p != display_name);
         {
