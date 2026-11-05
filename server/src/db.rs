@@ -271,6 +271,16 @@ pub async fn add_member(db: &Db, room_id: &str, user_id: &str) -> sqlx::Result<b
     Ok(res.rows_affected() > 0)
 }
 
+/// True when `user_id` is a member of `room_id`.
+pub async fn is_member(db: &Db, room_id: &str, user_id: &str) -> sqlx::Result<bool> {
+    let row: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM members WHERE room_id = ? AND user_id = ?")
+        .bind(room_id)
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?;
+    Ok(row.is_some())
+}
+
 pub async fn remove_member(db: &Db, room_id: &str, user_id: &str) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM members WHERE room_id = ? AND user_id = ?")
         .bind(room_id)
