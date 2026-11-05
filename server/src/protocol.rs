@@ -278,6 +278,9 @@ pub enum ServerMsg {
         request_id: String,
         room_id: String,
         anchor_id: String,
+        /// The anchor's position, so the device can load back to it if it's older than
+        /// what it has loaded (`load_older` with `until_seq`).
+        anchor_seq: i64,
         profile_id: String,
         from_device_id: String,
     },

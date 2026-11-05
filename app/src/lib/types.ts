@@ -148,7 +148,7 @@ export type ServerMsg =
   | { type: "typing"; room_id: string; user_id: string; display_name: string; typing: boolean }
   | { type: "room_updated"; room_id: string; system_prompt: string; updated_by: string }
   | { type: "reactions"; room_id: string; message_id: string; reactions: Reaction[] }
-  | { type: "ai_requested"; request_id: string; room_id: string; anchor_id: string; profile_id: string; from_device_id: string }
+  | { type: "ai_requested"; request_id: string; room_id: string; anchor_id: string; anchor_seq: number; profile_id: string; from_device_id: string }
   | { type: "link_code"; request_id: string; code: string; expires_in_secs: number }
   | { type: "linked"; request_id: string; user_id: string; display_name: string; secret: string }
   | { type: "devices"; devices: Device[] }
