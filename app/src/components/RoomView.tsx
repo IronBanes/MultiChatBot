@@ -1871,6 +1871,12 @@ ${before}` : t);
               className="min-w-0 flex-shrink truncate rounded-full border border-zinc-300 bg-transparent px-2.5 py-1 text-xs outline-none disabled:opacity-50 sm:max-w-64 dark:border-zinc-700 dark:bg-zinc-900"
               title="Which of your profiles answers your next message"
             >
+              {/* Only another device's profiles and none picked yet: make the first one selectable. */}
+              {!profileId && (
+                <option value="" disabled>
+                  Choose a profile
+                </option>
+              )}
               {profiles.map((p) => (
                 <option key={p.id} value={p.id}>
                   {p.label} · {p.model}
