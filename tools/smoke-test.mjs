@@ -356,6 +356,11 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   await phone.wait(type("welcome"), "welcome (phone)");
   phone.send({ type: "join_room", request_id: "r7", invite_code: droom.invite_code });
   await phone.wait(type("room_joined", (m) => m.request_id === "r7"), "room_joined (phone)");
+  // The account's other devices hear about a room one of them creates, without a request id.
+  phone.send({ type: "create_room", request_id: "r7b", name: "Made on the phone" });
+  const made = await phone.wait(type("room_joined", (m) => m.request_id === "r7b"), "room_joined (phone creates)");
+  const told = await pc.wait(type("room_joined", (m) => m.room.id === made.room.id), "room_joined (PC told)");
+  ok(told.request_id === null && told.room.name === "Made on the phone", "a room created on one device reaches the account's other devices");
 
   // Bob (another user) joins too, to see nothing of this.
   const bobd = new Client("Bob");

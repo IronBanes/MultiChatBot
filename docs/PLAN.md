@@ -116,7 +116,7 @@ all rooms. The first client frame must be `hello`.
 | type | fields |
 |---|---|
 | `welcome` | `user_id, rooms: RoomInfo[]` |
-| `room_joined` | `request_id?, room: RoomInfo` |
+| `room_joined` | `request_id?, room: RoomInfo` (also sent, without a request id, to the account's other connections) |
 | `room_left` | `room_id` |
 | `room_history` | `room_id, messages: Message[], has_more` (newest 200; `has_more` true when older messages exist) |
 | `older_messages` | `room_id, messages: Message[], has_more` (answers `load_older`; page of 100, oldest first — or the stretch reaching to `until_seq`) |

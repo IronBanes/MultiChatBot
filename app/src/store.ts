@@ -455,7 +455,9 @@ export const useChat = create<ChatState>((set, get) => {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
         if (msg.request_id) pendingRequests.delete(msg.request_id);
         pending?.resolve(r);
-        get().selectRoom(r.id);
+        // Without a request id it's a room another of my devices created or joined:
+        // list it, but don't switch to it here.
+        if (msg.request_id) get().selectRoom(r.id);
         break;
       }
       case "room_left":

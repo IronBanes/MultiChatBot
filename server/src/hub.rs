@@ -252,6 +252,23 @@ impl State {
     }
 
     /// Subscribes every connection of `user_id` to `room_id` and announces presence.
+    /// Answers a create/join on `conn`, and tells the user's other connections
+    /// (linked devices) about the room too, without a request id, so they list it
+    /// and know its details (such as the system prompt) without reconnecting.
+    fn room_joined(&self, conn: ConnId, user_id: &str, request_id: String, room: RoomInfo) {
+        let others: Vec<ConnId> = self
+            .hub()
+            .conns
+            .iter()
+            .filter(|(id, c)| **id != conn && c.user_id.as_deref() == Some(user_id))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in others {
+            self.send(id, ServerMsg::RoomJoined { request_id: None, room: room.clone() });
+        }
+        self.send(conn, ServerMsg::RoomJoined { request_id: Some(request_id), room });
+    }
+
     fn subscribe_user(&self, user_id: &str, room_id: &str) {
         let mut hub = self.hub();
         let was_online = hub.is_online(user_id, room_id);
@@ -296,7 +313,7 @@ impl State {
                 let room_id = db::create_room(&self.db, &name, &user_id).await?;
                 self.subscribe_user(&user_id, &room_id);
                 if let Some(room) = self.room_info(&room_id).await? {
-                    self.send(conn, ServerMsg::RoomJoined { request_id: Some(request_id), room });
+                    self.room_joined(conn, &user_id, request_id, room);
                 }
             }
 
@@ -322,7 +339,7 @@ impl State {
                 }
                 self.subscribe_user(&user_id, &room_id);
                 if let Some(room) = self.room_info(&room_id).await? {
-                    self.send(conn, ServerMsg::RoomJoined { request_id: Some(request_id), room });
+                    self.room_joined(conn, &user_id, request_id, room);
                 }
             }
 
