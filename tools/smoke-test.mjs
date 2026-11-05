@@ -388,7 +388,7 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   // The phone asks the PC to reply to its message with that profile.
   const anchorId = uuid();
   phone.send({ type: "send_message", room_id: droom.id, id: anchorId, content: "please answer from the PC", ai_requested: true });
-  await pc.wait(type("message", (m) => m.message.id === anchorId), "phone message reaches the PC");
+  const anchorMsg = await pc.wait(type("message", (m) => m.message.id === anchorId), "phone message reaches the PC");
   const reqId = uuid();
   phone.send({ type: "request_ai", request_id: reqId, room_id: droom.id, anchor_id: anchorId, device_id: "pc-1", profile_id: "prof-1" });
   const asked = await pc.wait(type("ai_requested", (m) => m.request_id === reqId), "ai_requested");
@@ -396,6 +396,7 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
     asked.room_id === droom.id && asked.anchor_id === anchorId && asked.profile_id === "prof-1" && asked.from_device_id === "phone-1",
     "ai_requested carries the same request, room, anchor, profile and the phone's device_id",
   );
+  ok(asked.anchor_seq === anchorMsg.message.seq, "ai_requested carries the anchor's seq, to load back to it");
   ok(
     !bobd.inbox.some((m) => m.type === "ai_requested") && !alice.inbox.some((m) => m.type === "ai_requested"),
     "other users and other connections get nothing",
