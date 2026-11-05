@@ -27,6 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 rmcp = { version = "3.8", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 base64 = "0.22"
 tauri-plugin-websocket = "2"
+tauri-plugin-notification = "2"
 
 # stdio MCP servers spawn local child processes, which iOS (and Android) forbid:
 # on mobile only the Streamable HTTP transport is compiled in.

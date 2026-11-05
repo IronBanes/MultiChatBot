@@ -11,6 +11,7 @@ import type {
   McpServerView,
   McpToolInfo,
   ModelInfo,
+  NotifyMode,
   Profile,
   ProfileView,
   SecretEdit,
@@ -44,6 +45,12 @@ export const backend = {
     invoke<McpToolInfo[]>("test_mcp_server", { server, secrets: secrets ?? null }),
   setRoomMcpMode: (roomId: string, serverId: string, mode: McpMode) =>
     invoke<void>("set_room_mcp_mode", { roomId, serverId, mode }),
+  /** Picks which messages in a room earn a system notification. */
+  setRoomNotify: (roomId: string, mode: NotifyMode) =>
+    invoke<void>("set_room_notify", { roomId, mode }),
+  /** Drops a left room's notification choice. */
+  forgetRoomNotify: (roomId: string) =>
+    invoke<void>("forget_room_notify", { roomId }),
   resolveToolCall: (id: string, callId: string, approved: boolean) =>
     invoke<void>("resolve_tool_call", { id, callId, approved }),
 

@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
 import { mentions, remoteProfileId } from "../store";
-import type { Attachment, McpMode, Member, Message, RoomInfo, SearchHit, ToolActivity } from "../lib/types";
+import type { Attachment, McpMode, Member, Message, NotifyMode, RoomInfo, SearchHit, ToolActivity } from "../lib/types";
 import { useChat, type LocalTool } from "../store";
 import { confirmAction } from "./Confirm";
 import { Markdown } from "./Markdown";
@@ -1997,6 +1997,92 @@ function RoomPromptDialog({ room, onClose }: { room: RoomInfo; onClose: () => vo
 /** Below this width the member list becomes a slide-over instead of a column. */
 const MEMBERS_INLINE_MIN = 1100;
 
+/** The three notification choices for one room; `notify_by_room` has no entry
+ *  for a room on "mentions" (the default). Its own component so the rows stay
+ *  out of the room's message rendering. */
+function NotifyMenu({ room, phone }: { room: RoomInfo; phone: boolean }) {
+  const setRoomNotify = useChat((s) => s.setRoomNotify);
+  const current = useChat((s) => s.client!.notify_by_room[room.id] ?? "mentions");
+  const choices: { value: NotifyMode; label: string }[] = [
+    { value: "all", label: "All messages" },
+    { value: "mentions", label: "Mentions only" },
+    { value: "off", label: "Off" },
+  ];
+  return (
+    <>
+      {choices.map((c) => (
+        <button
+          key={c.value}
+          role="menuitemradio"
+          aria-checked={current === c.value}
+          onClick={() => setRoomNotify(room.id, c.value)}
+          className={`flex items-center gap-3 text-left ${phone ? "min-h-11 w-full px-4 py-1.5 text-base active:bg-zinc-100 dark:active:bg-zinc-800" : "w-full px-3 py-1.5 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-800/60"}`}
+        >
+          <span className={`flex h-5 w-5 shrink-0 items-center justify-center ${current === c.value ? "text-indigo-600 dark:text-indigo-400" : "text-transparent"}`}>
+            <Icon name="check" size={16} />
+          </span>
+          {c.label}
+        </button>
+      ))}
+    </>
+  );
+}
+
+/** Desktop: the room's notification choice, from a bell button in the header. */
+function NotifyMenuButton({ room }: { room: RoomInfo }) {
+  const current = useChat((s) => s.client!.notify_by_room[room.id] ?? "mentions");
+  const [open, setOpen] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (e: MouseEvent) => {
+      if (box.current && !box.current.contains(e.target as Node)) setOpen(false);
+    };
+    const esc = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", esc);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", esc);
+    };
+  }, [open]);
+
+  return (
+    <div ref={box} className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        title="Notifications for this chat"
+        className={`flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition ${
+          current === "off"
+            ? "border-zinc-300 text-zinc-500 dark:border-zinc-700"
+            : "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300"
+        }`}
+      >
+        <Icon name="bell" size={13} />
+        <span className="hidden min-[480px]:inline">{current === "all" ? "All messages" : current === "mentions" ? "Mentions" : "Muted"}</span>
+      </button>
+      {open && (
+        <div
+          role="menu"
+          aria-label="Notifications"
+          className="absolute right-0 z-30 mt-2 w-56 overflow-hidden rounded-xl border border-zinc-200 bg-white py-1.5 text-left shadow-2xl dark:border-zinc-700 dark:bg-zinc-900"
+        >
+          <div className="px-3 pt-1 pb-1.5 text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">
+            Notifications in #{room.name}
+          </div>
+          <NotifyMenu room={room} phone={false} />
+          <p className="mt-1 border-t border-zinc-100 px-3 pt-2 pb-1 text-[11px] leading-snug text-zinc-500 dark:border-zinc-800">
+            While the app is in the background, a notification pops up for each choice above.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Phones: room actions that sit in the header on desktop. */
 function RoomMenu({
   room,
@@ -2039,6 +2125,16 @@ function RoomMenu({
             <span className="block truncate text-xs text-zinc-500">{room.system_prompt ? snippet(room.system_prompt, 60) : "None yet"}</span>
           </span>
         </button>
+        <div className="mt-1 border-t border-zinc-100 pt-1 dark:border-zinc-800" role="menu" aria-label="Notifications">
+          <div className="flex min-h-12 items-center gap-3 px-4 text-[15px]">
+            <Icon name="bell" size={18} className="text-zinc-500" />
+            <span className="min-w-0 flex-1">
+              <span className="block">Notifications</span>
+              <span className="block text-xs text-zinc-500">While the app is in the background</span>
+            </span>
+          </div>
+          <NotifyMenu room={room} phone />
+        </div>
         <button onClick={onLeave} className={`${row} text-red-600 dark:text-red-400`}>
           <Icon name="door" size={18} />
           <span className="flex-1">Leave room</span>
@@ -2217,6 +2313,7 @@ export function RoomView({
       >
         {copied ? "COPIED" : room.invite_code}
       </button>
+      <NotifyMenuButton room={room} />
       <Button variant="ghost" className="!px-2" onClick={() => setSearchOpen(true)} title="Search messages" aria-label="Search messages">
         <Icon name="search" size={17} />
       </Button>

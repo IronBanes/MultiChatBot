@@ -10,7 +10,7 @@ mod net;
 mod providers;
 mod secrets;
 
-use config::{Config, McpMode, McpServer, McpTransport, Profile};
+use config::{Config, McpMode, McpServer, McpTransport, NotifyMode, Profile};
 use context::HistoryItem;
 use futures_util::StreamExt;
 use generate::{Approvals, GenEvent};
@@ -106,6 +106,7 @@ struct ClientState {
     profiles: Vec<ProfileView>,
     mcp_servers: Vec<McpServerView>,
     mcp_modes_by_room: HashMap<String, HashMap<String, McpMode>>,
+    notify_by_room: HashMap<String, NotifyMode>,
 }
 
 /// "desktop", "ios" or "android" — lets the UI adapt (mobile hides stdio MCP servers).
@@ -154,6 +155,7 @@ fn get_state(state: State<'_, AppState>) -> Result<ClientState, String> {
         profiles: cfg.profiles.into_iter().map(view).collect(),
         mcp_servers: cfg.mcp_servers.into_iter().map(mcp_view).collect(),
         mcp_modes_by_room: cfg.mcp_modes_by_room,
+        notify_by_room: cfg.notify_by_room,
     })
 }
 
@@ -623,6 +625,29 @@ fn set_room_mcp_mode(state: State<'_, AppState>, room_id: String, server_id: Str
     })
 }
 
+/// Picks which messages in `room_id` earn a system notification. `Mentions` (the
+/// default) is stored as no entry, so rooms never touched stay out of the config.
+#[tauri::command]
+fn set_room_notify(state: State<'_, AppState>, room_id: String, mode: NotifyMode) -> Result<(), String> {
+    state.update(|c| {
+        if mode == NotifyMode::Mentions {
+            c.notify_by_room.remove(&room_id);
+        } else {
+            c.notify_by_room.insert(room_id, mode);
+        }
+    })
+}
+
+/// Drops a left room's notification choice (a rejoin starts from the default,
+/// like a room joined for the first time). Other per-room memories — the last
+/// profile and tool modes — are deliberately kept on leaving, as before.
+#[tauri::command]
+fn forget_room_notify(state: State<'_, AppState>, room_id: String) -> Result<(), String> {
+    state.update(|c| {
+        c.notify_by_room.remove(&room_id);
+    })
+}
+
 #[tauri::command]
 fn resolve_tool_call(state: State<'_, AppState>, id: String, call_id: String, approved: bool) -> Result<(), String> {
     let tx = state.approvals.lock().map_err(|_| "lock poisoned")?.remove(&format!("{id}:{call_id}"));
@@ -756,6 +781,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_websocket::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let base = app.path().app_config_dir()?;
             let config_path = config::config_path(&base);
@@ -810,6 +836,8 @@ pub fn run() {
             delete_mcp_server,
             test_mcp_server,
             set_room_mcp_mode,
+            set_room_notify,
+            forget_room_notify,
             resolve_tool_call,
             generate,
             stop_generation,

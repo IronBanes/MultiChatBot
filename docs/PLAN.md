@@ -220,3 +220,42 @@ Implementations: `OpenAiCompatible` (`POST {base}/chat/completions`, SSE) and
 `Anthropic` (`POST {base}/v1/messages`, `anthropic-version: 2026-10-21`, SSE; no sampling
 params since that version rejects them). Errors are sanitized: key, base URL and host are
 redacted and the text is truncated.
+
+## Notifications
+
+System notifications for new messages while the app is running but not in front
+(the window minimized or behind others, or a phone in the background with its relay
+connection still alive). Per room, the user picks **All messages**, **Mentions only**
+(the default) or **Off** — from the bell button in the room header on desktop, or the
+room's ⋯ menu on a phone. The choice lives in `config.json` as `notify_by_room`
+(room id → mode, no entry meaning "mentions") and is removed when the room is left.
+
+What notifies (in the store's `message` handling):
+
+- Only other people's human messages and *finished* AI replies (on `ai_complete`,
+  with the final text) — never this user's own messages from any of their devices,
+  deleted messages, or history/paging frames.
+- Only when the app isn't showing that room: the window hidden or unfocused
+  (`document.visibilityState`/`document.hasFocus()`), or another room is open.
+- Mentions: a message that @-names this user, or an AI reply whose anchor is this
+  user's message. All: every such message. Off: never (no text leaves the app).
+- At most one notification per room per 5 s; ones held back are counted, and the
+  next says "N new messages". Body: "Author: first 120 chars" ("AI for <name>: …").
+- The first notification checks the OS permission (asked once per run; if denied, a
+  one-time toast says so and nothing further is tried until restart). Where the
+  plugin reports clicks (desktop), clicking one focuses the window and opens the room.
+
+Phase 2 is true push — notifications when the phone app is suspended or closed,
+where phase 1 stops once the OS freezes the app. The relay would have to send push
+messages through **FCM** (Android) and **APNs** (iOS):
+
+- Per-device push tokens, registered with the relay over the authenticated
+  connection (the relay already knows each connection's device).
+- A relay-side push sender with server keys the owner has to create: a Firebase
+  project for Android, and an Apple push key for iOS.
+- Payloads without message text (or encrypted), since they pass through Google's
+  and Apple's servers — just "new message in #room", letting the app fetch the rest.
+
+Android also allows keeping a foreground service alive instead, which would keep the
+phase-1 connection (and so notifications) running indefinitely — at the cost of a
+permanent notification the user can't miss.

@@ -1077,6 +1077,26 @@ function LinkSection() {
   );
 }
 
+/** The General section's Notifications row: what the per-room setting does,
+ *  plus a button that asks for the OS permission and shows a sample. */
+function NotifySection() {
+  const testNotification = useChat((s) => s.testNotification);
+  return (
+    <div className="space-y-3 border-t border-zinc-200 pt-5 dark:border-zinc-800">
+      <div>
+        <h3 className="text-sm font-semibold">Notifications</h3>
+        <p className="mt-1 text-xs text-zinc-500">
+          Each room picks its own: all messages, mentions only (the default) or off — set it from the room's menu. They appear
+          while the app is running in the background.
+        </p>
+      </div>
+      <Button variant="outline" onClick={() => void testNotification()}>
+        <Icon name="bell" size={14} /> Send test notification
+      </Button>
+    </div>
+  );
+}
+
 function GeneralPanel() {
   const client = useChat((s) => s.client)!;
   const saveIdentity = useChat((s) => s.saveIdentity);
@@ -1117,6 +1137,8 @@ function GeneralPanel() {
           </div>
         </div>
       </div>
+
+      <NotifySection />
 
       <HostSection
         serverUrl={client.server_url}

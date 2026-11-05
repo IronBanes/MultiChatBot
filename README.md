@@ -206,6 +206,17 @@ On a phone (or any window narrower than 760px) the app switches to a phone layou
   wherever you'd scrolled to, stays in view.
 - The **+** next to the message box opens the AI reply, profile and tool options.
 
+### Notifications
+
+Each room picks when to notify: **All messages**, **Mentions only** (the default) or
+**Off**, set from the room's menu — the bell button in the header on desktop, or the
+room's ⋯ menu on a phone. Mentions means a message that @-names you, or an AI reply
+answering your message. Notifications appear while the app is running but not in front
+(minimized or behind other windows; on a phone, in the background while its connection
+is still alive). The first notification asks for the OS permission, and Settings →
+General has a **Send test notification** button. On phones the OS may suspend the app
+after a while in the background, and then notifications stop until it's opened again.
+
 iOS builds require macOS with Xcode — a Windows or Linux machine cannot produce them. There
 are two supported paths:
 
