@@ -81,6 +81,7 @@ export type ClientMsg =
   | { type: "join_room"; request_id: string; invite_code: string }
   | { type: "leave_room"; room_id: string }
   | { type: "open_room"; room_id: string }
+  | { type: "load_older"; room_id: string; before_seq: number }
   | { type: "send_message"; room_id: string; id: string; content: string; ai_requested: boolean; reply_to?: string | null }
   | { type: "ai_start"; room_id: string; id: string; anchor_id: string; model: string }
   | { type: "ai_delta"; room_id: string; id: string; delta: string }
@@ -102,7 +103,8 @@ export type ServerMsg =
   | { type: "welcome"; user_id: string; rooms: RoomInfo[] }
   | { type: "room_joined"; request_id: string | null; room: RoomInfo }
   | { type: "room_left"; room_id: string }
-  | { type: "room_history"; room_id: string; messages: Message[] }
+  | { type: "room_history"; room_id: string; messages: Message[]; has_more: boolean }
+  | { type: "older_messages"; room_id: string; messages: Message[]; has_more: boolean }
   | { type: "message"; room_id: string; message: Message }
   | { type: "message_updated"; room_id: string; message: Message }
   | { type: "ai_delta"; room_id: string; id: string; delta: string }

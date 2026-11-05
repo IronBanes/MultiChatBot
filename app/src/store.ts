@@ -28,6 +28,10 @@ interface ChatState {
   roomOrder: string[];
   messages: Record<string, Message[]>;
   loaded: Record<string, boolean>;
+  /** Room id → whether older messages exist before the first one loaded. */
+  hasMore: Record<string, boolean>;
+  /** Room id → whether an older-messages request is in flight. */
+  loadingOlder: Record<string, boolean>;
   unread: Record<string, number>;
   activeRoomId: string | null;
   /** True after the phone's back button: stay on the room list instead of opening a
@@ -70,6 +74,8 @@ interface ChatState {
   deleteMessage(roomId: string, messageId: string): Promise<boolean>;
   regenerate(ai: Message, profileId: string): void;
   stopAi(id: string): void;
+  /** Asks the relay for the next page of older messages (scroll-up pagination). */
+  loadOlder(roomId: string): void;
   /** Adds or removes this user's reaction on a message (human or AI). */
   react(roomId: string, messageId: string, emoji: string, on: boolean): void;
   /** Best-effort "I'm typing" broadcast; never persisted by the relay. */
@@ -180,6 +186,8 @@ export const useChat = create<ChatState>((set, get) => {
       {
         onMessage: handle,
         onStatus: (status, error) => {
+          // A lost answer can't arrive anymore; don't let it block loading forever.
+          if (status === "offline") set({ loadingOlder: {} });
           // The relay marks our in-flight replies as interrupted when the socket drops.
           if (status === "offline") stopAllGenerations();
           if (status !== "online") set({ devices: [] });
@@ -293,7 +301,7 @@ export const useChat = create<ChatState>((set, get) => {
         // Image fetches still pending when the connection dropped never got an answer;
         // forget them so the images request again on this connection.
         const images = Object.fromEntries(Object.entries(get().images).filter(([, src]) => src));
-        set({ rooms, roomOrder: order, loaded: {}, activeRoomId: active, images });
+        set({ rooms, roomOrder: order, loaded: {}, hasMore: {}, loadingOlder: {}, activeRoomId: active, images });
         if (active) relay?.send({ type: "open_room", room_id: active });
         break;
       }
@@ -332,6 +340,24 @@ export const useChat = create<ChatState>((set, get) => {
           return {
             messages: { ...s.messages, [msg.room_id]: [...merged, ...newer] },
             loaded: { ...s.loaded, [msg.room_id]: true },
+            hasMore: { ...s.hasMore, [msg.room_id]: msg.has_more },
+          };
+        });
+        break;
+      case "older_messages":
+        set((s) => {
+          const current = s.messages[msg.room_id] ?? [];
+          // Keep only what's older than the current first message; skip ids already
+          // present (a duplicate answer to a retry, or a race with room_history).
+          const firstSeq = current.length ? current[0].seq : -1;
+          const ids = new Set(current.map((m) => m.id));
+          const add = msg.messages
+            .filter((m) => m.seq < firstSeq && !ids.has(m.id))
+            .map((m) => withAttachments(m));
+          return {
+            messages: add.length ? { ...s.messages, [msg.room_id]: [...add, ...current] } : s.messages,
+            hasMore: { ...s.hasMore, [msg.room_id]: msg.has_more },
+            loadingOlder: { ...s.loadingOlder, [msg.room_id]: false },
           };
         });
         break;
@@ -528,6 +554,8 @@ export const useChat = create<ChatState>((set, get) => {
     roomOrder: [],
     messages: {},
     loaded: {},
+    hasMore: {},
+    loadingOlder: {},
     unread: {},
     activeRoomId: null,
     roomClosed: false,
@@ -558,7 +586,7 @@ export const useChat = create<ChatState>((set, get) => {
       await get().refreshClient();
       const after = get().client!;
       if (!relay || before?.server_url !== after.server_url || !before?.display_name) {
-        set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null });
+        set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, hasMore: {}, loadingOlder: {}, activeRoomId: null });
         connect();
       } else if (before.display_name !== after.display_name) {
         relay.rename(after.display_name);
@@ -588,14 +616,14 @@ export const useChat = create<ChatState>((set, get) => {
       await get().refreshClient();
       // The relay refuses a user change on an open connection, so reconnect
       // fresh (the same reset saveIdentity does when the server URL changes).
-      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null, unread: {} });
+      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, hasMore: {}, loadingOlder: {}, activeRoomId: null, unread: {} });
       connect();
     },
 
     async unlink() {
       await backend.unlinkDevice();
       await get().refreshClient();
-      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, activeRoomId: null, unread: {} });
+      set({ rooms: {}, roomOrder: [], messages: {}, loaded: {}, hasMore: {}, loadingOlder: {}, activeRoomId: null, unread: {} });
       connect();
     },
 
@@ -640,6 +668,15 @@ export const useChat = create<ChatState>((set, get) => {
 
     stopAi(id) {
       void backend.stopGeneration(id);
+    },
+
+    loadOlder(roomId) {
+      const s = get();
+      const first = s.messages[roomId]?.[0];
+      // Nothing to anchor a request to, nothing older to get, or one already in flight.
+      if (s.loadingOlder[roomId] || !s.hasMore[roomId] || !first) return;
+      const ok = relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq });
+      if (ok) set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));
     },
 
     react(roomId, messageId, emoji, on) {

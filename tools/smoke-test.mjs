@@ -233,6 +233,39 @@ ok(finalA.attachments.length === 1 && finalA.attachments[0].attachment_id === at
 const finalB = hist.messages.find((m) => m.id === aiB);
 ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded just before a disconnect stays in history");
 
+// Older messages: a fresh room with 205 human messages pages its history.
+{
+  alice.send({ type: "create_room", request_id: "r3", name: "Deep history" });
+  const big = await alice.wait(type("room_joined"), "room_joined (deep history)");
+  const bigRoom = big.room;
+  for (let i = 1; i <= 205; i++) {
+    alice.send({ type: "send_message", room_id: bigRoom.id, id: uuid(), content: `m${i}`, ai_requested: false });
+  }
+  alice.send({ type: "open_room", room_id: bigRoom.id });
+  const hist = await alice.wait(type("room_history"), "room_history (paged)", 20000);
+  ok(hist.messages.length === 200 && hist.has_more === true, "room_history holds the newest 200 messages with has_more: true");
+  ok(hist.messages[hist.messages.length - 1].content === "m205", "the history page ends at the newest message");
+  const before = hist.messages[0].seq;
+  alice.send({ type: "load_older", room_id: bigRoom.id, before_seq: before });
+  const older = await alice.wait(type("older_messages"), "older_messages", 20000);
+  ok(older.messages.length === 5, "load_older returns the 5 messages before the page start");
+  ok(older.messages.map((m) => m.content).join(",") === "m1,m2,m3,m4,m5", "older messages are oldest first");
+  ok(older.messages.every((m) => m.seq < before), "every older message predates before_seq");
+  ok(older.has_more === false, "has_more: false once the history is exhausted");
+  // Asking past the very first message: an empty page with has_more: false.
+  alice.send({ type: "load_older", room_id: bigRoom.id, before_seq: older.messages[0].seq });
+  const empty = await alice.wait(type("older_messages"), "older_messages (empty page)");
+  ok(empty.messages.length === 0 && empty.has_more === false, "an empty page is a valid answer");
+  // A non-member is refused.
+  const mallory = new Client("Mallory");
+  await mallory.open();
+  await mallory.wait(type("welcome"), "welcome (non-member)");
+  mallory.send({ type: "load_older", room_id: bigRoom.id, before_seq: before });
+  await mallory.wait(type("error", (m) => /Not a member/.test(m.message)), "load_older refused for a non-member");
+  ok(true, "load_older from a non-member gets an error frame");
+  mallory.close();
+}
+
 alice.close();
 bob2.close();
 console.log("\nAll relay smoke tests passed.");

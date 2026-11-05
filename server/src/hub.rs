@@ -13,7 +13,10 @@ const MAX_ROOM_NAME: usize = 80;
 const MAX_CONTENT: usize = 200_000;
 const MAX_PROMPT: usize = 8_000;
 const MAX_ERROR: usize = 300;
-const HISTORY_LIMIT: i64 = 1000;
+/// Messages sent in one `room_history` when a room is opened.
+const HISTORY_PAGE: i64 = 200;
+/// Messages sent in one `older_messages` page answering `load_older`.
+const OLDER_PAGE: i64 = 100;
 const MAX_TOOL_CALLS: usize = 100;
 const MAX_ATTACHMENTS: usize = 8;
 /// Distinct emoji one message accepts across all members.
@@ -315,7 +318,13 @@ impl State {
                 // Read and send under the updates lock, so an edit, delete or reaction
                 // can't be overtaken by this older snapshot.
                 let _ordered = self.updates_lock.lock().await;
-                let mut messages = db::recent_messages(&self.db, &room_id, HISTORY_LIMIT).await?;
+                // One row past the page answers whether older messages exist. Both
+                // queries return oldest first, so the extra probe row is at the front.
+                let mut messages = db::recent_messages(&self.db, &room_id, HISTORY_PAGE + 1).await?;
+                let has_more = messages.len() > HISTORY_PAGE as usize;
+                if has_more {
+                    messages.remove(0);
+                }
                 {
                     // Late joiners get the partial text of in-flight streams.
                     let hub = self.hub();
@@ -327,7 +336,25 @@ impl State {
                         }
                     }
                 }
-                self.send(conn, ServerMsg::RoomHistory { room_id, messages });
+                self.send(conn, ServerMsg::RoomHistory { room_id, messages, has_more });
+            }
+
+            ClientMsg::LoadOlder { room_id, before_seq } => {
+                if !self.in_room(conn, &room_id) {
+                    self.send(conn, err(None, "Not a member of that room"));
+                    return Ok(());
+                }
+                // Like OpenRoom: read and send under the updates lock, so an edit,
+                // delete or reaction can't be overtaken by this older snapshot. The
+                // page isn't streamed, only the newest messages are.
+                let _ordered = self.updates_lock.lock().await;
+                let mut messages =
+                    db::messages_before(&self.db, &room_id, before_seq, OLDER_PAGE + 1).await?;
+                let has_more = messages.len() > OLDER_PAGE as usize;
+                if has_more {
+                    messages.remove(0);
+                }
+                self.send(conn, ServerMsg::OlderMessages { room_id, messages, has_more });
             }
 
             ClientMsg::SendMessage { room_id, id, content, ai_requested, reply_to } => {
