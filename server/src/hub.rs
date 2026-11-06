@@ -2,7 +2,9 @@
 
 use crate::db::{self, Db, NewMessage};
 use crate::db::AiResult;
-use crate::protocol::{Attachment, ClientMsg, Device, Member, RoomInfo, ServerMsg, SharedProfile, ToolActivity};
+use crate::protocol::{
+    Attachment, ClientMsg, Device, Member, RoomInfo, ServerMsg, SharedMcpServer, SharedProfile, ToolActivity,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -28,6 +30,12 @@ const MAX_SEARCH_QUERY: usize = 200;
 const MAX_TOOL_CALLS: usize = 100;
 /// Profiles one connection may share with the user's other devices.
 const MAX_SHARED_PROFILES: usize = 50;
+/// MCP servers one connection may share with the user's other devices.
+const MAX_SHARED_SERVERS: usize = 50;
+/// Per-room modes kept for one shared MCP server.
+const MAX_SERVER_ROOM_MODES: usize = 500;
+/// Largest `device_command` forwarded, as JSON (tool arguments are the big part).
+const MAX_DEVICE_COMMAND: usize = 64 * 1024;
 const MAX_ATTACHMENTS: usize = 8;
 /// Distinct emoji one message accepts across all members.
 const MAX_REACTION_EMOJI: usize = 20;
@@ -49,6 +57,10 @@ const TYPING_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 pub type ConnId = u64;
 
+fn is_mcp_mode(mode: &str) -> bool {
+    matches!(mode, "off" | "ask" | "auto")
+}
+
 struct Conn {
     user_id: Option<String>,
     /// Set when `welcome` was sent: before that, room notifications would arrive ahead of
@@ -60,6 +72,10 @@ struct Conn {
     platform: String,
     /// Profiles this connection shared for the user's other devices to generate with.
     shared_profiles: Vec<SharedProfile>,
+    /// MCP servers this connection shared, while `remote_control` is on.
+    shared_servers: Vec<SharedMcpServer>,
+    /// True when this connection accepts `device_command`s from the user's devices.
+    remote_control: bool,
     failed_redeems: u32,
     /// When this connection last had a `typing: true` accepted (server-side throttle).
     last_typing: Option<Instant>,
@@ -137,6 +153,8 @@ impl Hub {
                 device_name: c.device_name.clone(),
                 platform: c.platform.clone(),
                 profiles: c.shared_profiles.clone(),
+                mcp_servers: c.shared_servers.clone(),
+                remote_control: c.remote_control,
             })
             .collect();
         devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
@@ -164,6 +182,17 @@ impl Hub {
                 c.user_id.as_deref() == Some(user_id)
                     && c.device_id == device_id
                     && c.rooms.contains(room_id)
+            })
+            .map(|(id, _)| *id)
+            .max()
+    }
+
+    /// The newest connection of `user_id`'s device `device_id`, other than `except`.
+    fn device_conn(&self, user_id: &str, device_id: &str, except: ConnId) -> Option<ConnId> {
+        self.conns
+            .iter()
+            .filter(|(id, c)| {
+                **id != except && c.user_id.as_deref() == Some(user_id) && c.device_id == device_id
             })
             .map(|(id, _)| *id)
             .max()
@@ -216,6 +245,8 @@ impl State {
                 device_name: String::new(),
                 platform: String::new(),
                 shared_profiles: Vec::new(),
+                shared_servers: Vec::new(),
+                remote_control: false,
                 failed_redeems: 0,
                 last_typing: None,
                 typing_rooms: HashSet::new(),
@@ -861,7 +892,7 @@ impl State {
                 self.broadcast(&room_id, ServerMsg::MessageUpdated { room_id: room_id.clone(), message });
             }
 
-            ClientMsg::ShareProfiles { profiles } => {
+            ClientMsg::ShareProfiles { profiles, mcp_servers, remote_control } => {
                 if let Some(c) = self.hub().conns.get_mut(&conn) {
                     let mut shared: Vec<SharedProfile> = profiles
                         .into_iter()
@@ -870,6 +901,7 @@ impl State {
                             id: clip(&p.id, 100),
                             label: clip(&p.label, MAX_NAME),
                             model: clip(&p.model, 120),
+                            enabled: p.enabled,
                         })
                         .filter(|p| !p.id.is_empty() && !p.label.is_empty())
                         .collect();
@@ -878,6 +910,27 @@ impl State {
                     shared.retain(|p| seen.insert(p.id.clone()));
                     shared.truncate(MAX_SHARED_PROFILES);
                     c.shared_profiles = shared;
+                    let mut seen = HashSet::new();
+                    // Without remote control nothing about the servers is shared.
+                    c.shared_servers = mcp_servers
+                        .into_iter()
+                        .filter(|_| remote_control)
+                        .map(|s| SharedMcpServer {
+                            id: clip(&s.id, 100),
+                            name: clip(&s.name, MAX_NAME),
+                            default_mode: s.default_mode,
+                            room_modes: s
+                                .room_modes
+                                .into_iter()
+                                .filter(|(room, mode)| room.len() <= 100 && is_mcp_mode(mode))
+                                .take(MAX_SERVER_ROOM_MODES)
+                                .collect(),
+                        })
+                        .filter(|s| !s.id.is_empty() && !s.name.is_empty() && is_mcp_mode(&s.default_mode))
+                        .filter(|s| seen.insert(s.id.clone()))
+                        .take(MAX_SHARED_SERVERS)
+                        .collect();
+                    c.remote_control = remote_control;
                 }
                 // The user's devices changed what they can pick from.
                 let hub = self.hub();
@@ -929,6 +982,45 @@ impl State {
                 let msg = err(Some(request_id), clip(&message, MAX_ERROR));
                 // Back to the asking device's connections only, and only within
                 // this user — another user's device ids can't be reached.
+                for id in hub
+                    .conns
+                    .iter()
+                    .filter(|(_, c)| {
+                        c.user_id.as_deref() == Some(user_id.as_str()) && c.device_id == to_device_id
+                    })
+                    .map(|(id, _)| *id)
+                {
+                    hub.send(id, &msg);
+                }
+            }
+
+            ClientMsg::DeviceCommand { request_id, device_id, command } => {
+                let size = serde_json::to_string(&command).map_or(usize::MAX, |t| t.len());
+                if size > MAX_DEVICE_COMMAND {
+                    self.send(conn, err(Some(request_id), "That's too large to send to the other device"));
+                    return Ok(());
+                }
+                // Pick the target and forward under one hub lock, like `request_ai`:
+                // only another online connection of this same user's device counts.
+                let hub = self.hub();
+                let target = hub.device_conn(&user_id, &device_id, conn);
+                let from_device_id = hub.conns.get(&conn).map(|c| c.device_id.clone()).unwrap_or_default();
+                // Ephemeral: forwarded, never stored.
+                let delivered = target.is_some_and(|t| {
+                    hub.send(t, &ServerMsg::DeviceCommand { request_id: request_id.clone(), from_device_id, command })
+                });
+                if !delivered {
+                    hub.send(conn, &err(Some(request_id), "That device is offline"));
+                }
+            }
+
+            ClientMsg::DeviceReply { request_id, to_device_id, error } => {
+                let hub = self.hub();
+                let msg = match error {
+                    Some(e) => err(Some(request_id), clip(&e, MAX_ERROR)),
+                    None => ServerMsg::DeviceReply { request_id },
+                };
+                // Back to the asking device's connections only, within this user.
                 for id in hub
                     .conns
                     .iter()

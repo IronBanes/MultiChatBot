@@ -30,6 +30,10 @@ export const backend = {
   saveProfile: (profile: Profile, apiKey?: string) =>
     invoke<ProfileView>("save_profile", { profile, apiKey: apiKey ?? null }),
   deleteProfile: (id: string) => invoke<void>("delete_profile", { id }),
+  /** `remote`: asked by another device, so refused unless remote control is on. */
+  setProfileEnabled: (id: string, enabled: boolean, remote = false) => invoke<void>("set_profile_enabled", { id, enabled, remote }),
+  /** Whether this user's other devices may control this one. */
+  setRemoteControl: (enabled: boolean) => invoke<void>("set_remote_control", { enabled }),
   setLastProfile: (roomId: string, profileId: string) =>
     invoke<void>("set_last_profile", { roomId, profileId }),
   testProfile: (profile: Profile, apiKey?: string) =>
@@ -43,16 +47,16 @@ export const backend = {
   deleteMcpServer: (id: string) => invoke<void>("delete_mcp_server", { id }),
   testMcpServer: (server: McpServer, secrets?: SecretEdit[]) =>
     invoke<McpToolInfo[]>("test_mcp_server", { server, secrets: secrets ?? null }),
-  setRoomMcpMode: (roomId: string, serverId: string, mode: McpMode) =>
-    invoke<void>("set_room_mcp_mode", { roomId, serverId, mode }),
+  setRoomMcpMode: (roomId: string, serverId: string, mode: McpMode, remote = false) =>
+    invoke<void>("set_room_mcp_mode", { roomId, serverId, mode, remote }),
   /** Picks which messages in a room earn a system notification. */
   setRoomNotify: (roomId: string, mode: NotifyMode) =>
     invoke<void>("set_room_notify", { roomId, mode }),
   /** Drops a left room's notification choice. */
   forgetRoomNotify: (roomId: string) =>
     invoke<void>("forget_room_notify", { roomId }),
-  resolveToolCall: (id: string, callId: string, approved: boolean) =>
-    invoke<void>("resolve_tool_call", { id, callId, approved }),
+  resolveToolCall: (id: string, callId: string, approved: boolean, remote = false) =>
+    invoke<void>("resolve_tool_call", { id, callId, approved, remote }),
 
   generate: (
     id: string,
@@ -60,8 +64,8 @@ export const backend = {
     roomId: string,
     history: HistoryItem[],
     roomPrompt: string,
-    /** For another of this user's devices: no MCP tools (nobody here to approve, and
-     *  the relay can't yet prove who asked). */
+    /** For another of this user's devices: MCP tools only with remote control on, and
+     *  every call is approved first, even on an Auto server. */
     delegated: boolean,
     onEvent: (e: GenEvent) => void,
   ) => {

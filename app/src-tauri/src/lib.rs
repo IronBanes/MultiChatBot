@@ -107,6 +107,7 @@ struct ClientState {
     mcp_servers: Vec<McpServerView>,
     mcp_modes_by_room: HashMap<String, HashMap<String, McpMode>>,
     notify_by_room: HashMap<String, NotifyMode>,
+    remote_control: bool,
 }
 
 /// "desktop", "ios" or "android" — lets the UI adapt (mobile hides stdio MCP servers).
@@ -156,6 +157,7 @@ fn get_state(state: State<'_, AppState>) -> Result<ClientState, String> {
         mcp_servers: cfg.mcp_servers.into_iter().map(mcp_view).collect(),
         mcp_modes_by_room: cfg.mcp_modes_by_room,
         notify_by_room: cfg.notify_by_room,
+        remote_control: cfg.remote_control,
     })
 }
 
@@ -376,6 +378,28 @@ fn set_last_profile(state: State<'_, AppState>, room_id: String, profile_id: Str
     state.update(|c| {
         c.last_profile_by_room.insert(room_id, profile_id);
     })
+}
+
+/// Turns a profile on or off, without touching its settings or key. `remote` marks a
+/// command from another device, checked under the settings lock like the other two.
+#[tauri::command]
+fn set_profile_enabled(state: State<'_, AppState>, id: String, enabled: bool, remote: Option<bool>) -> Result<(), String> {
+    state.update(|c| {
+        c.allow_remote(remote.unwrap_or(false))?;
+        match c.profiles.iter_mut().find(|p| p.id == id) {
+            Some(p) => {
+                p.enabled = enabled;
+                Ok(())
+            }
+            None => Err("Profile not found".to_string()),
+        }
+    })?
+}
+
+/// Whether this user's other devices may control this one (see `Config::remote_control`).
+#[tauri::command]
+fn set_remote_control(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    state.update(|c| c.remote_control = enabled)
 }
 
 /// Sends a tiny request with the (possibly unsaved) profile and reports the outcome.
@@ -619,10 +643,12 @@ async fn test_mcp_server(
 }
 
 #[tauri::command]
-fn set_room_mcp_mode(state: State<'_, AppState>, room_id: String, server_id: String, mode: McpMode) -> Result<(), String> {
+fn set_room_mcp_mode(state: State<'_, AppState>, room_id: String, server_id: String, mode: McpMode, remote: Option<bool>) -> Result<(), String> {
     state.update(|c| {
+        c.allow_remote(remote.unwrap_or(false))?;
         c.mcp_modes_by_room.entry(room_id).or_default().insert(server_id, mode);
-    })
+        Ok(())
+    })?
 }
 
 /// Picks which messages in `room_id` earn a system notification. `Mentions` (the
@@ -649,7 +675,10 @@ fn forget_room_notify(state: State<'_, AppState>, room_id: String) -> Result<(),
 }
 
 #[tauri::command]
-fn resolve_tool_call(state: State<'_, AppState>, id: String, call_id: String, approved: bool) -> Result<(), String> {
+fn resolve_tool_call(state: State<'_, AppState>, id: String, call_id: String, approved: bool, remote: Option<bool>) -> Result<(), String> {
+    // Held until answered, so turning remote control off can't land in between.
+    let cfg = state.config.lock().map_err(|_| "config lock poisoned")?;
+    cfg.allow_remote(remote.unwrap_or(false))?;
     let tx = state.approvals.lock().map_err(|_| "lock poisoned")?.remove(&format!("{id}:{call_id}"));
     match tx {
         Some(tx) => {
@@ -677,11 +706,11 @@ fn generate(
     on_event: Channel<GenEvent>,
 ) -> Result<(), String> {
     let cfg = state.snapshot()?;
-    // A reply generated for another of this user's devices gets no MCP tools:
-    // nobody is at this computer to approve them, and the relay can't yet prove
-    // that the request really came from the user's own device.
     let delegated = delegated.unwrap_or(false);
     let profile = state.profile(&profile_id)?;
+    if !profile.enabled {
+        return Err(format!("{} is turned off", profile.label));
+    }
     check_not_blocked(&state, &profile)?;
     {
         // Same as resolve_key: pairing takes turns with saves.
@@ -697,7 +726,8 @@ fn generate(
     if prompt.trimmed > 0 {
         eprintln!("[context] dropped {} oldest message(s) to fit {} tokens", prompt.trimmed, profile.max_context_tokens);
     }
-    let servers = if delegated { Vec::new() } else { cfg.active_mcp(&room_id) }
+    let servers = cfg
+        .mcp_for_reply(&room_id, delegated)
         .into_iter()
         .map(|(s, m)| {
             let sec = mcp_secrets_for(&s);
@@ -830,6 +860,8 @@ pub fn run() {
             save_profile,
             delete_profile,
             set_last_profile,
+            set_profile_enabled,
+            set_remote_control,
             test_profile,
             list_models,
             save_mcp_server,

@@ -1,8 +1,8 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
-import { mentions, remoteProfileId } from "../store";
-import type { Attachment, McpMode, Member, Message, NotifyMode, RoomInfo, SearchHit, ToolActivity } from "../lib/types";
+import { mentions, parseRemoteProfileId, remoteMode, remoteProfileId } from "../store";
+import type { Attachment, Device, McpMode, Member, Message, NotifyMode, RoomInfo, SearchHit, ToolActivity } from "../lib/types";
 import { useChat, type LocalTool } from "../store";
 import { confirmAction } from "./Confirm";
 import { Markdown } from "./Markdown";
@@ -92,10 +92,10 @@ function ToolCall({
           <p className="mb-1 text-zinc-600 dark:text-zinc-400">The AI wants to run this tool on your computer with:</p>
           <pre className="max-h-48 overflow-auto rounded-md bg-zinc-100 p-2 font-mono text-[11px] dark:bg-zinc-950">{local!.args || "{}"}</pre>
           <div className="mt-2 flex gap-2">
-            <Button className="!px-3 !py-1 text-xs" onClick={() => onAnswer(true)}>
+            <Button className="!px-4 !py-2 text-xs sm:!px-3 sm:!py-1" onClick={() => onAnswer(true)}>
               Allow
             </Button>
-            <Button variant="outline" className="!px-3 !py-1 text-xs" onClick={() => onAnswer(false)}>
+            <Button variant="outline" className="!px-4 !py-2 text-xs sm:!px-3 sm:!py-1" onClick={() => onAnswer(false)}>
               Deny
             </Button>
           </div>
@@ -490,6 +490,7 @@ const MessageItem = memo(function MessageItem({
   const answerToolCall = useChat((s) => s.answerToolCall);
   const generating = useChat((s) => !!s.myGenerations[m.id]);
   const localTools = useChat((s) => s.localTools[m.id]);
+  const remoteTools = useChat((s) => s.remoteTools[m.id]);
   const [copied, setCopied] = useState(false);
   const [sheet, setSheet] = useState(false);
   const longPress = useLongPress(() => setSheet(true));
@@ -640,7 +641,12 @@ const MessageItem = memo(function MessageItem({
             <ToolCall
               key={t.call_id}
               t={t}
-              local={mine ? localTools?.[t.call_id] : undefined}
+              local={
+                mine
+                  ? (localTools?.[t.call_id] ??
+                    (remoteTools?.[t.call_id] ? { status: t.status, args: remoteTools[t.call_id].args, detail: null } : undefined))
+                  : undefined
+              }
               onAnswer={(ok) => answerToolCall(m.id, t.call_id, ok)}
             />
           ))}
@@ -1111,11 +1117,11 @@ function useProfileChoices() {
   const myDeviceId = useChat((s) => s.client!.device_id);
   return useMemo(
     () => [
-      ...profiles.map((p) => ({ id: p.id, label: p.label, model: p.model, detail: p.model, remote: false, device: "" })),
+      ...profiles.filter((p) => p.enabled).map((p) => ({ id: p.id, label: p.label, model: p.model, detail: p.model, remote: false, device: "" })),
       ...devices
         .filter((d) => d.device_id !== myDeviceId)
         .flatMap((d) =>
-          d.profiles.map((p) => ({
+          d.profiles.filter((p) => p.enabled).map((p) => ({
             id: remoteProfileId(d.device_id, p.id),
             label: p.label,
             model: p.model,
@@ -1244,6 +1250,57 @@ function TypingIndicator({ roomId, phone }: { roomId: string; phone: boolean }) 
   );
 }
 
+/** Local profiles that can answer right now. */
+function useEnabledProfiles() {
+  const profiles = useChat((s) => s.client!.profiles);
+  return useMemo(() => profiles.filter((p) => p.enabled), [profiles]);
+}
+
+/** Whose tools a reply with `profileId` uses: this device's, or those of the online
+ *  device the picked profile lives on. */
+function useToolHost(profileId: string | null) {
+  const devices = useChat((s) => s.devices);
+  const picked = profileId ? parseRemoteProfileId(profileId) : null;
+  return { remote: !!picked, device: picked ? (devices.find((d) => d.device_id === picked.deviceId) ?? null) : null };
+}
+
+const REMOTE_MODE_OPTIONS = MODE_OPTIONS.filter((o) => o.value !== "auto");
+
+/** The Off / Ask switch for each MCP server on another of this user's devices. */
+function RemoteToolsList({ room, device }: { room: RoomInfo; device: Device | null }) {
+  const setRemoteMcpMode = useChat((s) => s.setRemoteMcpMode);
+  if (!device?.remote_control) {
+    return (
+      <p className="py-2 text-sm text-zinc-500">
+        Replies from {device?.device_name ?? "that device"} run without tools. To use them, turn on remote control there in Settings &gt; General.
+      </p>
+    );
+  }
+  if (device.mcp_servers.length === 0) return <p className="py-2 text-sm text-zinc-500">{device.device_name} has no MCP servers.</p>;
+  return (
+    <div className="space-y-2">
+      {device.mcp_servers.map((s) => {
+        const mode = remoteMode(s, room.id);
+        return (
+          <div key={s.id} className="flex items-center justify-between gap-2">
+            <span className="min-w-0 truncate text-sm" title={s.name}>
+              {s.name}
+            </span>
+            <Segmented
+              size="sm"
+              value={mode}
+              onChange={(next) => {
+                if (next !== mode) setRemoteMcpMode(device.device_id, room.id, s.id, next);
+              }}
+              options={REMOTE_MODE_OPTIONS}
+            />
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /** The Off / Ask / Auto switch for each MCP server, in this room. */
 function ToolsList({ room }: { room: RoomInfo }) {
   const servers = useChat((s) => s.client!.mcp_servers);
@@ -1265,7 +1322,10 @@ function ToolsList({ room }: { room: RoomInfo }) {
 }
 
 /** Per-chat MCP switches: Off / Ask / Auto for each server the user added. */
-function ToolsMenu({ room, onOpenSettings, remote }: { room: RoomInfo; onOpenSettings: (tab: SettingsTab) => void; remote: boolean }) {
+function ToolsMenu({ room, onOpenSettings, profileId }: { room: RoomInfo; onOpenSettings: (tab: SettingsTab) => void; profileId: string | null }) {
+  const { remote, device } = useToolHost(profileId);
+  // Tools on the other device need its permission; there's nothing to switch without it.
+  const blocked = remote && !device?.remote_control;
   const servers = useChat((s) => s.client!.mcp_servers);
   const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
   const [open, setOpen] = useState(false);
@@ -1286,44 +1346,55 @@ function ToolsMenu({ room, onOpenSettings, remote }: { room: RoomInfo; onOpenSet
   }, [open]);
 
   const modeOf = (id: string, fallback: McpMode): McpMode => modes?.[id] ?? fallback;
-  const active = servers.filter((s) => modeOf(s.id, s.default_mode) !== "off").length;
+  const active = remote
+    ? (device?.mcp_servers ?? []).filter((s) => remoteMode(s, room.id) !== "off").length
+    : servers.filter((s) => modeOf(s.id, s.default_mode) !== "off").length;
 
   return (
     <div ref={box} className="relative">
       <button
         onClick={() => setOpen((o) => !o)}
-        // Another device's profile replies without tools (see generate's `delegated`).
-        disabled={remote}
+        disabled={blocked}
         className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium transition disabled:opacity-40 ${
-          active && !remote
+          active && !blocked
             ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300"
             : "border-zinc-300 text-zinc-500 dark:border-zinc-700"
         }`}
-        title={remote ? "Replies from another device's profile run without tools" : "MCP tools for this chat"}
+        title={blocked ? "Turn on remote control on that device to use its tools" : "MCP tools for this chat"}
       >
         <Icon name="wrench" size={13} />
         <span className="hidden min-[480px]:inline">Tools</span>
-        {active > 0 && !remote && <span className="rounded-full bg-indigo-600 px-1.5 text-[10px] text-white">{active}</span>}
+        {active > 0 && !blocked && <span className="rounded-full bg-indigo-600 px-1.5 text-[10px] text-white">{active}</span>}
       </button>
-      {open && !remote && (
+      {open && !blocked && (
         <div className="fixed inset-x-3 bottom-24 z-30 rounded-xl sm:absolute sm:inset-x-auto sm:bottom-full sm:left-0 sm:mb-2 sm:w-80 border border-zinc-200 bg-white p-3 shadow-2xl dark:border-zinc-700 dark:bg-zinc-900">
           <div className="mb-2 flex items-center justify-between">
             <span className="text-sm font-semibold">Tools in #{room.name}</span>
-            <span className="text-[11px] text-zinc-500">for your replies</span>
+            <span className="text-[11px] text-zinc-500">{remote ? `on ${device?.device_name}` : "for your replies"}</span>
           </div>
-          <ToolsList room={room} />
+          {remote ? <RemoteToolsList room={room} device={device} /> : <ToolsList room={room} />}
           <p className="mt-3 text-[11px] leading-snug text-zinc-500">
-            <b>Ask</b> shows you each tool call to approve. <b>Auto</b> runs them without asking. Others in the room only see which tool ran.
+            {remote ? (
+              <>
+                <b>Ask</b> shows you each tool call to approve here. Others in the room only see which tool ran.
+              </>
+            ) : (
+              <>
+                <b>Ask</b> shows you each tool call to approve. <b>Auto</b> runs them without asking. Others in the room only see which tool ran.
+              </>
+            )}
           </p>
-          <button
-            onClick={() => {
-              setOpen(false);
-              onOpenSettings("mcp");
-            }}
-            className="mt-2 text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
-          >
-            Manage MCP servers…
-          </button>
+          {!remote && (
+            <button
+              onClick={() => {
+                setOpen(false);
+                onOpenSettings("mcp");
+              }}
+              className="mt-2 text-xs font-medium text-indigo-600 hover:underline dark:text-indigo-400"
+            >
+              Manage MCP servers…
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -1346,7 +1417,8 @@ function ComposerSheet({
   onOpenSettings: (tab: SettingsTab) => void;
   onClose: () => void;
 }) {
-  const profiles = useChat((s) => s.client!.profiles);
+  const profiles = useEnabledProfiles();
+  const { remote, device } = useToolHost(profileId);
   const chooseProfile = useChat((s) => s.chooseProfile);
   const settings = (tab: SettingsTab) => {
     onClose();
@@ -1416,14 +1488,13 @@ function ComposerSheet({
         )}
         <div className="mt-4 mb-1 flex items-baseline justify-between">
           <span className="text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Tools in #{room.name}</span>
-          <button onClick={() => settings("mcp")} className="text-xs font-medium text-indigo-600 dark:text-indigo-400">
-            Manage
-          </button>
+          {!remote && (
+            <button onClick={() => settings("mcp")} className="text-xs font-medium text-indigo-600 dark:text-indigo-400">
+              Manage
+            </button>
+          )}
         </div>
-        {profileId?.startsWith("remote:") && (
-          <p className="mb-1 text-xs text-zinc-500">Replies from another device's profile run without tools.</p>
-        )}
-        <ToolsList room={room} />
+        {remote ? <RemoteToolsList room={room} device={device} /> : <ToolsList room={room} />}
         <Button variant="outline" className="mt-5 w-full !py-3" onClick={onClose}>
           Done
         </Button>
@@ -1454,7 +1525,8 @@ function Composer({
   onClearEditing: () => void;
   onClearReply: () => void;
 }) {
-  const profiles = useChat((s) => s.client!.profiles);
+  const profiles = useEnabledProfiles();
+  const toolHost = useToolHost(profileId);
   const platform = useChat((s) => s.client!.platform);
   const status = useChat((s) => s.status);
   const sendMessage = useChat((s) => s.sendMessage);
@@ -1764,7 +1836,9 @@ ${before}` : t);
     const local = profiles.find((p) => p.id === profileId);
     const remote = shared.find((p) => p.id === profileId);
     const pickedLabel = local?.label ?? (remote ? `${remote.label} · on ${remote.device}` : "");
-    const toolsOn = servers.filter((s) => (modes?.[s.id] ?? s.default_mode) !== "off").length;
+    const toolsOn = toolHost.remote
+      ? (toolHost.device?.mcp_servers ?? []).filter((s) => remoteMode(s, room.id) !== "off").length
+      : servers.filter((s) => (modes?.[s.id] ?? s.default_mode) !== "off").length;
     return (
       <div className="safe-bottom border-t border-zinc-200 px-2 pt-1.5 pb-[max(0.5rem,env(safe-area-inset-bottom))] dark:border-zinc-800">
         {contextBar}
@@ -1776,7 +1850,7 @@ ${before}` : t);
           <Icon name="sparkle" size={13} className={ai ? "text-indigo-600 dark:text-indigo-400" : ""} />
           <span className="truncate">
             {!anyProfile ? "Add an AI profile to get replies" : ai ? `AI reply · ${pickedLabel}` : "AI reply off"}
-            {toolsOn > 0 && !remote && ` · ${toolsOn} tool${toolsOn === 1 ? "" : "s"}`}
+            {toolsOn > 0 && ` · ${toolsOn} tool${toolsOn === 1 ? "" : "s"}`}
           </span>
           <Icon name="chevron" size={12} className="shrink-0 -rotate-90" />
         </button>
@@ -1893,7 +1967,7 @@ ${before}` : t);
               Add an AI profile
             </button>
           )}
-          <ToolsMenu room={room} onOpenSettings={onOpenSettings} remote={!!profileId?.startsWith("remote:")} />
+          <ToolsMenu room={room} onOpenSettings={onOpenSettings} profileId={profileId} />
           <div className="flex-1" />
           {platform === "desktop" && (
             <span className="hidden text-[11px] text-zinc-400 lg:inline">Shift+Enter for newline</span>
@@ -2241,13 +2315,14 @@ export function RoomView({
   // A remembered remote id stays chosen while that device is online with that
   // profile; otherwise fall back to the first local profile, then the first
   // shared one.
-  const profileId = client.profiles.some((p) => p.id === remembered)
+  const firstOn = client.profiles.find((p) => p.enabled);
+  const profileId = client.profiles.some((p) => p.id === remembered && p.enabled)
     ? remembered
     : sharedProfiles.some((p) => p.id === remembered)
       ? remembered
       : // Never fall back to another device's profile: that would send the room's
         // history to a provider nobody picked. It's only used when chosen.
-        (client.profiles[0]?.id ?? null);
+        (firstOn?.id ?? null);
   const online = room.members.filter((m) => m.online).length;
 
   const copyCode = async () => {

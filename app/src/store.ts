@@ -10,6 +10,7 @@ import type {
   Attachment,
   ClientState,
   Device,
+  DeviceCommand,
   HistoryItem,
   McpMode,
   Message,
@@ -17,6 +18,7 @@ import type {
   RoomInfo,
   SearchHit,
   ServerMsg,
+  SharedMcpServer,
   SharedProfile,
   ToolStatus,
 } from "./lib/types";
@@ -26,6 +28,12 @@ export interface LocalTool {
   status: ToolStatus;
   args: string | null;
   detail: string | null;
+}
+
+/** A tool call of a reply another of this user's devices generates for this one. */
+export interface RemoteTool {
+  deviceId: string;
+  args: string;
 }
 
 export interface Toast {
@@ -60,6 +68,8 @@ interface ChatState {
   myGenerations: Record<string, true>;
   /** AI message id → call id → details, for replies this client generates. */
   localTools: Record<string, Record<string, LocalTool>>;
+  /** AI message id → call id → approvals waiting here for a reply another device generates. */
+  remoteTools: Record<string, Record<string, RemoteTool>>;
   /** attachment id → data URL ("" while loading). */
   images: Record<string, string>;
   /** Room id → user id → who is typing and when that expires (never persisted). */
@@ -109,6 +119,14 @@ interface ChatState {
   setRoomPrompt(roomId: string, prompt: string): void;
   chooseProfile(roomId: string, profileId: string): void;
   setRoomMcpMode(roomId: string, serverId: string, mode: McpMode): void;
+  /** Settings: turns one of this device's profiles on or off. */
+  setProfileEnabled(id: string, enabled: boolean): Promise<void>;
+  /** Settings: whether this user's other devices may control this one. */
+  setRemoteControl(enabled: boolean): Promise<void>;
+  /** Switches an MCP server on another of this user's devices, in one room. */
+  setRemoteMcpMode(deviceId: string, roomId: string, serverId: string, mode: McpMode): void;
+  /** Turns a profile on another of this user's devices on or off. */
+  setRemoteProfileEnabled(deviceId: string, profileId: string, enabled: boolean): void;
   /** Picks which messages in a room earn a system notification. */
   setRoomNotify(roomId: string, mode: NotifyMode): void;
   /** Settings → General: asks for the OS permission if needed, then shows a sample. */
@@ -140,6 +158,12 @@ export function remoteProfileId(deviceId: string, profileId: string): string {
   return `remote:${deviceId}:${profileId}`;
 }
 
+/** What a remote server does for replies in `roomId`. Auto counts as Ask: a delegated
+ *  reply asks before every tool call whatever the server's mode. */
+export function remoteMode(s: SharedMcpServer, roomId: string): McpMode {
+  return (s.room_modes[roomId] ?? s.default_mode) === "off" ? "off" : "ask";
+}
+
 export function parseRemoteProfileId(id: string): { deviceId: string; profileId: string } | null {
   if (!id.startsWith("remote:")) return null;
   const rest = id.slice("remote:".length);
@@ -151,9 +175,14 @@ export function parseRemoteProfileId(id: string): { deviceId: string; profileId:
 /** An `ai_requested` waiting for the room's history to load here, so the anchor
  *  can be found and the reply generated: room → pending requests. */
 const pendingDelegatedOpens = new Map<string, { requestId: string; anchorId: string; anchorSeq: number; profileId: string; fromDeviceId: string }[]>();
-/** Generation ids this client is generating for another of this user's devices.
- *  These run without MCP tools (see `backend.generate`'s `delegated`). */
-const delegatedGenerations = new Set<string>();
+/** Generation id → the device of this user it's generating for. Only that device can
+ *  answer the reply's tool calls remotely; a reply started here is never reachable. */
+const delegatedGenerations = new Map<string, string>();
+/** "<message id>:<call id>" → the approval a delegated reply is waiting on, kept so
+ *  it can be sent again if the asking device was away (phones drop off often). */
+const pendingApprovals = new Map<string, { deviceId: string; command: DeviceCommand }>();
+/** Tool arguments sent for approval: enough to judge, and well inside the relay's limit. */
+const MAX_APPROVAL_ARGS = 16_000;
 /** The profile list last shared on the current connection (null: none yet). */
 let lastSharedProfiles: string | null = null;
 /** Images announced for a reply this client hasn't loaded yet (e.g. while joining). */
@@ -391,12 +420,97 @@ export const useChat = create<ChatState>((set, get) => {
   function shareMyProfiles() {
     const client = get().client;
     if (!relay || client?.platform !== "desktop") return;
-    const profiles: SharedProfile[] = (client.profiles ?? []).map((p) => ({ id: p.id, label: p.label, model: p.model }));
-    // Only when the list changed on this connection: every share makes the relay
+    const profiles: SharedProfile[] = (client.profiles ?? []).map((p) => ({ id: p.id, label: p.label, model: p.model, enabled: p.enabled }));
+    const remote_control = client.remote_control;
+    // Nothing about the servers leaves this device until the user allows remote control.
+    const mcp_servers: SharedMcpServer[] = remote_control
+      ? client.mcp_servers.map((s) => {
+          const room_modes: Record<string, McpMode> = {};
+          for (const [room, modes] of Object.entries(client.mcp_modes_by_room)) {
+            if (modes[s.id]) room_modes[room] = modes[s.id];
+          }
+          return { id: s.id, name: s.name, default_mode: s.default_mode, room_modes };
+        })
+      : [];
+    // Only when something changed on this connection: every share makes the relay
     // send `devices` again, so sharing in answer to that would never stop.
-    const key = JSON.stringify(profiles);
+    const key = JSON.stringify({ profiles, mcp_servers, remote_control });
     if (key === lastSharedProfiles) return;
-    if (relay.send({ type: "share_profiles", profiles })) lastSharedProfiles = key;
+    if (relay.send({ type: "share_profiles", profiles, mcp_servers, remote_control })) lastSharedProfiles = key;
+  }
+
+  /** Sends a command to another of this user's devices; settles on its answer. */
+  function deviceCommand(deviceId: string, command: DeviceCommand) {
+    return request<void>((request_id) => ({ type: "device_command", request_id, device_id: deviceId, command }));
+  }
+
+  /** Offers a waiting tool call to the device the reply is for. Best effort: the PC
+   *  shows the same prompt, and it's offered again on the next `devices` frame. */
+  function offerApproval(p: { deviceId: string; command: DeviceCommand }) {
+    deviceCommand(p.deviceId, p.command).catch(() => {});
+  }
+
+  /** Stops offering a reply's approvals: all of them, or just `callId`'s. */
+  function dropApprovals(id: string, callId?: string) {
+    const prefix = callId === undefined ? `${id}:` : `${id}:${callId}`;
+    for (const key of pendingApprovals.keys()) {
+      if (callId === undefined ? key.startsWith(prefix) : key === prefix) pendingApprovals.delete(key);
+    }
+  }
+
+  /** Runs a command from another of this user's devices and answers it. The relay
+   *  vouches for the account only, so what may happen here is decided here: nothing
+   *  without the user's remote-control setting, and never a switch to Auto. */
+  async function runDeviceCommand(requestId: string, from: string, command: DeviceCommand) {
+    const reply = (error: string | null) =>
+      relay?.send({ type: "device_reply", request_id: requestId, to_device_id: from, error });
+    const client = get().client;
+    if (command.kind === "tool_approval") {
+      const { room_id: roomId, message_id: messageId, call_id: callId, args, tool } = command;
+      // Rendered as text in the chat: anything else from the relay must not reach it.
+      if (typeof args !== "string") {
+        reply("Invalid tool approval");
+        return;
+      }
+      // Offers repeat until answered; only the first one is news.
+      const seen = !!get().remoteTools[messageId]?.[callId];
+      set((s) => ({
+        remoteTools: { ...s.remoteTools, [messageId]: { ...s.remoteTools[messageId], [callId]: { deviceId: from, args } } },
+      }));
+      reply(null);
+      // The app may be in the background while the reply runs.
+      const s = get();
+      if (!seen && s.rooms[roomId] && client?.notify_by_room[roomId] !== "off" && !roomOnScreen(s, roomId)) {
+        void notifyRoom(get, roomId, s.rooms[roomId].name, `The AI wants to use ${tool}`);
+      }
+      return;
+    }
+    // The backend checks again as it acts: this copy of the setting can be out of date.
+    if (!client?.remote_control) {
+      reply("Remote control is off on that device. Turn it on there in Settings > General.");
+      return;
+    }
+    try {
+      if (command.kind === "answer_tool") {
+        if (delegatedGenerations.get(command.message_id) !== from) throw new Error("That reply wasn't requested from this device");
+        await backend.resolveToolCall(command.message_id, command.call_id, command.approved, true);
+      } else if (command.kind === "set_mcp_mode") {
+        if (command.mode !== "off" && command.mode !== "ask") throw new Error("Auto can only be set on that device");
+        if (!get().rooms[command.room_id]) throw new Error("That device isn't in this room");
+        if (!client.mcp_servers.some((s) => s.id === command.server_id)) throw new Error("That MCP server is gone");
+        await backend.setRoomMcpMode(command.room_id, command.server_id, command.mode, true);
+        await get().refreshClient();
+      } else if (command.kind === "set_profile_enabled") {
+        await backend.setProfileEnabled(command.profile_id, command.enabled, true);
+        await get().refreshClient();
+      } else {
+        // The relay's frames aren't trusted to match these types.
+        throw new Error("This app doesn't know that command");
+      }
+      reply(null);
+    } catch (e) {
+      reply(errorText(e));
+    }
   }
 
   function connect() {
@@ -482,8 +596,13 @@ export const useChat = create<ChatState>((set, get) => {
       relay?.send({ type: "ai_request_failed", request_id: requestId, to_device_id: fromDeviceId, message });
     // Only a local profile id that still exists can answer; the relay already
     // guarantees the request came from one of this user's own devices.
-    if (!get().client?.profiles.some((p) => p.id === profileId)) {
+    const asked = get().client?.profiles.find((p) => p.id === profileId);
+    if (!asked) {
       fail("That AI profile isn't on this computer anymore");
+      return;
+    }
+    if (!asked.enabled) {
+      fail(`${asked.label} is turned off`);
       return;
     }
     // Left the room meanwhile: opening it would fail without telling the asking device.
@@ -528,7 +647,7 @@ export const useChat = create<ChatState>((set, get) => {
       anchor,
       profileId,
       (id) => {
-        delegatedGenerations.add(id);
+        delegatedGenerations.set(id, fromDeviceId);
         return () => delegatedGenerations.delete(id);
       },
       // The asking device hears about a failed reply directly, not only via the room.
@@ -573,6 +692,7 @@ export const useChat = create<ChatState>((set, get) => {
     };
     const finish = () => {
       stopDelegatedTracking?.();
+      dropApprovals(id);
       set((st) => {
         const { [id]: _, ...rest } = st.myGenerations;
         return { myGenerations: rest };
@@ -594,6 +714,22 @@ export const useChat = create<ChatState>((set, get) => {
             const local: LocalTool = { status: ev.status, args: ev.args ?? prev?.args ?? null, detail: ev.detail ?? prev?.detail ?? null };
             return { localTools: { ...st.localTools, [id]: { ...st.localTools[id], [ev.call_id]: local } } };
           });
+          // A reply for another device: the approval goes there too, with the arguments
+          // (to that device only, never the room). Either side may answer; first wins.
+          const askedBy = delegatedGenerations.get(id);
+          if (askedBy && ev.status === "awaiting_approval" && get().client?.remote_control) {
+            const raw = ev.args ?? "{}";
+            // Half an emoji at the cut would make the relay refuse the whole frame.
+            const args = raw.length > MAX_APPROVAL_ARGS ? `… [cut short: the full call is on the computer]\n${raw.slice(0, MAX_APPROVAL_ARGS).replace(/[\uD800-\uDBFF]$/, "")}` : raw;
+            const pending = {
+              deviceId: askedBy,
+              command: { kind: "tool_approval", room_id: roomId, message_id: id, call_id: ev.call_id, server: ev.server, tool: ev.tool, args } as const,
+            };
+            pendingApprovals.set(`${id}:${ev.call_id}`, pending);
+            offerApproval(pending);
+          } else if (askedBy) {
+            dropApprovals(id, ev.call_id);
+          }
         } else if (ev.event === "image") {
           const callId = ev.call_id;
           const { mime, data } = ev;
@@ -793,6 +929,15 @@ export const useChat = create<ChatState>((set, get) => {
         }
         break;
       }
+      case "device_command":
+        void runDeviceCommand(msg.request_id, msg.from_device_id, msg.command);
+        break;
+      case "device_reply": {
+        const pending = pendingRequests.get(msg.request_id);
+        pendingRequests.delete(msg.request_id);
+        pending?.resolve(undefined);
+        break;
+      }
       case "ai_requested":
         // Another of this user's devices asked this one to reply with its profile.
         runDelegatedAi(msg.request_id, msg.room_id, msg.anchor_id, msg.anchor_seq, msg.profile_id, msg.from_device_id);
@@ -827,6 +972,10 @@ export const useChat = create<ChatState>((set, get) => {
               return { ...m, tools };
             })!,
           },
+          // Answered or timed out: nothing is waiting on this device anymore.
+          ...(msg.activity.status !== "awaiting_approval" && s.remoteTools[msg.id]?.[msg.activity.call_id]
+            ? { remoteTools: { ...s.remoteTools, [msg.id]: withoutKey(s.remoteTools[msg.id], msg.activity.call_id) } }
+            : {}),
         }));
         break;
       case "ai_attachment":
@@ -863,6 +1012,7 @@ export const useChat = create<ChatState>((set, get) => {
                   : { ...m, content: msg.content, status: "interrupted" },
             )!,
           },
+          remoteTools: s.remoteTools[msg.id] ? withoutKey(s.remoteTools, msg.id) : s.remoteTools,
         }));
         // Their finished AI reply: notify like a human message, with its final text.
         if (msg.type === "ai_complete") {
@@ -952,10 +1102,23 @@ export const useChat = create<ChatState>((set, get) => {
         pending?.resolve({ user_id: msg.user_id, display_name: msg.display_name, secret: msg.secret });
         break;
       }
-      case "devices":
-        // An older relay may leave `profiles` out: treat that as sharing nothing.
-        set({ devices: msg.devices.map((d) => ({ ...d, profiles: d.profiles ?? [] })) });
+      case "devices": {
+        // An older relay leaves these out: that's sharing nothing, with profiles on.
+        set({
+          devices: msg.devices.map((d) => ({
+            ...d,
+            profiles: (d.profiles ?? []).map((p) => ({ ...p, enabled: p.enabled ?? true })),
+            mcp_servers: d.mcp_servers ?? [],
+            remote_control: !!d.remote_control,
+          })),
+        });
+        // Every sign-in sends this frame, so a device that came back hears what's waiting
+        // for it, even if its old connection hadn't dropped yet (it can't be seen leaving).
+        for (const p of pendingApprovals.values()) {
+          if (msg.devices.some((d) => d.device_id === p.deviceId)) offerApproval(p);
+        }
         break;
+      }
       case "error": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;
         if (pending && msg.request_id) {
@@ -989,6 +1152,7 @@ export const useChat = create<ChatState>((set, get) => {
     devices: [],
     myGenerations: {},
     localTools: {},
+    remoteTools: {},
     images: {},
     typing: {},
     jumpTarget: null,
@@ -1185,7 +1349,39 @@ export const useChat = create<ChatState>((set, get) => {
         const modes = { ...s.client.mcp_modes_by_room, [roomId]: { ...s.client.mcp_modes_by_room[roomId], [serverId]: mode } };
         return { client: { ...s.client, mcp_modes_by_room: modes } };
       });
+      // Linked devices show this device's modes.
+      shareMyProfiles();
       backend.setRoomMcpMode(roomId, serverId, mode).catch((e) => get().toast(errorText(e)));
+    },
+
+    async setProfileEnabled(id, enabled) {
+      try {
+        await backend.setProfileEnabled(id, enabled);
+        await get().refreshClient();
+      } catch (e) {
+        get().toast(errorText(e));
+      }
+    },
+
+    async setRemoteControl(enabled) {
+      try {
+        await backend.setRemoteControl(enabled);
+        // Not refreshed: a failed read would leave the old setting in place here.
+        set((s) => ({ client: s.client && { ...s.client, remote_control: enabled } }));
+        // Tool arguments stop going out now; the prompt stays on this computer.
+        if (!enabled) pendingApprovals.clear();
+        shareMyProfiles();
+      } catch (e) {
+        get().toast(errorText(e));
+      }
+    },
+
+    setRemoteMcpMode(deviceId, roomId, serverId, mode) {
+      deviceCommand(deviceId, { kind: "set_mcp_mode", room_id: roomId, server_id: serverId, mode }).catch((e) => get().toast(errorText(e)));
+    },
+
+    setRemoteProfileEnabled(deviceId, profileId, enabled) {
+      deviceCommand(deviceId, { kind: "set_profile_enabled", profile_id: profileId, enabled }).catch((e) => get().toast(errorText(e)));
     },
 
     setRoomNotify(roomId, mode) {
@@ -1209,7 +1405,11 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     answerToolCall(id, callId, approved) {
-      backend.resolveToolCall(id, callId, approved).catch((e) => get().toast(errorText(e)));
+      const remote = get().remoteTools[id]?.[callId];
+      const answer = remote
+        ? deviceCommand(remote.deviceId, { kind: "answer_tool", message_id: id, call_id: callId, approved })
+        : backend.resolveToolCall(id, callId, approved);
+      answer.catch((e) => get().toast(errorText(e)));
     },
 
     loadImage(attachmentId) {

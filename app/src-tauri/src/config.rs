@@ -33,6 +33,9 @@ pub struct Profile {
     /// "low" | "medium" | "high" | ... ; `None` leaves the provider default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Off profiles can't reply, here or for the user's other devices.
+    #[serde(default = "yes")]
+    pub enabled: bool,
 }
 
 fn yes() -> bool {
@@ -138,6 +141,11 @@ pub struct Config {
     /// Hosting resumes on the next launch.
     #[serde(default)]
     pub host_relay_port: Option<u16>,
+    /// Lets this user's other devices switch this device's MCP servers and profiles,
+    /// and gives replies generated for them tools (every call approved first). Off
+    /// until the user turns it on here: the commands arrive through the relay.
+    #[serde(default)]
+    pub remote_control: bool,
 }
 
 impl Config {
@@ -152,6 +160,27 @@ impl Config {
             })
             .filter(|(_, m)| *m != McpMode::Off)
             .collect()
+    }
+
+    /// The servers a reply in `room_id` may use. A reply generated for another of this
+    /// user's devices gets tools only with remote control on, and every call is approved
+    /// first even on an Auto server: nobody may be at this computer, and a request
+    /// arriving through the relay must not run anything unseen.
+    pub fn allow_remote(&self, remote: bool) -> Result<(), String> {
+        if remote && !self.remote_control {
+            return Err("Remote control is off on that device. Turn it on there in Settings > General.".into());
+        }
+        Ok(())
+    }
+
+    pub fn mcp_for_reply(&self, room_id: &str, delegated: bool) -> Vec<(McpServer, McpMode)> {
+        if !delegated {
+            return self.active_mcp(room_id);
+        }
+        if !self.remote_control {
+            return Vec::new();
+        }
+        self.active_mcp(room_id).into_iter().map(|(s, _)| (s, McpMode::Ask)).collect()
     }
 }
 
@@ -178,6 +207,7 @@ impl Default for Config {
             mcp_modes_by_room: HashMap::new(),
             notify_by_room: HashMap::new(),
             host_relay_port: None,
+            remote_control: false,
         }
     }
 }
@@ -234,4 +264,68 @@ pub fn save(path: &Path, cfg: &Config) -> std::io::Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec_pretty(cfg)?)?;
     std::fs::rename(tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(id: &str, default_mode: McpMode) -> McpServer {
+        McpServer {
+            id: id.into(),
+            name: id.into(),
+            transport: McpTransport::Http,
+            command: String::new(),
+            args: Vec::new(),
+            url: "https://example.com/mcp".into(),
+            default_mode,
+            share_images: false,
+            timeout_secs: 120,
+        }
+    }
+
+    fn config() -> Config {
+        let mut c = Config { mcp_servers: vec![server("auto", McpMode::Auto), server("off", McpMode::Off)], ..Config::default() };
+        c.mcp_modes_by_room.insert("room".into(), HashMap::from([("off".to_string(), McpMode::Ask)]));
+        c
+    }
+
+    fn modes(list: Vec<(McpServer, McpMode)>) -> Vec<(String, McpMode)> {
+        list.into_iter().map(|(s, m)| (s.id, m)).collect()
+    }
+
+    #[test]
+    fn a_reply_started_here_keeps_each_servers_mode() {
+        assert_eq!(modes(config().mcp_for_reply("room", false)), [("auto".to_string(), McpMode::Auto), ("off".to_string(), McpMode::Ask)]);
+    }
+
+    #[test]
+    fn a_delegated_reply_gets_no_tools_without_remote_control() {
+        assert!(config().mcp_for_reply("room", true).is_empty());
+    }
+
+    #[test]
+    fn a_delegated_reply_asks_for_every_call_even_on_auto() {
+        let c = Config { remote_control: true, ..config() };
+        assert_eq!(modes(c.mcp_for_reply("room", true)), [("auto".to_string(), McpMode::Ask), ("off".to_string(), McpMode::Ask)]);
+        // A server that's off stays off.
+        assert_eq!(modes(c.mcp_for_reply("other", true)), [("auto".to_string(), McpMode::Ask)]);
+    }
+
+    #[test]
+    fn only_commands_from_another_device_need_remote_control() {
+        let mut c = config();
+        assert!(c.allow_remote(false).is_ok());
+        assert!(c.allow_remote(true).is_err());
+        c.remote_control = true;
+        assert!(c.allow_remote(true).is_ok());
+    }
+
+    #[test]
+    fn configs_from_before_this_setting_stay_locked_and_profiles_stay_on() {
+        let c: Config = serde_json::from_str(r#"{"user_id":"u"}"#).unwrap();
+        assert!(!c.remote_control);
+        let p: Profile = serde_json::from_str(r#"{"label":"l","provider":"openai","base_url":"http://x","model":"m","max_context_tokens":1000}"#).unwrap();
+        assert!(p.enabled);
+    }
 }

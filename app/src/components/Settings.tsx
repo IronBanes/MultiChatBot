@@ -58,6 +58,7 @@ function blankProfile(): Profile {
     temperature: null,
     show_reasoning: true,
     reasoning_effort: null,
+    enabled: true,
   };
 }
 
@@ -389,6 +390,7 @@ function ResultBox({ ok, children }: { ok: boolean; children: React.ReactNode })
 function ProfilesPanel() {
   const client = useChat((s) => s.client)!;
   const refreshClient = useChat((s) => s.refreshClient);
+  const setProfileEnabled = useChat((s) => s.setProfileEnabled);
   const [editing, setEditing] = useState<ProfileView | "new" | null>(client.profiles.length === 0 ? "new" : null);
 
   if (editing) {
@@ -416,8 +418,13 @@ function ProfilesPanel() {
             <div className="truncate text-xs text-zinc-500">
               {p.provider === "anthropic" ? "Anthropic" : "OpenAI-compatible"} · {p.model} · {p.has_key ? "key stored" : "no key"}
               {p.show_reasoning ? " · reasoning" : ""}
+              {p.enabled ? "" : " · off"}
             </div>
           </div>
+          <label className="flex shrink-0 items-center gap-1.5 text-xs text-zinc-500" title="Off profiles can't reply, here or for your linked devices">
+            <input type="checkbox" className="h-4 w-4 accent-indigo-600" checked={p.enabled} onChange={(e) => void setProfileEnabled(p.id, e.target.checked)} />
+            On
+          </label>
           <Button variant="ghost" onClick={() => setEditing(p)}>
             Edit
           </Button>
@@ -915,6 +922,8 @@ function LinkSection() {
   const createLinkCode = useChat((s) => s.createLinkCode);
   const redeemLinkCode = useChat((s) => s.redeemLinkCode);
   const unlink = useChat((s) => s.unlink);
+  const setRemoteControl = useChat((s) => s.setRemoteControl);
+  const setRemoteProfileEnabled = useChat((s) => s.setRemoteProfileEnabled);
   const [code, setCode] = useState<{ text: string; expiresAt: number } | null>(null);
   const [now, setNow] = useState(Date.now());
   const [entered, setEntered] = useState("");
@@ -1049,6 +1058,25 @@ function LinkSection() {
 
       {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
 
+      {client.platform === "desktop" && (
+        <label className="flex items-start gap-3">
+          <input
+            type="checkbox"
+            className="mt-1 h-4 w-4 accent-indigo-600"
+            checked={client.remote_control}
+            onChange={(e) => void setRemoteControl(e.target.checked)}
+          />
+          <span>
+            <span className="block text-sm font-medium">Let linked devices control this computer</span>
+            <span className="block text-xs text-zinc-500">
+              They can turn your AI profiles on or off and switch MCP servers between Off and Ask. Replies this computer generates for them can use
+              tools, and every call waits for approval on that device or here, even on servers set to Auto. Tool arguments are sent to that device
+              through the relay.
+            </span>
+          </span>
+        </label>
+      )}
+
       <div className="space-y-2">
         <span className="block text-xs font-medium text-zinc-700 dark:text-zinc-300">Devices online</span>
         {devices.length === 0 ? (
@@ -1067,6 +1095,23 @@ function LinkSection() {
                   <div className="pl-3.5 text-xs text-zinc-500">
                     Shares {d.profiles.length} AI profile{d.profiles.length === 1 ? "" : "s"}
                   </div>
+                )}
+                {d.remote_control && d.device_id !== client.device_id && d.profiles.length > 0 && (
+                  <ul className="mt-1 space-y-1 pl-3.5">
+                    {d.profiles.map((p) => (
+                      <li key={p.id}>
+                        <label className="flex min-h-8 items-center gap-2 text-sm">
+                          <input
+                            type="checkbox"
+                            className="h-4 w-4 accent-indigo-600"
+                            checked={p.enabled}
+                            onChange={(e) => setRemoteProfileEnabled(d.device_id, p.id, e.target.checked)}
+                          />
+                          <span className="min-w-0 truncate">{p.label}</span>
+                        </label>
+                      </li>
+                    ))}
+                  </ul>
                 )}
               </li>
             ))}

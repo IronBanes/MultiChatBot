@@ -429,6 +429,72 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   const own = await phone.wait(type("error", (m) => m.request_id === "rq-own"), "error (own device)");
   ok(/offline/.test(own.message), "request_ai to one's own connection is refused");
 
+  // Remote control (device linking phase 3): the PC shares its servers and on/off state
+  // only when allowed, and device commands stay between one account's devices.
+  pc.send({
+    type: "share_profiles",
+    profiles: [{ id: "prof-1", label: "Claude", model: "m", enabled: false }],
+    mcp_servers: [{ id: "srv-1", name: "Files", default_mode: "ask", room_modes: {} }],
+    remote_control: false,
+  });
+  const quiet = await phone.wait(
+    type("devices", (m) => m.devices.some((d) => d.device_id === "pc-1" && d.profiles[0]?.enabled === false)),
+    "devices (remote control off)",
+  );
+  ok(quiet.devices.find((d) => d.device_id === "pc-1").mcp_servers.length === 0, "without remote control no MCP server is listed");
+
+  pc.send({
+    type: "share_profiles",
+    profiles: [{ id: "prof-1", label: "Claude", model: "m", enabled: true }],
+    mcp_servers: [
+      { id: "srv-1", name: "Files", default_mode: "ask", room_modes: { [droom.id]: "off", bad: "root" } },
+      { id: "srv-2", name: "Bogus", default_mode: "root", room_modes: {} },
+    ],
+    remote_control: true,
+  });
+  const allowed = await phone.wait(type("devices", (m) => m.devices.some((d) => d.remote_control)), "devices (remote control on)");
+  const shared = allowed.devices.find((d) => d.device_id === "pc-1");
+  ok(shared.mcp_servers.length === 1 && shared.mcp_servers[0].name === "Files", "a server with a bogus mode isn't listed");
+  ok(!("command" in shared.mcp_servers[0]) && !("url" in shared.mcp_servers[0]), "only a server's name and modes are shared");
+  ok(JSON.stringify(shared.mcp_servers[0].room_modes) === JSON.stringify({ [droom.id]: "off" }), "room modes pass; a bogus mode is dropped");
+
+  const setMode = { kind: "set_mcp_mode", room_id: droom.id, server_id: "srv-1", mode: "ask" };
+  phone.send({ type: "device_command", request_id: "dc1", device_id: "pc-1", command: setMode });
+  const cmd = await pc.wait(type("device_command", (m) => m.request_id === "dc1"), "device_command");
+  ok(cmd.from_device_id === "phone-1" && cmd.command.kind === "set_mcp_mode" && cmd.command.mode === "ask", "a device command reaches the target with the sender's device id");
+  pc.send({ type: "device_reply", request_id: "dc1", to_device_id: "phone-1", error: null });
+  await phone.wait(type("device_reply", (m) => m.request_id === "dc1"), "device_reply");
+  ok(true, "a device's answer reaches the asking device");
+
+  phone.send({ type: "device_command", request_id: "dc2", device_id: "pc-1", command: setMode });
+  await pc.wait(type("device_command", (m) => m.request_id === "dc2"), "device_command (refused)");
+  pc.send({ type: "device_reply", request_id: "dc2", to_device_id: "phone-1", error: "Remote control is off" });
+  const refusedCmd = await phone.wait(type("error", (m) => m.request_id === "dc2"), "error (command refused)");
+  ok(/Remote control/.test(refusedCmd.message), "a refused command reaches the asking device as an error frame");
+
+  // Tool arguments go to that one device: not the room, not the other member.
+  const approval = { kind: "tool_approval", room_id: droom.id, message_id: "m1", call_id: "c1", server: "Files", tool: "read", args: "SECRET-ARGS" };
+  pc.send({ type: "device_command", request_id: "dc3", device_id: "phone-1", command: approval });
+  const offered = await phone.wait(type("device_command", (m) => m.request_id === "dc3"), "tool_approval");
+  ok(offered.command.args === "SECRET-ARGS", "a tool approval carries its arguments to the asking device");
+  await new Promise((r) => setTimeout(r, 150));
+  ok(![...bobd.inbox, ...alice.inbox].some((m) => JSON.stringify(m).includes("SECRET-ARGS")), "tool arguments never reach another user or connection");
+
+  phone.send({ type: "device_command", request_id: "dc4", device_id: "bob-dev", command: setMode });
+  const foreignCmd = await phone.wait(type("error", (m) => m.request_id === "dc4"), "error (command to another user)");
+  ok(/offline/.test(foreignCmd.message), "a device command to another user's device is refused");
+  ok(!bobd.inbox.some((m) => m.type === "device_command"), "another user's device never receives a command");
+  phone.send({ type: "device_command", request_id: "dc5", device_id: "phone-1", command: setMode });
+  const selfCmd = await phone.wait(type("error", (m) => m.request_id === "dc5"), "error (command to itself)");
+  ok(/offline/.test(selfCmd.message), "a device command to one's own connection is refused");
+  pc.send({ type: "device_reply", request_id: "dc6", to_device_id: "bob-dev", error: null });
+  await new Promise((r) => setTimeout(r, 150));
+  ok(!bobd.inbox.some((m) => m.type === "device_reply"), "a device reply can't reach another user's device");
+  const huge = { ...approval, args: "x".repeat(70_000) };
+  pc.send({ type: "device_command", request_id: "dc7", device_id: "phone-1", command: huge });
+  const tooBig = await pc.wait(type("error", (m) => m.request_id === "dc7"), "error (command too large)");
+  ok(/too large/.test(tooBig.message), "an oversized device command is refused");
+
   pc.close();
   phone.close();
   bobd.close();

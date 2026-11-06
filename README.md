@@ -87,6 +87,12 @@ to its own account and rooms. A linked phone can also use the computer's AI prof
 while the computer is online — pick one labelled "· on <device>" and the computer
 generates the reply with its own keys.
 
+To control the computer from the phone, turn on **Let linked devices control this
+computer** in its **Settings → General**. The phone can then turn the computer's AI profiles
+on or off (**Settings → General**, under the device), switch its MCP servers between Off and
+Ask for a room (**Tools**, with one of its profiles picked), and allow or deny each tool call
+in the chat. The prompt shows on the computer too, and whichever answers first wins.
+
 ### Playing with a friend
 
 1. **Host:** run `start.cmd --server` or `./start.sh --server`, or turn on **Host a
@@ -444,6 +450,11 @@ message, generated with your own model.
   key; a key can't be tried on an address typed into the form until it's saved. Changing
   an MCP server's URL or command (or testing a new one) doesn't carry its stored env vars
   and headers along; enter them again for the new address.
+- Linked devices can't control your computer unless you turn on **Let linked devices
+  control this computer** there. With it on, they can turn profiles on or off and switch
+  MCP servers between Off and Ask, but never to Auto, and every tool call in a reply they
+  ask for needs approval, even on servers set to Auto. A tool's arguments go to the device
+  that asked, through the relay, without being stored; only use this with a relay you trust.
 - Message content is rendered as Markdown with raw HTML disabled. `javascript:` links
   are neutralized, links open in the system browser, and remote images are never loaded.
 - MCP tool arguments and results are never sent to the relay (only to the MCP server
