@@ -23,9 +23,15 @@ Run the ones that cover what you changed. Each line starts from the repo root.
 (cd server && cargo test)
 ```
 
-For protocol changes, start the relay with `cd server && cargo run` and leave it running. Then run `node tools/smoke-test.mjs` (Node 22+) from the repo root in a second terminal.
+For protocol changes, start the relay on a throwaway database and leave it running, because the smoke test leaves its rooms and messages behind:
 
-Android and iOS builds run in GitHub Actions only on pull requests that change `app/**` or their own workflow file. Other pull requests get no mobile build.
+```bash
+(cd server && MULTICHAT_DB=target/smoke-test.db cargo run)
+```
+
+Then run `node tools/smoke-test.mjs` (Node 22+) from the repo root in a second terminal. Delete `server/target/smoke-test.db*` after stopping the relay.
+
+Android and iOS builds run in GitHub Actions on manual dispatch and `v*` tag pushes. On pull requests they run only when `app/**` or their own workflow file changes, so other pull requests get no mobile build.
 
 ## Rules
 
