@@ -43,10 +43,10 @@ Android and iOS builds run in GitHub Actions on manual dispatch and `v*` tag pus
 
 For changes the smoke test can't reach, such as anything between two linked devices, drive real app instances:
 
-1. Run Vite on port 1420 (`cd app && npx vite --port 1420 --strictPort`), a throwaway relay and `node tools/mock-llm.mjs <port>`. Debug builds load the UI from Vite.
-2. Start `app/src-tauri/target/debug/multichat.exe` once per device, each with its own `MULTICHAT_INSTANCE`, `WEBVIEW2_USER_DATA_FOLDER` and `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<port>` (Windows only).
-3. From a Node script, connect to the target listed at `http://localhost:<port>/json/list` and use `Runtime.evaluate`. `await import('/src/store.ts')` gives the live store, and `window.__TAURI_INTERNALS__.invoke` calls backend commands.
-4. Clean up afterwards: the test instance folders under `%APPDATA%\com.multichat.app\instances` and each test key in the keychain (target `profile:<id>.multichat-bot`).
+1. Build the debug app (`cd app/src-tauri && cargo build`). Then run Vite on port 1420 (`cd app && npx vite --port 1420 --strictPort`), a throwaway relay and `node tools/mock-llm.mjs <port>`. Debug builds load the UI from Vite.
+2. Start `app/src-tauri/target/debug/multichat.exe` once per device, each with its own `WEBVIEW2_USER_DATA_FOLDER`, `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=<port>` (Windows only) and `MULTICHAT_INSTANCE`. Pick an unused instance name and confirm `%APPDATA%\com.multichat.app\instances\<name>` doesn't exist first, because an existing name loads that instance's real settings.
+3. From a Node script, connect to the target listed at `http://localhost:<port>/json/list` and use `Runtime.evaluate`. `await import('/src/store.ts')` gives the live store, and `window.__TAURI_INTERNALS__.invoke` calls backend commands. New instances use the relay on port 8787, so call the store's `saveIdentity(name, url)` with the throwaway relay's URL, which must end in `/ws`.
+4. Clean up afterwards: only the instance folders this run created and each test key in the keychain (target `profile:<id>.multichat-bot`).
 
 Stop test processes by exact port or PID, and delete keys by their exact test id. Never match on a name like `multichat`: that can hit the user's own app and secrets.
 
