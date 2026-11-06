@@ -485,6 +485,7 @@ export const useChat = create<ChatState>((set, get) => {
       }
       return;
     }
+    // The backend checks again as it acts: this copy of the setting can be out of date.
     if (!client?.remote_control) {
       reply("Remote control is off on that device. Turn it on there in Settings > General.");
       return;
@@ -492,15 +493,15 @@ export const useChat = create<ChatState>((set, get) => {
     try {
       if (command.kind === "answer_tool") {
         if (delegatedGenerations.get(command.message_id) !== from) throw new Error("That reply wasn't requested from this device");
-        await backend.resolveToolCall(command.message_id, command.call_id, command.approved);
+        await backend.resolveToolCall(command.message_id, command.call_id, command.approved, true);
       } else if (command.kind === "set_mcp_mode") {
         if (command.mode !== "off" && command.mode !== "ask") throw new Error("Auto can only be set on that device");
         if (!get().rooms[command.room_id]) throw new Error("That device isn't in this room");
         if (!client.mcp_servers.some((s) => s.id === command.server_id)) throw new Error("That MCP server is gone");
-        await backend.setRoomMcpMode(command.room_id, command.server_id, command.mode);
+        await backend.setRoomMcpMode(command.room_id, command.server_id, command.mode, true);
         await get().refreshClient();
       } else if (command.kind === "set_profile_enabled") {
-        await backend.setProfileEnabled(command.profile_id, command.enabled);
+        await backend.setProfileEnabled(command.profile_id, command.enabled, true);
         await get().refreshClient();
       } else {
         // The relay's frames aren't trusted to match these types.
@@ -716,7 +717,7 @@ export const useChat = create<ChatState>((set, get) => {
           // A reply for another device: the approval goes there too, with the arguments
           // (to that device only, never the room). Either side may answer; first wins.
           const askedBy = delegatedGenerations.get(id);
-          if (askedBy && ev.status === "awaiting_approval") {
+          if (askedBy && ev.status === "awaiting_approval" && get().client?.remote_control) {
             const raw = ev.args ?? "{}";
             // Half an emoji at the cut would make the relay refuse the whole frame.
             const args = raw.length > MAX_APPROVAL_ARGS ? `… [cut short: the full call is on the computer]\n${raw.slice(0, MAX_APPROVAL_ARGS).replace(/[\uD800-\uDBFF]$/, "")}` : raw;
@@ -1365,7 +1366,11 @@ export const useChat = create<ChatState>((set, get) => {
     async setRemoteControl(enabled) {
       try {
         await backend.setRemoteControl(enabled);
-        await get().refreshClient();
+        // Not refreshed: a failed read would leave the old setting in place here.
+        set((s) => ({ client: s.client && { ...s.client, remote_control: enabled } }));
+        // Tool arguments stop going out now; the prompt stays on this computer.
+        if (!enabled) pendingApprovals.clear();
+        shareMyProfiles();
       } catch (e) {
         get().toast(errorText(e));
       }

@@ -166,6 +166,13 @@ impl Config {
     /// user's devices gets tools only with remote control on, and every call is approved
     /// first even on an Auto server: nobody may be at this computer, and a request
     /// arriving through the relay must not run anything unseen.
+    pub fn allow_remote(&self, remote: bool) -> Result<(), String> {
+        if remote && !self.remote_control {
+            return Err("Remote control is off on that device. Turn it on there in Settings > General.".into());
+        }
+        Ok(())
+    }
+
     pub fn mcp_for_reply(&self, room_id: &str, delegated: bool) -> Vec<(McpServer, McpMode)> {
         if !delegated {
             return self.active_mcp(room_id);
@@ -303,6 +310,15 @@ mod tests {
         assert_eq!(modes(c.mcp_for_reply("room", true)), [("auto".to_string(), McpMode::Ask), ("off".to_string(), McpMode::Ask)]);
         // A server that's off stays off.
         assert_eq!(modes(c.mcp_for_reply("other", true)), [("auto".to_string(), McpMode::Ask)]);
+    }
+
+    #[test]
+    fn only_commands_from_another_device_need_remote_control() {
+        let mut c = config();
+        assert!(c.allow_remote(false).is_ok());
+        assert!(c.allow_remote(true).is_err());
+        c.remote_control = true;
+        assert!(c.allow_remote(true).is_ok());
     }
 
     #[test]

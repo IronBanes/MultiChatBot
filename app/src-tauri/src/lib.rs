@@ -380,15 +380,19 @@ fn set_last_profile(state: State<'_, AppState>, room_id: String, profile_id: Str
     })
 }
 
-/// Turns a profile on or off, without touching its settings or key.
+/// Turns a profile on or off, without touching its settings or key. `remote` marks a
+/// command from another device, checked under the settings lock like the other two.
 #[tauri::command]
-fn set_profile_enabled(state: State<'_, AppState>, id: String, enabled: bool) -> Result<(), String> {
-    state.update(|c| match c.profiles.iter_mut().find(|p| p.id == id) {
-        Some(p) => {
-            p.enabled = enabled;
-            Ok(())
+fn set_profile_enabled(state: State<'_, AppState>, id: String, enabled: bool, remote: Option<bool>) -> Result<(), String> {
+    state.update(|c| {
+        c.allow_remote(remote.unwrap_or(false))?;
+        match c.profiles.iter_mut().find(|p| p.id == id) {
+            Some(p) => {
+                p.enabled = enabled;
+                Ok(())
+            }
+            None => Err("Profile not found".to_string()),
         }
-        None => Err("Profile not found".to_string()),
     })?
 }
 
@@ -639,10 +643,12 @@ async fn test_mcp_server(
 }
 
 #[tauri::command]
-fn set_room_mcp_mode(state: State<'_, AppState>, room_id: String, server_id: String, mode: McpMode) -> Result<(), String> {
+fn set_room_mcp_mode(state: State<'_, AppState>, room_id: String, server_id: String, mode: McpMode, remote: Option<bool>) -> Result<(), String> {
     state.update(|c| {
+        c.allow_remote(remote.unwrap_or(false))?;
         c.mcp_modes_by_room.entry(room_id).or_default().insert(server_id, mode);
-    })
+        Ok(())
+    })?
 }
 
 /// Picks which messages in `room_id` earn a system notification. `Mentions` (the
@@ -669,7 +675,10 @@ fn forget_room_notify(state: State<'_, AppState>, room_id: String) -> Result<(),
 }
 
 #[tauri::command]
-fn resolve_tool_call(state: State<'_, AppState>, id: String, call_id: String, approved: bool) -> Result<(), String> {
+fn resolve_tool_call(state: State<'_, AppState>, id: String, call_id: String, approved: bool, remote: Option<bool>) -> Result<(), String> {
+    // Held until answered, so turning remote control off can't land in between.
+    let cfg = state.config.lock().map_err(|_| "config lock poisoned")?;
+    cfg.allow_remote(remote.unwrap_or(false))?;
     let tx = state.approvals.lock().map_err(|_| "lock poisoned")?.remove(&format!("{id}:{call_id}"));
     match tx {
         Some(tx) => {

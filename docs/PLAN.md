@@ -214,7 +214,9 @@ forge a command. So the receiving device decides what happens, within these limi
 
 - **Off by default.** "Let linked devices control this computer" (`remote_control`) is only
   set at the desktop itself. Until then commands are refused, no server names are shared
-  and delegated replies get no tools.
+  and delegated replies get no tools. The backend checks the setting as it acts on each
+  command, under the lock that changes it, so turning it off stops them at once. A reply
+  already running keeps its prompts on the desktop, and its arguments stop going out.
 - **Never Auto.** A linked device can set a server to Off or Ask only.
 - **Every delegated call is approved,** even on a server set to Auto at the desktop
   (`Config::mcp_for_reply`). The desktop shows the same prompt, and the first answer wins;
