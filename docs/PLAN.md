@@ -225,8 +225,10 @@ forge a command. So the receiving device decides what happens, within these limi
   started at the desktop can't be answered from elsewhere.
   This stops devices answering each other's prompts by mistake, but it isn't a security
   boundary: a device's id is self-reported and all linked devices share one account secret,
-  so one of them could claim another's id. That gains it nothing new, as it could ask for
-  its own reply and approve that.
+  so with remote control on, one of them could claim another's id, read that device's waiting
+  tool arguments and answer the call. It could already ask for its own reply and approve
+  that, so the new exposure is those arguments and that one answer. Authenticating each
+  device, with approvals bound to that identity, would close this; it isn't built yet.
 
 A forged command can still turn profiles and servers off or back to Ask, and a forged
 approval can run a tool of a server that's on, so remote control trusts the relay more
