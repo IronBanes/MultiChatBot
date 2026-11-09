@@ -190,6 +190,17 @@ node tools/smoke-test.mjs                    # relay protocol test with two clie
 cd app/src-tauri && cargo test              # context building, trimming, error sanitizing
 ```
 
+Lint and type check (these also run in GitHub Actions on every pull request, and any warning fails them):
+
+```bash
+cd app && npm run typecheck && npm run lint
+cd app/src-tauri && cargo clippy --all-targets -- -D warnings
+cd server && cargo clippy --all-targets -- -D warnings
+```
+
+On Linux, clippy for `app/src-tauri` needs Tauri's system libraries (WebKitGTK and friends, see
+Prerequisites) as well as `libdbus-1-dev`.
+
 ## iOS
 
 The same `app/` builds for iOS as a second Tauri target: the React frontend runs in a

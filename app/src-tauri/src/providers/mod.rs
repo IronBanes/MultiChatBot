@@ -141,7 +141,7 @@ pub(crate) fn parse_models(v: &Value) -> Vec<ModelInfo> {
             Some(ModelInfo { id, name, context_length, reasoning: flag("reasoning"), tools: flag("tool_calling") })
         })
         .collect();
-    out.sort_by(|a, b| a.id.to_lowercase().cmp(&b.id.to_lowercase()));
+    out.sort_by_key(|a| a.id.to_lowercase());
     out
 }
 
@@ -206,10 +206,10 @@ pub fn sanitize(msg: &str, api_key: Option<&str>, base_url: &str) -> String {
     let base = base_url.trim().trim_end_matches('/');
     if !base.is_empty() {
         s = s.replace(base, "[endpoint]");
-        if let Ok(u) = reqwest::Url::parse(base) {
-            if let Some(host) = u.host_str() {
-                s = s.replace(host, "[endpoint]");
-            }
+        if let Ok(u) = reqwest::Url::parse(base)
+            && let Some(host) = u.host_str()
+        {
+            s = s.replace(host, "[endpoint]");
         }
     }
     let words: Vec<String> = s

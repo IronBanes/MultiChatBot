@@ -91,9 +91,10 @@ export default function App() {
     if (window.innerWidth < NAV_INLINE_MIN) closeRoom();
   }, [closeRoom]);
 
+  const instance = client?.instance;
   useEffect(() => {
-    if (client) document.title = client.instance === "default" ? "Multichat" : `Multichat — ${client.instance}`;
-  }, [client?.instance]);
+    if (instance) document.title = instance === "default" ? "Multichat" : `Multichat — ${instance}`;
+  }, [instance]);
 
   useEffect(() => {
     applyTheme();

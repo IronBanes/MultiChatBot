@@ -182,10 +182,10 @@ pub fn set_key(profile_id: &str, key: &str, endpoint: &str) -> Result<(), String
 /// Pairs a key stored before pairing existed with `endpoint` (best effort: the key is
 /// still used if this fails, and it's tried again next time).
 pub fn pair_legacy_key(profile_id: &str, endpoint: &str) {
-    if let Ok(Some(raw)) = get(&format!("profile:{profile_id}")) {
-        if serde_json::from_str::<PairedKey>(&raw).is_err() {
-            let _ = set_key(profile_id, &raw, endpoint);
-        }
+    if let Ok(Some(raw)) = get(&format!("profile:{profile_id}"))
+        && serde_json::from_str::<PairedKey>(&raw).is_err()
+    {
+        let _ = set_key(profile_id, &raw, endpoint);
     }
 }
 

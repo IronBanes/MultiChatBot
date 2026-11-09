@@ -86,10 +86,10 @@ impl Host {
                 Ok(())
             }
             Err(e) => {
-                if let Some(old_port) = old_port.filter(|&p| p != port) {
-                    if let Ok(r) = multichat_relay::start(&format!("0.0.0.0:{old_port}"), &db).await {
-                        *relay = Some(r);
-                    }
+                if let Some(old_port) = old_port.filter(|&p| p != port)
+                    && let Ok(r) = multichat_relay::start(&format!("0.0.0.0:{old_port}"), &db).await
+                {
+                    *relay = Some(r);
                 }
                 let in_use = e
                     .downcast_ref::<std::io::Error>()
