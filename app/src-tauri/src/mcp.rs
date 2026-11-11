@@ -164,10 +164,10 @@ impl McpManager {
     /// Returns a live connection, (re)connecting if needed.
     async fn get(&self, server: &McpServer, secrets: &McpSecrets) -> Result<Arc<Connection>, String> {
         let fp = fingerprint(server, secrets);
-        if let Some(c) = self.conns.lock().await.get(&server.id) {
-            if c.fingerprint == fp && !c.client.is_transport_closed() {
-                return Ok(c.clone());
-            }
+        if let Some(c) = self.conns.lock().await.get(&server.id)
+            && c.fingerprint == fp && !c.client.is_transport_closed()
+        {
+            return Ok(c.clone());
         }
         let conn = tokio::time::timeout(CONNECT_TIMEOUT, connect(server, secrets))
             .await
@@ -266,10 +266,10 @@ impl McpManager {
                 _ => parts.push("[unsupported content omitted]".into()),
             }
         }
-        if parts.is_empty() {
-            if let Some(s) = &res.structured_content {
-                parts.push(s.to_string());
-            }
+        if parts.is_empty()
+            && let Some(s) = &res.structured_content
+        {
+            parts.push(s.to_string());
         }
         let mut text = parts.join("\n");
         if server.share_images && images.len() < MAX_IMAGES {
@@ -282,10 +282,10 @@ impl McpManager {
                 if images.len() >= MAX_IMAGES {
                     break;
                 }
-                if let Some(img) = read_fresh_image(&path).await {
-                    if !images.iter().any(|i| i.data == img.data) {
-                        images.push(img);
-                    }
+                if let Some(img) = read_fresh_image(&path).await
+                    && !images.iter().any(|i| i.data == img.data)
+                {
+                    images.push(img);
                 }
             }
         }

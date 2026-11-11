@@ -18,12 +18,12 @@ Roadmap: GitHub issue #22.
 Run the ones that cover what you changed. Each line starts from the repo root, and the commands are for Git Bash, so on Windows `VAR=value cmd` won't work in PowerShell.
 
 ```bash
-(cd app && npm run build)
-(cd app/src-tauri && cargo check && cargo clippy && cargo test)
-(cd server && cargo test)
+(cd app && npm run typecheck && npm run lint && npm run build)
+(cd app/src-tauri && cargo clippy --all-targets -- -D warnings && cargo test)
+(cd server && cargo clippy --all-targets -- -D warnings && cargo test)
 ```
 
-`cargo clippy` already reports 7 style warnings in code that predates this guide. Fix new warnings only.
+The Lint and Type Check workflow (`.github/workflows/check.yml`) runs ESLint, `tsc` and both clippy commands on every pull request, and fails on any warning. ESLint's config is `app/eslint.config.js`; the React Compiler rules are off there on purpose, because the app doesn't use the compiler.
 
 For protocol changes, start a separate relay on its own port and throwaway database and leave it running, because the smoke test leaves its rooms and messages behind:
 

@@ -838,7 +838,7 @@ function MessageList({
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const first = list[0]?.id ?? null;
+    const first = messages?.[0]?.id ?? null;
     if (!stick.current && firstId.current !== null && firstId.current !== first) {
       // Older messages were prepended: keep what the user is reading in place by
       // restoring the distance from the bottom saved before the change (the raw
@@ -1586,6 +1586,7 @@ function Composer({
     setTyping(room.id, true);
   };
   // Unmount (also covers switching rooms, since the Composer is keyed by room).
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- unmount only; the Composer is keyed by room, so the first stopTyping stays valid
   useEffect(() => stopTyping, []);
   /** Called on every text change. */
   const onTextChange = (value: string) => {
@@ -1643,6 +1644,7 @@ ${before}` : t);
       lastEdit.current = null;
       leaving.current = false;
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reacts to edit mode changing, not to stopTyping's identity
   }, [editing, toast]);
 
   // On phones, focusing would pop the keyboard up as soon as a room opens.
