@@ -66,6 +66,8 @@ export const backend = {
     roomPrompt: string,
     /** The room's shared summary of messages before `history` ("" = none). */
     summary: string,
+    /** Only messages with a smaller seq may be folded into a new summary (null = no limit). */
+    foldBefore: number | null,
     /** For another of this user's devices: MCP tools only with remote control on, and
      *  every call is approved first, even on an Auto server. */
     delegated: boolean,
@@ -73,7 +75,7 @@ export const backend = {
   ) => {
     const channel = new Channel<GenEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, summary, delegated, onEvent: channel });
+    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, summary, foldBefore, delegated, onEvent: channel });
   },
   stopGeneration: (id: string) => invoke<void>("stop_generation", { id }),
 

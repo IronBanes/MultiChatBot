@@ -122,48 +122,76 @@ pub fn plan_summary(
 }
 
 /// The request that asks the model to write (or extend) the room summary from
-/// `items`, the oldest history entries to fold in. Returns the system text and
-/// the single user message. If the text doesn't fit the input budget, the
-/// oldest items are dropped until it does (the newest folded items matter most).
+/// `items`, the oldest history entries to fold in. Returns the system text, the
+/// single user message, and how many of `items` (from the front) it covers.
+///
+/// Coverage is always a prefix: the oldest items that fit the input budget go in
+/// and the rest stay out, so the room's summary boundary (the last covered `seq`)
+/// never claims a message the model didn't see. An oldest message too long to fit
+/// on its own goes in cut short, so coverage still moves. 0 means even that
+/// doesn't fit (the previous summary fills the budget). Rendered once, in one pass.
 pub fn summary_request(
     previous: &str,
     items: &[HistoryItem],
     max_context_tokens: u32,
-) -> (String, Vec<ChatMessage>) {
-    let system = "\
-You maintain a running summary of a group chat. \
-Keep who said what (names), decisions that were made, open questions, facts people shared \
-and what the AI was asked to do. \
-Write plain prose under about 400 words, no preamble.";
-
-    let render = |items: &[&HistoryItem]| {
-        let mut text = String::new();
-        let previous = previous.trim();
-        if !previous.is_empty() {
-            text.push_str("Current summary:\n");
-            text.push_str(previous);
-            text.push_str("\n\nNew messages to fold in:\n");
-        }
-        for h in items.iter().filter(|h| !h.content.trim().is_empty()) {
-            let name = match h.kind {
-                Kind::Human => h.author_name.as_str(),
-                Kind::Ai => "AI",
-            };
-            text.push_str(&format!("[{name}]: {}\n", h.content));
-        }
-        text
-    };
+) -> (String, Vec<ChatMessage>, usize) {
+    let system = "You maintain a running summary of a group chat. Keep who said what (names), decisions that were made, open questions, facts people shared and what the AI was asked to do. Write plain prose under about 400 words, no preamble.";
 
     let budget = (max_context_tokens.saturating_sub(output_reserve(max_context_tokens)) as usize)
         .saturating_sub(estimate_tokens(system));
-    // Drop the oldest items until the user message fits; keep at least one.
-    let items: Vec<&HistoryItem> = items.iter().filter(|h| !h.content.trim().is_empty()).collect();
-    let mut start = 0;
-    while items.len() - start > 1 && estimate_tokens(&render(&items[start..])) > budget {
-        start += 1;
+    // estimate_tokens(text) = ceil(chars / 4) + 4, so this many characters fit.
+    let max_chars = budget.saturating_sub(4) * 4;
+
+    let mut text = String::new();
+    let previous = previous.trim();
+    if !previous.is_empty() {
+        text.push_str("Current summary:
+");
+        text.push_str(previous);
+        text.push_str("
+
+New messages to fold in:
+");
     }
-    let messages = vec![ChatMessage { role: Role::User, content: render(&items[start..]) }];
-    (system.to_string(), messages)
+    let mut chars = text.chars().count();
+    let mut covered = 0;
+    let mut any = false;
+    for h in items {
+        if h.content.trim().is_empty() {
+            // Nothing to summarize, but it's inside the covered prefix.
+            covered += 1;
+            continue;
+        }
+        let name = match h.kind {
+            Kind::Human => h.author_name.as_str(),
+            Kind::Ai => "AI",
+        };
+        let line = format!("[{name}]: {}
+", h.content);
+        let len = line.chars().count();
+        if chars + len > max_chars {
+            const CUT: &str = " [...]
+";
+            let room = max_chars.saturating_sub(chars + CUT.len());
+            // The oldest message alone is too long: send its start rather than
+            // never moving past it. Only when a useful part of it fits.
+            if !any && room >= 64 {
+                text.extend(line.chars().take(room));
+                text.push_str(CUT);
+                covered += 1;
+                any = true;
+            }
+            break;
+        }
+        text.push_str(&line);
+        chars += len;
+        covered += 1;
+        any = true;
+    }
+    if !any {
+        covered = 0;
+    }
+    (system.to_string(), vec![ChatMessage { role: Role::User, content: text }], covered)
 }
 
 pub fn build(history: &[HistoryItem], room_prompt: &str, summary: &str, max_context_tokens: u32) -> Prompt {
@@ -277,19 +305,32 @@ mod tests {
     #[test]
     fn summary_request_carries_previous_summary_and_fits_budget() {
         let items: Vec<_> = (0..5).map(|i| human(&format!("A{i}"), &format!("note {i}"))).collect();
-        let (system, messages) = summary_request("They discussed the budget.", &items, 100_000);
+        let (system, messages, covered) = summary_request("They discussed the budget.", &items, 100_000);
+        assert_eq!(covered, 5);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, Role::User);
         assert!(messages[0].content.contains("They discussed the budget."));
         assert!(messages[0].content.contains("[A0]: note 0"));
         assert!(messages[0].content.contains("[A4]: note 4"));
         assert!(system.contains("running summary"));
-        // Oversized: the oldest items are dropped until it fits, the newest kept.
-        let long = "y".repeat(8000);
+        // Oversized: the oldest items that fit go in and coverage stops there, so
+        // the boundary never claims a message the model didn't see.
+        let long = "y".repeat(1000);
         let items: Vec<_> = (0..8).map(|i| human(&format!("A{i}"), &long)).collect();
-        let (_, messages) = summary_request("", &items, 2000);
-        assert!(messages[0].content.contains(&format!("[A{}]: ", items.len() - 1)));
-        assert!(!messages[0].content.contains("[A0]: "));
+        let (system, messages, covered) = summary_request("", &items, 2000);
+        assert!(covered >= 1 && covered < items.len());
+        assert!(messages[0].content.contains("[A0]: "));
+        assert!(messages[0].content.contains(&format!("[A{}]: ", covered - 1)));
+        assert!(!messages[0].content.contains(&format!("[A{covered}]: ")));
+        let budget = 2000 - output_reserve(2000) as usize;
+        assert!(estimate_tokens(&system) + estimate_tokens(&messages[0].content) <= budget);
+        // A single message too long to fit is cut, but still covered.
+        let huge = "z".repeat(40_000);
+        let (_, messages, covered) = summary_request("", &[human("A", &huge), human("B", "x")], 2000);
+        assert_eq!(covered, 1);
+        assert!(messages[0].content.ends_with(" [...]
+"));
+        assert!(estimate_tokens(&messages[0].content) <= budget);
     }
 
     #[test]

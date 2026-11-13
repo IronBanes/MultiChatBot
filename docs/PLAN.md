@@ -268,6 +268,19 @@ last message — one compare-and-set, so concurrent writers can't regress it, an
 the writer that advanced it broadcasts `room_summary`. If summarizing fails, the reply
 falls back to trimming, as before.
 
+The boundary never passes a message the summary didn't see:
+- **Prefix only.** The summary request carries the oldest folded messages that fit the
+  input budget. `upto_seq` is the last one it really carried, and the rest stay in the
+  reply's history. An oldest message too long to fit on its own goes in cut short.
+- **No gaps.** The device only summarizes when its loaded messages reach back to the
+  boundary (or, with no summary yet, to the start of the room). Otherwise it loads the
+  missing pages with `load_older` and this reply trims as before.
+- **No unfinished replies.** Folding stops before an earlier AI reply that is still
+  streaming.
+
+A device shows its own summary at once, and a `room_summary` at the same boundary
+replaces it, so every member ends up with the copy the relay accepted.
+
 ## Provider trait
 
 ```rust

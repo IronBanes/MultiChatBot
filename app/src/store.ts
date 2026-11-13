@@ -684,6 +684,28 @@ export const useChat = create<ChatState>((set, get) => {
       .filter((m) => m.seq <= anchor.seq && m.seq > upto && !m.deleted && (m.kind === "human" || m.status === "complete"))
       .map((m) => ({ kind: m.kind, author_name: m.author_name, content: historyText(m, byId), seq: m.seq }));
 
+    // What may be folded into a new summary. The boundary must not pass a message
+    // the summary never saw, so folding stops at:
+    // - a gap: older messages after the boundary (or, with no summary yet, at the start
+    //   of the room) aren't loaded here. Nothing is folded this time; those messages
+    //   are loaded now so the next reply can summarize without skipping them.
+    // - an earlier AI reply still streaming: it isn't in this history yet, and a
+    //   boundary past it would leave its final text out of both summary and history.
+    let foldBefore: number | null = null;
+    const first = usable[0];
+    if (first && s.hasMore[roomId] && first.seq > upto + 1) {
+      foldBefore = 0;
+      if (!s.loadingOlder[roomId]) {
+        const ok = relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq, until_seq: upto + 1 });
+        if (ok) set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));
+      }
+    } else {
+      const streaming = usable.find(
+        (m) => m.kind === "ai" && !m.deleted && m.seq > upto && m.seq < anchor.seq && m.status === "streaming",
+      );
+      if (streaming) foldBefore = streaming.seq;
+    }
+
     const id = crypto.randomUUID();
     if (!relay?.send({ type: "ai_start", room_id: roomId, id, anchor_id: anchor.id, model: profile.model })) {
       get().toast("Not connected to the server");
@@ -707,7 +729,7 @@ export const useChat = create<ChatState>((set, get) => {
     };
 
     backend
-      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", summary, !!stopDelegatedTracking, (ev) => {
+      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", summary, foldBefore, !!stopDelegatedTracking, (ev) => {
         if (ev.event === "delta") {
           relay?.send({ type: "ai_delta", room_id: roomId, id, delta: ev.text });
         } else if (ev.event === "reasoning") {
@@ -1105,8 +1127,10 @@ export const useChat = create<ChatState>((set, get) => {
         break;
       case "room_summary":
         // Another member's AI summarized the older history; only a newer one applies.
+        // At an equal boundary the relay's copy wins: it's the one it accepted, and a
+        // local summary for the same messages may have been refused.
         patchRoom(msg.room_id, (r) =>
-          (r.summary_upto_seq ?? 0) < msg.upto_seq ? { ...r, summary: msg.summary, summary_upto_seq: msg.upto_seq } : r,
+          (r.summary_upto_seq ?? 0) <= msg.upto_seq ? { ...r, summary: msg.summary, summary_upto_seq: msg.upto_seq } : r,
         );
         break;
       case "link_code": {

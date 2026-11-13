@@ -712,6 +712,9 @@ fn generate(
     history: Vec<HistoryItem>,
     room_prompt: String,
     summary: Option<String>,
+    // Only messages with a smaller seq may be folded into the summary (a reply
+    // still streaming, or a gap in the loaded history); None = no limit.
+    fold_before: Option<i64>,
     delegated: Option<bool>,
     on_event: Channel<GenEvent>,
 ) -> Result<(), String> {
@@ -731,7 +734,12 @@ fn generate(
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
     // The summarizing pre-step happens inside the spawned task, so the prompt is
     // built there too (with the summary it produced).
-    let fold = context::plan_summary(&history, &room_prompt, summary.as_deref().unwrap_or(""), profile.max_context_tokens);
+    let fold = context::plan_summary(&history, &room_prompt, summary.as_deref().unwrap_or(""), profile.max_context_tokens)
+        .map(|n| match fold_before {
+            Some(limit) => history[..n].iter().take_while(|h| h.seq < limit).count(),
+            None => n,
+        })
+        .filter(|&n| n > 0);
     let servers = cfg
         .mcp_for_reply(&room_id, delegated)
         .into_iter()
@@ -761,7 +769,8 @@ fn generate(
             // Fold the oldest `n` messages into a new summary first. Errors go
             // through the same scrub as replies, so the API key never appears;
             // neither the summary nor any message content is ever logged.
-            let (system, messages) = context::summary_request(&summary, &history[..n], profile.max_context_tokens);
+            // Only the prefix the request really carries counts as summarized.
+            let (system, messages, covered) = context::summary_request(&summary, &history[..n], profile.max_context_tokens);
             let req = ChatRequest {
                 model: profile.model.clone(),
                 system,
@@ -787,20 +796,24 @@ fn generate(
                 }
                 Ok::<_, String>(text)
             };
-            let outcome = tokio::select! {
-                _ = &mut stop => None,
-                r = tokio::time::timeout(SUMMARY_TIMEOUT, summarize) => match r {
-                    Ok(Ok(text)) if !text.trim().is_empty() => Some(text),
-                    _ => None,
-                },
+            let outcome = if covered == 0 {
+                None
+            } else {
+                tokio::select! {
+                    _ = &mut stop => None,
+                    r = tokio::time::timeout(SUMMARY_TIMEOUT, summarize) => match r {
+                        Ok(Ok(text)) if !text.trim().is_empty() => Some(text),
+                        _ => None,
+                    },
+                }
             };
             match outcome {
                 Some(text) => {
                     summary = text;
-                    let upto_seq = history[n - 1].seq;
+                    let upto_seq = history[covered - 1].seq;
                     let _ = on_event.send(GenEvent::Summary { text: summary.clone(), upto_seq });
                     // The folded messages leave the prompt; the summary covers them.
-                    kept = &history[n..];
+                    kept = &history[covered..];
                 }
                 None if stop.is_terminated() => {
                     // The user stopped while summarizing: no reply at all.
@@ -810,6 +823,8 @@ fn generate(
                     }
                     return;
                 }
+                // Not even one message fits next to the previous summary: trim as before.
+                None if covered == 0 => {}
                 None => {
                     let _ = on_event.send(GenEvent::Notice {
                         message: "Couldn't summarize earlier messages, so the oldest were left out".into(),
