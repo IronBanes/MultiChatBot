@@ -879,6 +879,9 @@ export const useChat = create<ChatState>((set, get) => {
           const { [msg.room_id]: _m, ...messages } = s.messages;
           const { [msg.room_id]: _l, ...loaded } = s.loaded;
           const { [msg.room_id]: _h, ...hasMore } = s.hasMore;
+          // A load_older sent around leaving is refused without an answer; a flag left
+          // set would block loading older pages (and replies waiting on them) after a rejoin.
+          const { [msg.room_id]: _o, ...loadingOlder } = s.loadingOlder;
           const client = s.client && { ...s.client, notify_by_room: withoutKey(s.client.notify_by_room, msg.room_id) };
           return {
             client,
@@ -887,6 +890,7 @@ export const useChat = create<ChatState>((set, get) => {
             messages,
             loaded,
             hasMore,
+            loadingOlder,
             activeRoomId: s.activeRoomId === msg.room_id ? (roomOrder[0] ?? null) : s.activeRoomId,
           };
         });
