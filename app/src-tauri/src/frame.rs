@@ -44,7 +44,9 @@ pub fn shell_html() -> &'static str {
       "try{window.webkitRTCPeerConnection=undefined}catch(e1){}" +
       "try{window.RTCDataChannel=undefined}catch(e1){}" +
       "try{window.RTCSessionDescription=undefined}catch(e1){}" +
-      "function __report(){parent.postMessage({type:\"mc-frame-height\",height:Math.ceil(document.documentElement.scrollHeight)},\"*\")}" +
+      // The body, not documentElement: the root's scrollHeight is never less than the
+      // frame's own height, so the frame could grow but never shrink to its content.
+      "function __report(){var b=document.body;if(!b)return;parent.postMessage({type:\"mc-frame-height\",height:Math.ceil(Math.max(b.scrollHeight,b.getBoundingClientRect().height))},\"*\")}" +
       "window.addEventListener(\"load\",__report);" +
       "var __ro=new ResizeObserver(__report);__ro.observe(document.documentElement);" +
       "document.addEventListener(\"DOMContentLoaded\",function(){if(document.body)__ro.observe(document.body)});" +

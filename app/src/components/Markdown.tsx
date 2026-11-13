@@ -136,7 +136,11 @@ function CodeBlock({ node, children }: { node?: HastNode; children?: ReactNode }
   const canPreview = !!lang && PREVIEWABLE.has(lang) && (lang !== "xml" || code.includes("<svg"));
   // AI replies only: run html blocks live unless the viewer turned it off.
   const runLive = live && lang === "html" && setting !== "off";
-  const [frame, setFrame] = useState(() => runLive && setting === "auto");
+  // null follows the setting; Run or Code overrides it for this block. Not a one-time
+  // initial value: the block first renders mid-stream (live off) and must still start
+  // running when the reply finishes.
+  const [toggled, setToggled] = useState<boolean | null>(null);
+  const frame = toggled ?? setting === "auto";
   const [expanded, setExpanded] = useState(false);
   const showFrame = runLive && frame;
 
@@ -165,7 +169,7 @@ function CodeBlock({ node, children }: { node?: HastNode; children?: ReactNode }
           )}
           {runLive && (
             <button
-              onClick={() => setFrame((f) => !f)}
+              onClick={() => setToggled(!frame)}
               className="min-h-[44px] rounded px-2 py-0.5 hover:bg-zinc-800 hover:text-zinc-100 sm:min-h-0"
             >
               {frame ? "Code" : "Run"}

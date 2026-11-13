@@ -33,7 +33,7 @@ search box that finds messages by their text and jumps straight to them.
 | `docs/PLAN.md` | WebSocket protocol, data models and context-building rules. |
 | `tools/smoke-test.mjs` | Two scripted clients that exercise the relay protocol end to end. |
 | `start.cmd`, `start.ps1`, `start.sh` | One-step setup and launch for Windows, macOS and Linux. |
-| `tools/mock-llm.mjs` | Fake OpenAI and Anthropic streaming server (reasoning, tool calls, model list) for testing without API keys. |
+| `tools/mock-llm.mjs` | Fake OpenAI and Anthropic streaming server (reasoning, tool calls, model list, and a live HTML reply that probes its sandbox when your message says "html") for testing without API keys. |
 | `tools/mock-mcp.mjs` | Tiny MCP server over stdio with `echo`, `add` and `now` tools. |
 | `branding/` | Logo concepts. |
 

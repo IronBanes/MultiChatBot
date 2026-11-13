@@ -8,7 +8,8 @@
 //           Anthropic base URL          http://127.0.0.1:9999
 // API key "bad" returns a 401 (to test error handling); "slow" streams slowly.
 // When tools are offered and your message contains "tool", the mock calls one
-// (preferring `echo`), then answers with the result.
+// (preferring `echo`), then answers with the result. A message with the word "html"
+// gets a live ```html reply that probes its sandbox (see htmlReply).
 // Each request's received context is logged, so you can check trimming/merging.
 
 import http from "node:http";
@@ -47,7 +48,35 @@ function lastHumanText(msgs) {
   return "";
 }
 
+// A live ```html reply that draws a small chart and probes its sandbox: it posts
+// {type: "mc-probe", r} to the app with what it could reach (all should be blocked
+// except the CDN script). A hit on /pixel in this log means remote images leaked.
+function htmlReply() {
+  const base = `http://127.0.0.1:${port}`;
+  return (
+    "Here is a live chart:\n\n```html\n" +
+    `<div id="out">waiting</div>\n<canvas id="c" width="220" height="90"></canvas>\n<img src="${base}/pixel" alt="">\n` +
+    `<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js" onload="window.cdn='ok'" onerror="window.cdn='blocked'"></script>\n` +
+    "<script>\n" +
+    "const r = { origin: self.origin, tauri: typeof window.__TAURI_INTERNALS__, rtc: typeof RTCPeerConnection };\n" +
+    "try { r.parentDoc = String(!!parent.document.body); } catch (e) { r.parentDoc = 'blocked'; }\n" +
+    "const tryFetch = (u, o) => fetch(u, o).then(() => 'ok', () => 'blocked');\n" +
+    "const timeout = (p) => Promise.race([p, new Promise((ok) => setTimeout(() => ok('no answer'), 3000))]);\n" +
+    "const invoke = window.__TAURI_INTERNALS__?.invoke;\n" +
+    "const tryInvoke = invoke ? timeout(Promise.resolve().then(() => invoke('get_state')).then((s) => 'OPEN ' + Object.keys(s || {}).join(','), (e) => 'blocked: ' + String(e).slice(0, 80))) : 'absent';\n" +
+    `Promise.all([tryFetch("${base}/v1/models"), tryFetch("http://ipc.localhost/plugin%3Aapp%7Cversion", { method: "POST" }), tryInvoke]).then(([f, i, v]) => {\n` +
+    "  r.fetch = f; r.ipc = i; r.invoke = v; r.cdn = window.cdn || 'pending';\n" +
+    "  parent.postMessage({ type: 'mc-probe', r }, '*');\n" +
+    "});\n" +
+    "document.getElementById('out').textContent = 'Live script ran';\n" +
+    "const x = document.getElementById('c').getContext('2d'); x.fillStyle = '#6366f1';\n" +
+    "[30, 70, 45, 85].forEach((h, i) => x.fillRect(10 + i * 52, 90 - h, 40, h));\n" +
+    "</script>\n```"
+  );
+}
+
 function reply(model, msgs) {
+  if (/\bhtml\b/i.test(lastHumanText(msgs))) return htmlReply();
   return (
     `Mock reply from **${model}**. I received ${msgs.length} message(s); the latest was:\n\n` +
     `> ${lastHumanText(msgs).slice(0, 200)}\n\n` +
@@ -72,6 +101,11 @@ function pickTool(tools, isAnthropic, said) {
 
 http
   .createServer(async (req, res) => {
+    if (req.url === "/pixel") {
+      console.log("\nGET /pixel: a live HTML reply loaded a remote image");
+      res.end();
+      return;
+    }
     let body = "";
     for await (const c of req) body += c;
     let json = {};
