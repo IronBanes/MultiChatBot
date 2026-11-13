@@ -272,6 +272,8 @@ The boundary never passes a message the summary didn't see:
 - **Prefix only.** The summary request carries the oldest folded messages that fit the
   input budget. `upto_seq` is the last one it really carried, and the rest stay in the
   reply's history. An oldest message too long to fit on its own goes in cut short.
+  The boundary also moves back so the reply's history starts with a human message,
+  because a leading AI reply would otherwise be dropped from the prompt.
 - **No gaps.** The device only summarizes when its loaded messages reach back to the
   boundary (or, with no summary yet, to the start of the room). Otherwise it loads the
   missing pages with `load_older` and this reply trims as before.
