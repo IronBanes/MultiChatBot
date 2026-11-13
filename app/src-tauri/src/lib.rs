@@ -766,7 +766,9 @@ fn generate(
                 model: profile.model.clone(),
                 system,
                 messages,
-                max_output_tokens: 1024,
+                // The same reserve the summary request leaves free: thinking models
+                // spend part of it reasoning before the summary text starts.
+                max_output_tokens: context::output_reserve(profile.max_context_tokens),
                 temperature: profile.temperature,
                 show_reasoning: false,
                 reasoning_effort: None,

@@ -467,7 +467,7 @@ function SummaryDivider({ summary }: { summary: string }) {
       >
         {open ? "Hide summary" : "Show summary"}
       </button>
-      {open && <p className="whitespace-pre-wrap text-xs text-zinc-500 dark:text-zinc-400">{summary}</p>}
+      {open && <p className="w-full whitespace-pre-wrap text-left text-xs text-zinc-500 dark:text-zinc-400">{summary}</p>}
     </div>
   );
 }
@@ -944,7 +944,7 @@ function MessageList({
 
   // The summary boundary: shown only when a summarized message is on screen, so
   // the divider marks a real edge of the AI's context, not a far-off one.
-  const upto = room.summary_upto_seq;
+  const upto = room.summary_upto_seq ?? 0;
   const showSummaryDivider =
     upto > 0 && list.some((m) => m.seq <= upto) && list.some((m) => m.seq > upto);
   const firstAfterSummary = showSummaryDivider ? list.findIndex((m) => m.seq > upto) : -1;

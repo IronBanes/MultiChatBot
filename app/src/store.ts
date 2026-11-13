@@ -674,8 +674,12 @@ export const useChat = create<ChatState>((set, get) => {
     const usable = s.messages[roomId] ?? [];
     const byId = new Map(usable.map((m) => [m.id, m]));
     // Messages the room's shared summary already covers are replaced by it, so
-    // they don't widen the prompt.
-    const upto = room?.summary_upto_seq ?? 0;
+    // they don't widen the prompt. A reply to a message the summary already covers
+    // (a regenerate further up) uses the full history instead: the summary would
+    // describe what comes after its anchor. Missing on an older relay: no summary.
+    const covered = room?.summary_upto_seq ?? 0;
+    const upto = anchor.seq > covered ? covered : 0;
+    const summary = upto > 0 ? (room?.summary ?? "") : "";
     const history: HistoryItem[] = usable
       .filter((m) => m.seq <= anchor.seq && m.seq > upto && !m.deleted && (m.kind === "human" || m.status === "complete"))
       .map((m) => ({ kind: m.kind, author_name: m.author_name, content: historyText(m, byId), seq: m.seq }));
@@ -703,7 +707,7 @@ export const useChat = create<ChatState>((set, get) => {
     };
 
     backend
-      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", room?.summary ?? "", !!stopDelegatedTracking, (ev) => {
+      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", summary, !!stopDelegatedTracking, (ev) => {
         if (ev.event === "delta") {
           relay?.send({ type: "ai_delta", room_id: roomId, id, delta: ev.text });
         } else if (ev.event === "reasoning") {
@@ -751,7 +755,7 @@ export const useChat = create<ChatState>((set, get) => {
           // every member's AI uses the same one.
           relay?.send({ type: "set_room_summary", room_id: roomId, summary: ev.text, upto_seq: ev.upto_seq });
           patchRoom(roomId, (r) =>
-            r.summary_upto_seq < ev.upto_seq ? { ...r, summary: ev.text, summary_upto_seq: ev.upto_seq } : r,
+            (r.summary_upto_seq ?? 0) < ev.upto_seq ? { ...r, summary: ev.text, summary_upto_seq: ev.upto_seq } : r,
           );
         } else if (ev.event === "notice") {
           get().toast(ev.message, "info");
@@ -1102,7 +1106,7 @@ export const useChat = create<ChatState>((set, get) => {
       case "room_summary":
         // Another member's AI summarized the older history; only a newer one applies.
         patchRoom(msg.room_id, (r) =>
-          r.summary_upto_seq < msg.upto_seq ? { ...r, summary: msg.summary, summary_upto_seq: msg.upto_seq } : r,
+          (r.summary_upto_seq ?? 0) < msg.upto_seq ? { ...r, summary: msg.summary, summary_upto_seq: msg.upto_seq } : r,
         );
         break;
       case "link_code": {
