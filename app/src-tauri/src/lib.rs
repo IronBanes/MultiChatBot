@@ -770,7 +770,7 @@ fn generate(
             // through the same scrub as replies, so the API key never appears;
             // neither the summary nor any message content is ever logged.
             // Only the prefix the request really carries counts as summarized.
-            let (system, messages, covered) = context::summary_request(&summary, &history[..n], profile.max_context_tokens);
+            let (system, messages, covered) = context::fold_request(&summary, &history, n, profile.max_context_tokens);
             let req = ChatRequest {
                 model: profile.model.clone(),
                 system,

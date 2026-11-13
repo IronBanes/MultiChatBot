@@ -194,6 +194,33 @@ New messages to fold in:
     (system.to_string(), vec![ChatMessage { role: Role::User, content: text }], covered)
 }
 
+/// `summary_request` for the oldest `n` items of `history`, with the boundary moved
+/// back so the history left for the reply starts with a human message: `build`
+/// drops leading assistant turns, so an AI reply right after the boundary would be
+/// in neither the summary nor the prompt. Returns the request and how many items it
+/// covers (0 = nothing can be folded).
+pub fn fold_request(
+    previous: &str,
+    history: &[HistoryItem],
+    n: usize,
+    max_context_tokens: u32,
+) -> (String, Vec<ChatMessage>, usize) {
+    let starts_with_ai = |at: usize| history.get(at).is_some_and(|h| h.kind == Kind::Ai);
+    let mut limit = n.min(history.len());
+    loop {
+        while limit > 0 && starts_with_ai(limit) {
+            limit -= 1;
+        }
+        let (system, messages, covered) = summary_request(previous, &history[..limit], max_context_tokens);
+        // Covered everything up to a human message (or nothing): done. Otherwise the
+        // budget cut it short of an AI reply; try again from before that reply.
+        if covered == 0 || !starts_with_ai(covered) {
+            return (system, messages, covered);
+        }
+        limit = covered;
+    }
+}
+
 pub fn build(history: &[HistoryItem], room_prompt: &str, summary: &str, max_context_tokens: u32) -> Prompt {
     let system = system_prompt(room_prompt, summary);
     let converted: Vec<ChatMessage> = history
@@ -331,6 +358,20 @@ mod tests {
         assert!(messages[0].content.ends_with(" [...]
 "));
         assert!(estimate_tokens(&messages[0].content) <= budget);
+    }
+
+    #[test]
+    fn fold_request_leaves_a_human_message_first() {
+        let history = vec![human("A", "one"), ai("two"), human("B", "three"), ai("four"), human("C", "five")];
+        // Folding 3 would leave "four" (AI) first: the boundary moves back to 2.
+        let (_, messages, covered) = fold_request("", &history, 3, 100_000);
+        assert_eq!(covered, 2);
+        assert!(messages[0].content.contains("[A]: one"));
+        assert!(!messages[0].content.contains("three"));
+        // Folding 4 leaves "five" (human) first: unchanged.
+        assert_eq!(fold_request("", &history, 4, 100_000).2, 4);
+        // Folding 1 leaves "two" (AI) first, so nothing can be folded.
+        assert_eq!(fold_request("", &history, 1, 100_000).2, 0);
     }
 
     #[test]
