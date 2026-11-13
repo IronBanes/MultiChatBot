@@ -3,6 +3,7 @@
 
 mod config;
 mod context;
+mod frame;
 mod generate;
 mod host;
 mod mcp;
@@ -812,6 +813,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_websocket::init())
         .plugin(tauri_plugin_notification::init())
+        // The frame shell for live HTML in AI replies: a page from its own origin,
+        // with its own CSP, so scripts in model HTML can run (see frame.rs).
+        .register_uri_scheme_protocol(frame::SCHEME, |_ctx, request| frame::respond(&request))
         .setup(|app| {
             let base = app.path().app_config_dir()?;
             let config_path = config::config_path(&base);
