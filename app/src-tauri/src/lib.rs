@@ -774,6 +774,9 @@ fn generate(
             // neither the summary nor any message content is ever logged.
             let max = profile.max_context_tokens;
             let mut next = summary.clone();
+            // The summary as of the last fully covered message: what gets published,
+            // so part of a message that never finished stays out of it.
+            let mut checkpoint = summary.clone();
             let (mut done, mut from) = (0usize, 0usize);
             let mut failed = false;
             let mut stopped = false;
@@ -843,12 +846,14 @@ fn generate(
                 match step {
                     Step::Items(c) => {
                         done += c;
+                        checkpoint = next.clone();
                         // fold_request ends the fold before a human message; that's enough
                         // for this reply.
                         break;
                     }
                     Step::Part(end) if end >= history[done].content.chars().count() => {
                         done += 1;
+                        checkpoint = next.clone();
                         from = 0;
                     }
                     Step::Part(end) => from = end,
@@ -865,7 +870,7 @@ fn generate(
             if done > 0 {
                 // A message only partly summarized stays out of the boundary, so it's
                 // read again from its start next time.
-                summary = next;
+                summary = checkpoint;
                 let upto_seq = history[done - 1].seq;
                 let _ = on_event.send(GenEvent::Summary { text: summary.clone(), upto_seq });
                 // The folded messages leave the prompt; the summary covers them.

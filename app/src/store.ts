@@ -865,6 +865,9 @@ export const useChat = create<ChatState>((set, get) => {
           relay?.send({ type: "ai_request_failed", request_id: p.requestId, to_device_id: p.fromDeviceId, message: "Couldn't load the room" });
         }
         pendingDelegatedOpens.delete(msg.room_id);
+        // Replies that waited for older history can't start after leaving the room.
+        for (const start of pendingAiStarts.get(msg.room_id) ?? []) start.fail?.("This computer isn't in that room anymore");
+        pendingAiStarts.delete(msg.room_id);
         // The room is gone; its notification choice (and in-flight throttle) go too.
         notifyState.delete(msg.room_id);
         queueNotifyWrite(() => backend.forgetRoomNotify(msg.room_id)).catch(() => {});
