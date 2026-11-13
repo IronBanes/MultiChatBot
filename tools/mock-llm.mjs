@@ -9,7 +9,8 @@
 // API key "bad" returns a 401 (to test error handling); "slow" streams slowly.
 // When tools are offered and your message contains "tool", the mock calls one
 // (preferring `echo`), then answers with the result. A message with the word "html"
-// gets a live ```html reply that probes its sandbox (see htmlReply).
+// gets a live ```html reply that probes its sandbox (see htmlReply); "html navigate"
+// gets one that navigates its frame away (see navigateReply).
 // Each request's received context is logged, so you can check trimming/merging.
 
 import http from "node:http";
@@ -78,8 +79,29 @@ function htmlReply() {
   );
 }
 
+// A live ```html reply that navigates its own frame to /away on this server. The
+// app should stop the frame; a "GET /away" line here shows the navigation happened.
+function navigateReply() {
+  return (
+    "This one tries to leave its frame:\n\n```html\n" +
+    "<p>Leaving in a moment…</p>\n" +
+    `<script>setTimeout(() => { location.href = "http://127.0.0.1:${port}/away"; }, 800);</script>\n` +
+    "```"
+  );
+}
+
+// The page a navigating frame lands on: it asks the app for the block's HTML, the way
+// the shell does, and reports whether it got an answer.
+const AWAY_PAGE =
+  "<!doctype html><h1>Outside page</h1><script>" +
+  "addEventListener('message', (e) => fetch('/away-got?' + encodeURIComponent(String(e.data?.type))));" +
+  "parent.postMessage({ type: 'mc-frame-ready' }, '*');" +
+  "</script>";
+
 function reply(model, msgs) {
-  if (/\bhtml\b/i.test(lastHumanText(msgs))) return htmlReply();
+  const last = lastHumanText(msgs);
+  if (/\bhtml\b/i.test(last) && /\bnavigate\b/i.test(last)) return navigateReply();
+  if (/\bhtml\b/i.test(last)) return htmlReply();
   return (
     `Mock reply from **${model}**. I received ${msgs.length} message(s); the latest was:\n\n` +
     `> ${lastHumanText(msgs).slice(0, 200)}\n\n` +
@@ -106,6 +128,17 @@ http
   .createServer(async (req, res) => {
     if (req.url === "/pixel") {
       console.log("\nGET /pixel: a live HTML reply loaded a remote image");
+      res.end();
+      return;
+    }
+    if (req.url === "/away") {
+      console.log("\nGET /away: a live HTML reply navigated its frame here");
+      res.writeHead(200, { "content-type": "text/html" });
+      res.end(AWAY_PAGE);
+      return;
+    }
+    if (req.url?.startsWith("/away-got")) {
+      console.log(`\nGET ${req.url}: the outside page got a message from the app`);
       res.end();
       return;
     }

@@ -56,23 +56,40 @@ const FRAME_SRC = convertFileSrc("frame.html", "mcframe");
 interface FrameMessage {
   type?: unknown;
   height?: unknown;
+  token?: unknown;
 }
 
 /** The live ```html viewer: a sandboxed frame that renders `html` and reports its height. */
 function LiveFrame({ html, fill, onEscape }: { html: string; fill?: boolean; onEscape?: () => void }) {
   const ref = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(160);
+  const [left, setLeft] = useState(false);
+  // The HTML goes out once per frame. The shell never reloads on its own (new content
+  // remounts the frame), so a second "ready" comes from a page the block navigated to.
+  // The sandbox stays in force after a navigation, so origin and source can't tell
+  // that page from the shell.
+  const rendered = useRef(false);
+  // Identifies this frame's "left" message, whose source no longer matches after a navigation.
+  const [token] = useState(() => crypto.randomUUID());
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
-      const win = ref.current?.contentWindow;
       // The sandboxed shell has an opaque origin, which reports as "null".
-      if (!win || e.source !== win || e.origin !== "null") return;
+      if (e.origin !== "null") return;
       const data = e.data as FrameMessage | null | undefined;
       if (!data || typeof data !== "object") return;
+      if (data.type === "mc-frame-left" && data.token === token) {
+        // The block navigated its frame away: drop the frame so no outside page shows here.
+        setLeft(true);
+        return;
+      }
+      const win = ref.current?.contentWindow;
+      if (!win || e.source !== win) return;
       if (data.type === "mc-frame-ready") {
+        if (rendered.current) return;
+        rendered.current = true;
         // The sandboxed frame has an opaque origin, so target "*"; only that window listens.
         win.postMessage(
-          { type: "mc-frame-render", html, dark: document.documentElement.classList.contains("dark") },
+          { type: "mc-frame-render", html, token, dark: document.documentElement.classList.contains("dark") },
           "*",
         );
       } else if (data.type === "mc-frame-height" && typeof data.height === "number" && Number.isFinite(data.height)) {
@@ -85,7 +102,10 @@ function LiveFrame({ html, fill, onEscape }: { html: string; fill?: boolean; onE
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [html, fill, onEscape]);
+  }, [html, fill, onEscape, token]);
+  if (left) {
+    return <p className="p-3 text-sm text-zinc-400">This block tried to open another page, so it was stopped.</p>;
+  }
   return (
     <iframe
       ref={ref}

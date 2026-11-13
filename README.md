@@ -476,9 +476,10 @@ message, generated with your own model.
   **Expand** opens one full-window, and **Code** shows the source instead. The sandbox can't
   reach the app, your keys or the chat, can't fetch data (no XHR, WebSocket or remote images)
   and can't nest frames; scripts may load from cdnjs.cloudflare.com, cdn.jsdelivr.net and
-  unpkg.com. It's best effort: a page can still navigate its own frame to a website, which
-  would reveal your IP address to that site, so use **Click to run** or **Off** in rooms you
-  don't trust. Human messages keep the script-free preview.
+  unpkg.com. It's best effort: a page can still navigate its own frame to a website. The app
+  then removes the frame and says so, but the visit has already revealed your IP address to
+  that site, so use **Click to run** or **Off** in rooms you don't trust. Human messages keep
+  the script-free preview.
 - MCP tool arguments and results are never sent to the relay (only to the MCP server
   itself); the relay only stores tool names and statuses. Use **Ask** mode for servers that can change files or send data.
 - The HTML, SVG and CSS preview runs in an `<iframe sandbox="">`, so scripts, forms and

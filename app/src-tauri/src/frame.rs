@@ -33,6 +33,7 @@ pub fn shell_html() -> &'static str {
     if (!d || typeof d !== "object") return;
     if (d.type !== "mc-frame-render") return;
     if (typeof d.html !== "string" || typeof d.dark !== "boolean") return;
+    if (typeof d.token !== "string" || !/^[0-9a-f-]{36}$/.test(d.token)) return;
     window.removeEventListener("message", onMessage);
     var prelude =
       "<!doctype html><meta charset=\"utf-8\"><style>" +
@@ -48,6 +49,12 @@ pub fn shell_html() -> &'static str {
       // frame's own height, so the frame could grow but never shrink to its content.
       "function __report(){var b=document.body;if(!b)return;parent.postMessage({type:\"mc-frame-height\",height:Math.ceil(Math.max(b.scrollHeight,b.getBoundingClientRect().height))},\"*\")}" +
       "window.addEventListener(\"load\",__report);" +
+      // pagehide fires when this document unloads for a navigation (document.open in
+      // the shell doesn't unload it), so the app can stop the frame before an outside
+      // page stays on screen.
+      // The message's source no longer matches the frame once it has navigated, so the
+      // app matches the token instead (checked to be a UUID below, so it can't break out).
+      "window.addEventListener(\"pagehide\",function(){parent.postMessage({type:\"mc-frame-left\",token:\"" + d.token + "\"},\"*\")});" +
       // Keys typed in the frame don't reach the app, so forward Escape (closes Expand).
       "document.addEventListener(\"keydown\",function(e){if(e.key===\"Escape\")parent.postMessage({type:\"mc-frame-escape\"},\"*\")},true);" +
       "var __ro=new ResizeObserver(__report);__ro.observe(document.documentElement);" +
@@ -118,6 +125,16 @@ mod tests {
         assert_eq!(r.headers()["X-Content-Type-Options"], "nosniff");
         assert_eq!(r.headers()["Cache-Control"], "no-store");
         assert_eq!(r.body().as_slice(), shell_html().as_bytes());
+    }
+
+    #[test]
+    fn shell_checks_the_token_before_writing_it_into_a_script() {
+        // The token is concatenated into the prelude's script, so it must be validated first.
+        let shell = shell_html();
+        let check = shell.find("/^[0-9a-f-]{36}$/.test(d.token)").expect("token check");
+        let used = shell.find("d.token + ").expect("token use");
+        assert!(check < used);
+        assert!(shell.contains("mc-frame-left"));
     }
 
     #[test]
