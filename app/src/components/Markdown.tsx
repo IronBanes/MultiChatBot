@@ -59,13 +59,14 @@ interface FrameMessage {
 }
 
 /** The live ```html viewer: a sandboxed frame that renders `html` and reports its height. */
-function LiveFrame({ html, fill }: { html: string; fill?: boolean }) {
+function LiveFrame({ html, fill, onEscape }: { html: string; fill?: boolean; onEscape?: () => void }) {
   const ref = useRef<HTMLIFrameElement>(null);
   const [height, setHeight] = useState(160);
   useEffect(() => {
     const onMessage = (e: MessageEvent) => {
       const win = ref.current?.contentWindow;
-      if (!win || e.source !== win) return;
+      // The sandboxed shell has an opaque origin, which reports as "null".
+      if (!win || e.source !== win || e.origin !== "null") return;
       const data = e.data as FrameMessage | null | undefined;
       if (!data || typeof data !== "object") return;
       if (data.type === "mc-frame-ready") {
@@ -77,11 +78,14 @@ function LiveFrame({ html, fill }: { html: string; fill?: boolean }) {
       } else if (data.type === "mc-frame-height" && typeof data.height === "number" && Number.isFinite(data.height)) {
         // The overlay is full height, so only the inline view resizes.
         if (!fill) setHeight(Math.min(Math.max(data.height, 40), 2000));
+      } else if (data.type === "mc-frame-escape") {
+        // Keys pressed inside the frame never reach this window, so the shell forwards Escape.
+        onEscape?.();
       }
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [html, fill]);
+  }, [html, fill, onEscape]);
   return (
     <iframe
       ref={ref}
@@ -120,7 +124,7 @@ function LiveFrameOverlay({ html, onClose }: { html: string; onClose: () => void
         </button>
       </div>
       <div className="min-h-0 flex-1 px-3 pb-3" onMouseDown={(e) => e.stopPropagation()}>
-        <LiveFrame html={html} fill />
+        <LiveFrame html={html} fill onEscape={onClose} />
       </div>
     </div>
   );

@@ -48,6 +48,8 @@ pub fn shell_html() -> &'static str {
       // frame's own height, so the frame could grow but never shrink to its content.
       "function __report(){var b=document.body;if(!b)return;parent.postMessage({type:\"mc-frame-height\",height:Math.ceil(Math.max(b.scrollHeight,b.getBoundingClientRect().height))},\"*\")}" +
       "window.addEventListener(\"load\",__report);" +
+      // Keys typed in the frame don't reach the app, so forward Escape (closes Expand).
+      "document.addEventListener(\"keydown\",function(e){if(e.key===\"Escape\")parent.postMessage({type:\"mc-frame-escape\"},\"*\")},true);" +
       "var __ro=new ResizeObserver(__report);__ro.observe(document.documentElement);" +
       "document.addEventListener(\"DOMContentLoaded\",function(){if(document.body)__ro.observe(document.body)});" +
       "<\/script>" +

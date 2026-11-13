@@ -60,13 +60,16 @@ function htmlReply() {
     "<script>\n" +
     "const r = { origin: self.origin, tauri: typeof window.__TAURI_INTERNALS__, rtc: typeof RTCPeerConnection };\n" +
     "try { r.parentDoc = String(!!parent.document.body); } catch (e) { r.parentDoc = 'blocked'; }\n" +
-    "const tryFetch = (u, o) => fetch(u, o).then(() => 'ok', () => 'blocked');\n" +
+    // no-cors: a request that reaches a server resolves (opaque), so a rejection means
+    // the request was refused before it left (CSP). Confirm with this server's log too.
+    "const tryFetch = (u, o) => fetch(u, { ...o, mode: 'no-cors' }).then(() => 'REACHED', () => 'blocked');\n" +
     "const timeout = (p) => Promise.race([p, new Promise((ok) => setTimeout(() => ok('no answer'), 3000))]);\n" +
     "const invoke = window.__TAURI_INTERNALS__?.invoke;\n" +
     "const tryInvoke = invoke ? timeout(Promise.resolve().then(() => invoke('get_state')).then((s) => 'OPEN ' + Object.keys(s || {}).join(','), (e) => 'blocked: ' + String(e).slice(0, 80))) : 'absent';\n" +
     `Promise.all([tryFetch("${base}/v1/models"), tryFetch("http://ipc.localhost/plugin%3Aapp%7Cversion", { method: "POST" }), tryInvoke]).then(([f, i, v]) => {\n` +
     "  r.fetch = f; r.ipc = i; r.invoke = v; r.cdn = window.cdn || 'pending';\n" +
     "  parent.postMessage({ type: 'mc-probe', r }, '*');\n" +
+    "  const pre = document.createElement('pre'); pre.textContent = JSON.stringify(r, null, 1); document.body.append(pre);\n" +
     "});\n" +
     "document.getElementById('out').textContent = 'Live script ran';\n" +
     "const x = document.getElementById('c').getContext('2d'); x.fillStyle = '#6366f1';\n" +

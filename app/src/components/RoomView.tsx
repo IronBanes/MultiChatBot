@@ -654,8 +654,9 @@ const MessageItem = memo(function MessageItem({
       )}
       {m.attachments.length > 0 && <Gallery attachments={m.attachments} />}
       {m.content ? (
-        // Live HTML only in finished AI replies: a half-streamed block must not run.
-        <Markdown text={m.content} live={!streaming} />
+        // Live HTML only in complete AI replies: a half-streamed, failed or interrupted
+        // reply may hold a partial block, which must not run.
+        <Markdown text={m.content} live={m.status === "complete"} />
       ) : streaming && !m.reasoning && m.tools.length === 0 && m.attachments.length === 0 ? (
         <span className="text-sm text-zinc-400">Thinking…</span>
       ) : null}
