@@ -20,6 +20,8 @@ CREATE TABLE IF NOT EXISTS rooms (
     name TEXT NOT NULL,
     invite_code TEXT NOT NULL UNIQUE,
     system_prompt TEXT NOT NULL DEFAULT '',
+    summary TEXT NOT NULL DEFAULT '',
+    summary_upto_seq INTEGER NOT NULL DEFAULT 0,
     created_by TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
@@ -109,6 +111,8 @@ pub async fn connect(path: &str) -> anyhow::Result<Db> {
     sqlx::raw_sql(SCHEMA).execute(&pool).await?;
     // Columns added after the first release; existing databases need them too.
     for ddl in [
+        "ALTER TABLE rooms ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE rooms ADD COLUMN summary_upto_seq INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE messages ADD COLUMN reasoning TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE messages ADD COLUMN tools TEXT NOT NULL DEFAULT '[]'",
         "ALTER TABLE messages ADD COLUMN edited_at INTEGER",
@@ -269,17 +273,22 @@ pub struct RoomRow {
     pub name: String,
     pub invite_code: String,
     pub system_prompt: String,
+    /// Conversation summary of the messages up to `summary_upto_seq` ("" = none).
+    pub summary: String,
+    /// `seq` of the last message the summary covers; 0 = no summary.
+    pub summary_upto_seq: i64,
     /// (user_id, display_name)
     pub members: Vec<(String, String)>,
 }
 
 pub async fn room(db: &Db, room_id: &str) -> sqlx::Result<Option<RoomRow>> {
-    let row: Option<(String, String, String, String)> =
-        sqlx::query_as("SELECT id, name, invite_code, system_prompt FROM rooms WHERE id = ?")
-            .bind(room_id)
-            .fetch_optional(db)
-            .await?;
-    let Some((id, name, invite_code, system_prompt)) = row else {
+    let row: Option<(String, String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, name, invite_code, system_prompt, summary, summary_upto_seq FROM rooms WHERE id = ?",
+    )
+    .bind(room_id)
+    .fetch_optional(db)
+    .await?;
+    let Some((id, name, invite_code, system_prompt, summary, summary_upto_seq)) = row else {
         return Ok(None);
     };
     let members: Vec<(String, String)> = sqlx::query_as(
@@ -289,7 +298,7 @@ pub async fn room(db: &Db, room_id: &str) -> sqlx::Result<Option<RoomRow>> {
     .bind(room_id)
     .fetch_all(db)
     .await?;
-    Ok(Some(RoomRow { id, name, invite_code, system_prompt, members }))
+    Ok(Some(RoomRow { id, name, invite_code, system_prompt, summary, summary_upto_seq, members }))
 }
 
 /// Short human-readable code used for room invites and device linking.
@@ -379,6 +388,32 @@ pub async fn set_room_prompt(db: &Db, room_id: &str, prompt: &str) -> sqlx::Resu
         .execute(db)
         .await?;
     Ok(())
+}
+
+/// Stores a room's conversation summary covering messages up to `upto_seq`. The
+/// single compare-and-set keeps the summary moving forward (an older or equal
+/// `upto_seq` is refused) and never past the room's last message, so concurrent
+/// writers are safe without a new lock. Returns whether the summary was stored.
+pub async fn set_room_summary(
+    db: &Db,
+    room_id: &str,
+    summary: &str,
+    upto_seq: i64,
+) -> sqlx::Result<bool> {
+    let rows = sqlx::query(
+        "UPDATE rooms SET summary = ?, summary_upto_seq = ? WHERE id = ? AND summary_upto_seq < ?
+         AND ? <= (SELECT COALESCE(MAX(seq), 0) FROM messages WHERE room_id = ?)",
+    )
+    .bind(summary)
+    .bind(upto_seq)
+    .bind(room_id)
+    .bind(upto_seq)
+    .bind(upto_seq)
+    .bind(room_id)
+    .execute(db)
+    .await?
+    .rows_affected();
+    Ok(rows > 0)
 }
 
 // `attachments` and `reactions` are filled in by `with_attachments` / `with_reactions`.
@@ -1167,6 +1202,58 @@ mod tests {
         db.close().await;
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[tokio::test]
+    async fn set_room_summary_moves_forward_only_within_history() {
+        let dir = std::env::temp_dir().join(format!("mc-summary-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = connect(dir.join("t.db").to_str().unwrap()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO users (id, display_name, updated_at) VALUES ('a', 'A', 0);
+             INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('r', 'R', 'X', 'a', 0);
+             INSERT INTO members VALUES ('r', 'a', 0);",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let msg = |id, content| NewMessage {
+            id,
+            room_id: "r",
+            kind: "human",
+            author_id: "a",
+            author_name: "A",
+            content,
+            ai_requested: false,
+            anchor_id: None,
+            model: None,
+            reply_to: None,
+            status: "complete",
+        };
+        let m1 = insert_message(&db, msg("m1", "one")).await.unwrap();
+        let m2 = insert_message(&db, msg("m2", "two")).await.unwrap();
+        // A room without messages can't take a summary: nothing to cover.
+        sqlx::raw_sql("INSERT INTO rooms (id, name, invite_code, created_by, created_at) VALUES ('empty', 'E', 'Y', 'a', 0)")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(!set_room_summary(&db, "empty", "empty room", 1).await.unwrap());
+        // The first summary covering m1 goes in.
+        assert!(set_room_summary(&db, "r", "first", m1.seq).await.unwrap());
+        let row = room(&db, "r").await.unwrap().unwrap();
+        assert_eq!(row.summary, "first");
+        assert_eq!(row.summary_upto_seq, m1.seq);
+        // An older or equal `upto_seq` is refused.
+        assert!(!set_room_summary(&db, "r", "worse", m1.seq).await.unwrap());
+        assert!(!set_room_summary(&db, "r", "older", m1.seq - 1).await.unwrap());
+        // A newer summary still within the history moves it forward.
+        assert!(set_room_summary(&db, "r", "second", m2.seq).await.unwrap());
+        assert_eq!(room(&db, "r").await.unwrap().unwrap().summary_upto_seq, m2.seq);
+        // An `upto_seq` past the last message is refused.
+        assert!(!set_room_summary(&db, "r", "beyond", m2.seq + 1).await.unwrap());
+        assert_eq!(room(&db, "r").await.unwrap().unwrap().summary, "second");
+        db.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn account_secrets_are_checked_claimed_and_never_stored() {
         let dir = std::env::temp_dir().join(format!("mc-secret-{}", uuid::Uuid::new_v4()));

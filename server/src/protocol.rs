@@ -99,6 +99,13 @@ pub enum ClientMsg {
         room_id: String,
         system_prompt: String,
     },
+    /// Stores the room's shared summary of messages up to `upto_seq`. Only moves
+    /// forward and never past the room's last message.
+    SetRoomSummary {
+        room_id: String,
+        summary: String,
+        upto_seq: i64,
+    },
     React {
         room_id: String,
         message_id: String,
@@ -283,6 +290,13 @@ pub enum ServerMsg {
         system_prompt: String,
         updated_by: String,
     },
+    /// A room's summary moved forward: every member's AI uses the same one.
+    RoomSummary {
+        room_id: String,
+        summary: String,
+        upto_seq: i64,
+        updated_by: String,
+    },
     /// The message's full current reaction list; clients just replace.
     Reactions {
         room_id: String,
@@ -342,6 +356,10 @@ pub struct RoomInfo {
     pub name: String,
     pub invite_code: String,
     pub system_prompt: String,
+    /// Conversation summary of the messages up to `summary_upto_seq` ("" = none).
+    pub summary: String,
+    /// `seq` of the last message the summary covers; 0 = no summary.
+    pub summary_upto_seq: i64,
     pub members: Vec<Member>,
 }
 

@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
 import { mentions, parseRemoteProfileId, remoteMode, remoteProfileId } from "../store";
@@ -446,6 +446,29 @@ function ReplyQuote({
     >
       ↪ <span style={{ color: memberColor(orig.author_id) }}>{orig.author_name}</span>: {snippet(orig.content, 80)}
     </button>
+  );
+}
+
+/** Where the room's shared summary ends: shown in the message list so it's
+ *  clear which messages the AI sees as themselves and which only as a summary.
+ *  Kept out of `MessageItem`, which must stay memoized. */
+function SummaryDivider({ summary }: { summary: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="mx-auto my-3 flex max-w-md flex-col items-center gap-1 px-4 text-center">
+      <div className="flex w-full items-center gap-2">
+        <span className="h-px flex-1 bg-zinc-200 dark:bg-zinc-700" />
+        <span className="text-xs text-zinc-500">Earlier messages are summarized for the AI</span>
+        <span className="h-px flex-1 bg-zinc-200 dark:bg-zinc-700" />
+      </div>
+      <button
+        onClick={() => setOpen(!open)}
+        className="min-h-[44px] sm:min-h-0 rounded-md px-3 text-xs font-medium text-zinc-500 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-300"
+      >
+        {open ? "Hide summary" : "Show summary"}
+      </button>
+      {open && <p className="w-full whitespace-pre-wrap text-left text-xs text-zinc-500 dark:text-zinc-400">{summary}</p>}
+    </div>
   );
 }
 
@@ -919,6 +942,13 @@ function MessageList({
     clearJump();
   }, [jumpTarget, room.id, onJump, clearJump]);
 
+  // The summary boundary: shown only when a summarized message is on screen, so
+  // the divider marks a real edge of the AI's context, not a far-off one.
+  const upto = room.summary_upto_seq ?? 0;
+  const showSummaryDivider =
+    upto > 0 && list.some((m) => m.seq <= upto) && list.some((m) => m.seq > upto);
+  const firstAfterSummary = showSummaryDivider ? list.findIndex((m) => m.seq > upto) : -1;
+
   return (
     <div ref={ref} onScroll={onScroll} className={`min-h-0 flex-1 overflow-y-auto ${bubbles ? "overscroll-contain pb-9" : "pb-8"}`}>
       {/* The bottom padding keeps the last row clear of the floating typing indicator. */}
@@ -948,22 +978,24 @@ function MessageList({
             m.kind === "human" && prev?.kind === "human" && prev.author_id === m.author_id && m.created_at - prev.created_at < 5 * 60_000;
           const anchor = m.anchor_id ? byId.get(m.anchor_id) : undefined;
           return (
-            <MessageItem
-              key={m.id}
-              m={m}
-              anchor={anchor}
-              replyOriginal={m.reply_to ? byId.get(m.reply_to) : undefined}
-              showAnchor={!!anchor && prev?.id !== anchor.id}
-              compact={compact}
-              myProfileId={myProfileId}
-              mine={m.author_id === myId}
-              myName={myName}
-              bubbles={bubbles}
-              members={members}
-              onEdit={onEdit}
-              onReply={onReply}
-              onJump={onJump}
-            />
+            <Fragment key={m.id}>
+              {i === firstAfterSummary && <SummaryDivider summary={room.summary} />}
+              <MessageItem
+                m={m}
+                anchor={anchor}
+                replyOriginal={m.reply_to ? byId.get(m.reply_to) : undefined}
+                showAnchor={!!anchor && prev?.id !== anchor.id}
+                compact={compact}
+                myProfileId={myProfileId}
+                mine={m.author_id === myId}
+                myName={myName}
+                bubbles={bubbles}
+                members={members}
+                onEdit={onEdit}
+                onReply={onReply}
+                onJump={onJump}
+              />
+            </Fragment>
           );
         })}
       </div>

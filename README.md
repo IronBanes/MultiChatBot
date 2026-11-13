@@ -435,6 +435,14 @@ add a `ProviderKind` variant.
      rough estimate of 4 characters per token. The system prompt and your message are
      always kept.
    - The group-chat system prompt is followed by the room's shared instructions, if any.
+
+When a chat grows too long for the profile's context, the oldest messages are no
+longer just dropped: the device writing the reply first asks its model to summarize
+them (the newest messages stay verbatim) and shares that summary with the room through
+the relay, so every member's AI works from the same summary instead of silently
+forgetting different things. The summary appears in the room as a small "Earlier
+messages are summarized for the AI" divider with a "Show summary" button; if
+summarizing fails, the reply falls back to trimming, as before.
 3. Rust streams from the provider and batches deltas about every 100 ms. Your client
    relays text as `ai_delta` and reasoning as `ai_reasoning`. When the model calls MCP
    tools, Rust runs them (asking you first in **Ask** mode), reports each call's status

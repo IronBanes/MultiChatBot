@@ -34,6 +34,9 @@ pub enum ToolStatus {
 pub enum GenEvent {
     Delta { text: String },
     Reasoning { text: String },
+    /// The room's new shared summary, covering messages up to `upto_seq`. The
+    /// webview stores it with the relay, so every member's AI uses it.
+    Summary { text: String, upto_seq: i64 },
     /// Tool activity. `args` and `detail` are for the sender's eyes only.
     Tool { call_id: String, server: String, tool: String, status: ToolStatus, args: Option<String>, detail: Option<String> },
     /// An image a tool produced, to share with the room (base64).
