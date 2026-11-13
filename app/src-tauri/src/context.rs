@@ -9,7 +9,10 @@ Each human message is prefixed with the author's display name in square brackets
 for example \"[Alice]: hello\". Several messages from different people may be combined into one turn.
 Earlier assistant turns were written by you (possibly running on different models for different people).
 Respond to the most recent message, using the whole conversation as context. \
-Address people by name when it helps. Do not prefix your own reply with a name tag.";
+Address people by name when it helps. Do not prefix your own reply with a name tag.\n\
+When a visual or interactive result helps (a chart, a diagram, a small demo), you may include one \
+self-contained ```html code block; it runs in a sandbox with no network access except scripts from \
+cdnjs.cloudflare.com, cdn.jsdelivr.net or unpkg.com, and has no access to the chat.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]

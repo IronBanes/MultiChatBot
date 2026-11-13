@@ -14,6 +14,7 @@ import type {
 } from "../lib/types";
 import { useChat } from "../store";
 import { confirmAction } from "./Confirm";
+import { useLiveHtml, type LiveHtml } from "../lib/liveHtml";
 import { PALETTES, useAppearance, type Mode } from "../theme";
 import { Button, Field, Icon, inputCls, Modal, Segmented } from "./ui";
 
@@ -1149,6 +1150,7 @@ function GeneralPanel() {
   const [url, setUrl] = useState(client.server_url);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [appearance, setAppearance] = useAppearance();
+  const [liveHtml, setLiveHtml] = useLiveHtml();
 
   // Linking or unlinking switches accounts, and with it the name; a stale field
   // here would rename the other account on the next Save.
@@ -1210,6 +1212,20 @@ function GeneralPanel() {
               { value: "system", label: "System" },
               { value: "light", label: "Light" },
               { value: "dark", label: "Dark" },
+            ]}
+          />
+        </Field>
+        <Field
+          label="Code in AI replies"
+          hint="HTML in AI replies runs in a sandbox that can't reach the app, your keys or the chat. It can't fetch data, but it can load scripts from public CDNs."
+        >
+          <Segmented
+            value={liveHtml}
+            onChange={(v: LiveHtml) => setLiveHtml(v)}
+            options={[
+              { value: "off", label: "Off" },
+              { value: "ask", label: "Click to run" },
+              { value: "auto", label: "Run automatically" },
             ]}
           />
         </Field>

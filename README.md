@@ -468,6 +468,17 @@ message, generated with your own model.
   that asked, through the relay, without being stored; only use this with a relay you trust.
 - Message content is rendered as Markdown with raw HTML disabled. `javascript:` links
   are neutralized, links open in the system browser, and remote images are never loaded.
+- AI replies can include **live HTML** — charts, diagrams and small interactive demos —
+  that runs right in the chat. A ```html block is served by the app itself into a sandboxed
+  frame (`allow-scripts`, its own origin and CSP, its content posted in, never the app's DOM).
+  **Settings → General → Appearance → Code in AI replies** picks what happens: **Off**, or
+  **Click to run** (the default — a **Run** button on the block), or **Run automatically**;
+  **Expand** opens one full-window, and **Code** shows the source instead. The sandbox can't
+  reach the app, your keys or the chat, can't fetch data (no XHR, WebSocket or remote images)
+  and can't nest frames; scripts may load from cdnjs.cloudflare.com, cdn.jsdelivr.net and
+  unpkg.com. It's best effort: a page can still navigate its own frame to a website, which
+  would reveal your IP address to that site, so use **Click to run** or **Off** in rooms you
+  don't trust. Human messages keep the script-free preview.
 - MCP tool arguments and results are never sent to the relay (only to the MCP server
   itself); the relay only stores tool names and statuses. Use **Ask** mode for servers that can change files or send data.
 - The HTML, SVG and CSS preview runs in an `<iframe sandbox="">`, so scripts, forms and
