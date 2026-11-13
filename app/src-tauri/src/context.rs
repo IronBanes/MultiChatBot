@@ -127,16 +127,14 @@ pub fn plan_summary(
 ///
 /// Coverage is always a prefix: the oldest items that fit the input budget go in
 /// and the rest stay out, so the room's summary boundary (the last covered `seq`)
-/// never claims a message the model didn't see. An oldest message too long to fit
-/// on its own goes in cut short, so coverage still moves. 0 means even that
-/// doesn't fit (the previous summary fills the budget). Rendered once, in one pass.
+/// never claims a message the model didn't see. 0 means the oldest message doesn't
+/// fit next to the previous summary (see `piece_request`). Rendered once, in one pass.
 pub fn summary_request(
     previous: &str,
     items: &[HistoryItem],
     max_context_tokens: u32,
 ) -> (String, Vec<ChatMessage>, usize) {
-    let system = "You maintain a running summary of a group chat. Keep who said what (names), decisions that were made, open questions, facts people shared and what the AI was asked to do. Write plain prose under about 400 words, no preamble.";
-
+    let system = SUMMARY_SYSTEM;
     let budget = (max_context_tokens.saturating_sub(output_reserve(max_context_tokens)) as usize)
         .saturating_sub(estimate_tokens(system));
     // estimate_tokens(text) = ceil(chars / 4) + 4, so this many characters fit.
@@ -145,13 +143,9 @@ pub fn summary_request(
     let mut text = String::new();
     let previous = previous.trim();
     if !previous.is_empty() {
-        text.push_str("Current summary:
-");
+        text.push_str("Current summary:\n");
         text.push_str(previous);
-        text.push_str("
-
-New messages to fold in:
-");
+        text.push_str("\n\nNew messages to fold in:\n");
     }
     let mut chars = text.chars().count();
     let mut covered = 0;
@@ -162,25 +156,11 @@ New messages to fold in:
             covered += 1;
             continue;
         }
-        let name = match h.kind {
-            Kind::Human => h.author_name.as_str(),
-            Kind::Ai => "AI",
-        };
-        let line = format!("[{name}]: {}
-", h.content);
+        let line = format!("[{}]: {}\n", speaker(h), h.content);
         let len = line.chars().count();
         if chars + len > max_chars {
-            const CUT: &str = " [...]
-";
-            let room = max_chars.saturating_sub(chars + CUT.len());
-            // The oldest message alone is too long: send its start rather than
-            // never moving past it. Only when a useful part of it fits.
-            if !any && room >= 64 {
-                text.extend(line.chars().take(room));
-                text.push_str(CUT);
-                covered += 1;
-                any = true;
-            }
+            // An oldest message too long to fit on its own isn't cut here (its tail
+            // would be lost): `piece_request` summarizes it in parts.
             break;
         }
         text.push_str(&line);
@@ -192,6 +172,64 @@ New messages to fold in:
         covered = 0;
     }
     (system.to_string(), vec![ChatMessage { role: Role::User, content: text }], covered)
+}
+
+const SUMMARY_SYSTEM: &str = "\
+You maintain a running summary of a group chat. \
+Keep who said what (names), decisions that were made, open questions, facts people shared \
+and what the AI was asked to do. \
+Write plain prose under about 400 words, no preamble.";
+
+const PIECE_SYSTEM: &str = "\
+You maintain a running summary of a group chat. \
+A message too long to read at once arrives in parts; fold this part into the summary. \
+Keep who said what (names), decisions that were made, open questions, facts people shared \
+and what the AI was asked to do. \
+Write plain prose under about 400 words, no preamble.";
+
+/// The name a summary request shows for a history item.
+fn speaker(h: &HistoryItem) -> &str {
+    match h.kind {
+        Kind::Human => h.author_name.as_str(),
+        Kind::Ai => "AI",
+    }
+}
+
+/// For one message too long to summarize in a single request: the request that
+/// folds its characters from `from` on, as many as fit, into `previous`. Returns
+/// the request and where the next part starts (the message's length when this is
+/// the last part), or None when not even a useful part fits.
+pub fn piece_request(
+    previous: &str,
+    item: &HistoryItem,
+    from: usize,
+    max_context_tokens: u32,
+) -> Option<(String, Vec<ChatMessage>, usize)> {
+    let budget = (max_context_tokens.saturating_sub(output_reserve(max_context_tokens)) as usize)
+        .saturating_sub(estimate_tokens(PIECE_SYSTEM));
+    let max_chars = budget.saturating_sub(4) * 4;
+    let total = item.content.chars().count();
+    if from >= total {
+        return None;
+    }
+    let mut text = String::new();
+    let previous = previous.trim();
+    if !previous.is_empty() {
+        text.push_str("Current summary:\n");
+        text.push_str(previous);
+        text.push_str("\n\n");
+    }
+    // The header's length with the widest possible end, so the real one fits too.
+    let header = |end: usize| format!("Part of a long message, characters {from} to {end} of {total}:\n[{}]: ", speaker(item));
+    let room = max_chars.saturating_sub(text.chars().count() + header(total).chars().count() + 1);
+    if room < 64 {
+        return None;
+    }
+    let next = (from + room).min(total);
+    text.push_str(&header(next));
+    text.extend(item.content.chars().skip(from).take(next - from));
+    text.push('\n');
+    Some((PIECE_SYSTEM.to_string(), vec![ChatMessage { role: Role::User, content: text }], next))
 }
 
 /// `summary_request` for the oldest `n` items of `history`, with the boundary moved
@@ -244,10 +282,19 @@ pub fn build(history: &[HistoryItem], room_prompt: &str, summary: &str, max_cont
     }
     let trimmed = start;
 
-    // Providers (notably Anthropic) need the first turn to be from the user.
-    let kept = converted[start..].iter().skip_while(|m| m.role == Role::Assistant);
+    // Providers (notably Anthropic) need the first turn to be from the user. Right
+    // after a summary, a leading AI reply is part of the conversation the summary
+    // leads into, so it stays behind a short user turn instead of being dropped.
+    let after_summary = !summary.trim().is_empty() && start == 0;
+    let kept = converted[start..].iter().skip_while(|m| !after_summary && m.role == Role::Assistant);
 
     let mut messages: Vec<ChatMessage> = Vec::new();
+    if after_summary && converted.first().is_some_and(|m| m.role == Role::Assistant) {
+        messages.push(ChatMessage {
+            role: Role::User,
+            content: "(The conversation continues after the summary.)".into(),
+        });
+    }
     for m in kept {
         match messages.last_mut() {
             Some(last) if last.role == m.role => {
@@ -351,13 +398,22 @@ mod tests {
         assert!(!messages[0].content.contains(&format!("[A{covered}]: ")));
         let budget = 2000 - output_reserve(2000) as usize;
         assert!(estimate_tokens(&system) + estimate_tokens(&messages[0].content) <= budget);
-        // A single message too long to fit is cut, but still covered.
-        let huge = "z".repeat(40_000);
-        let (_, messages, covered) = summary_request("", &[human("A", &huge), human("B", "x")], 2000);
-        assert_eq!(covered, 1);
-        assert!(messages[0].content.ends_with(" [...]
-"));
-        assert!(estimate_tokens(&messages[0].content) <= budget);
+        // A single message too long to fit isn't cut: nothing is covered, and
+        // piece_request walks it in parts instead.
+        let huge = format!("{}IMPORTANT TAIL", "z".repeat(40_000));
+        let item = human("A", &huge);
+        let (_, _, covered) = summary_request("", &[item.clone(), human("B", "x")], 2000);
+        assert_eq!(covered, 0);
+        let (mut from, mut parts, mut tail) = (0, 0, false);
+        while let Some((_, m, next)) = piece_request("prev", &item, from, 2000) {
+            assert!(next > from);
+            assert!(estimate_tokens(&m[0].content) <= budget);
+            tail |= m[0].content.contains("IMPORTANT TAIL");
+            from = next;
+            parts += 1;
+        }
+        assert_eq!(from, huge.chars().count());
+        assert!(parts > 1 && tail);
     }
 
     #[test]
@@ -372,6 +428,16 @@ mod tests {
         assert_eq!(fold_request("", &history, 4, 100_000).2, 4);
         // Folding 1 leaves "two" (AI) first, so nothing can be folded.
         assert_eq!(fold_request("", &history, 1, 100_000).2, 0);
+    }
+
+    #[test]
+    fn leading_ai_reply_after_a_summary_is_kept() {
+        let p = build(&[ai("earlier answer"), human("A", "q")], "", "They planned a picnic.", 100_000);
+        assert_eq!(p.messages[0].role, Role::User);
+        assert!(p.messages.iter().any(|m| m.content.contains("earlier answer")));
+        // Without a summary it's dropped as before.
+        let p = build(&[ai("earlier answer"), human("A", "q")], "", "", 100_000);
+        assert!(!p.messages.iter().any(|m| m.content.contains("earlier answer")));
     }
 
     #[test]

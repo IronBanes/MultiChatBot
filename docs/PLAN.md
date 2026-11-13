@@ -271,12 +271,14 @@ falls back to trimming, as before.
 The boundary never passes a message the summary didn't see:
 - **Prefix only.** The summary request carries the oldest folded messages that fit the
   input budget. `upto_seq` is the last one it really carried, and the rest stay in the
-  reply's history. An oldest message too long to fit on its own goes in cut short.
+  reply's history. A message too long for one request is summarized in
+  parts and counts as covered only after its last part.
   The boundary also moves back so the reply's history starts with a human message,
-  because a leading AI reply would otherwise be dropped from the prompt.
+  because a leading AI reply would otherwise be dropped from the prompt. After a
+  summary, `build` also keeps a leading AI reply behind a short user turn.
 - **No gaps.** The device only summarizes when its loaded messages reach back to the
-  boundary (or, with no summary yet, to the start of the room). Otherwise it loads the
-  missing pages with `load_older` and this reply trims as before.
+  boundary (or, with no summary yet, to the start of the room). Otherwise the reply waits while `load_older` fills the gap page by page.
+  Past 10,000 loaded messages it replies without summarizing instead.
 - **No unfinished replies.** Folding stops before an earlier AI reply that is still
   streaming.
 

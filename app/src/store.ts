@@ -174,6 +174,12 @@ export function parseRemoteProfileId(id: string): { deviceId: string; profileId:
 
 /** An `ai_requested` waiting for the room's history to load here, so the anchor
  *  can be found and the reply generated: room → pending requests. */
+/** Room id → AI replies waiting for older pages, so their history reaches the
+ *  summary boundary (or the room's start) before they begin. */
+const pendingAiStarts = new Map<string, { run: () => void; fail?: (message: string) => void }[]>();
+/** Loaded messages past which a reply stops waiting for older pages and replies
+ *  without summarizing (the relay sends at most 2,000 per page). */
+const MAX_BACKFILL = 10_000;
 const pendingDelegatedOpens = new Map<string, { requestId: string; anchorId: string; anchorSeq: number; profileId: string; fromDeviceId: string }[]>();
 /** Generation id → the device of this user it's generating for. Only that device can
  *  answer the reply's tool calls remotely; a reply started here is never reachable. */
@@ -548,6 +554,12 @@ export const useChat = create<ChatState>((set, get) => {
               }
               pendingDelegatedOpens.delete(roomId);
             }
+            // Replies waiting for older pages never started; say so instead of waiting.
+            if (pendingAiStarts.size) {
+              for (const starts of pendingAiStarts.values()) for (const start of starts) start.fail?.("Couldn't load the room");
+              pendingAiStarts.clear();
+              get().toast("The AI reply didn't start: the connection dropped");
+            }
           }
           // The relay marks our in-flight replies as interrupted when the socket drops.
           if (status === "offline") stopAllGenerations();
@@ -687,18 +699,27 @@ export const useChat = create<ChatState>((set, get) => {
     // What may be folded into a new summary. The boundary must not pass a message
     // the summary never saw, so folding stops at:
     // - a gap: older messages after the boundary (or, with no summary yet, at the start
-    //   of the room) aren't loaded here. Nothing is folded this time; those messages
-    //   are loaded now so the next reply can summarize without skipping them.
+    //   of the room) aren't loaded here. The reply waits while they load, page by page,
+    //   so neither its history nor a new summary skips them. Past MAX_BACKFILL loaded
+    //   messages (or if loading can't start) it replies without summarizing instead.
     // - an earlier AI reply still streaming: it isn't in this history yet, and a
     //   boundary past it would leave its final text out of both summary and history.
     let foldBefore: number | null = null;
     const first = usable[0];
     if (first && s.hasMore[roomId] && first.seq > upto + 1) {
-      foldBefore = 0;
-      if (!s.loadingOlder[roomId]) {
-        const ok = relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq, until_seq: upto + 1 });
-        if (ok) set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));
+      if (usable.length < MAX_BACKFILL) {
+        const loading =
+          s.loadingOlder[roomId] ||
+          (relay?.send({ type: "load_older", room_id: roomId, before_seq: first.seq, until_seq: upto + 1 }) ?? false);
+        if (loading) {
+          if (!s.loadingOlder[roomId]) set((st) => ({ loadingOlder: { ...st.loadingOlder, [roomId]: true } }));
+          const waiting = pendingAiStarts.get(roomId) ?? [];
+          waiting.push({ run: () => startAi(roomId, anchor, profileId, delegated, onFail), fail: onFail });
+          pendingAiStarts.set(roomId, waiting);
+          return;
+        }
       }
+      foldBefore = 0;
     } else {
       const streaming = usable.find(
         (m) => m.kind === "ai" && !m.deleted && m.seq > upto && m.seq < anchor.seq && m.status === "streaming",
@@ -923,6 +944,12 @@ export const useChat = create<ChatState>((set, get) => {
           const waiting = pendingDelegatedOpens.get(msg.room_id) ?? [];
           pendingDelegatedOpens.delete(msg.room_id);
           for (const p of waiting) runDelegatedAi(p.requestId, msg.room_id, p.anchorId, p.anchorSeq, p.profileId, p.fromDeviceId);
+          // Replies that waited for older history to reach the summary boundary: try
+          // again (each loads another page if a gap is still left).
+          const starts = pendingAiStarts.get(msg.room_id) ?? [];
+          pendingAiStarts.delete(msg.room_id);
+          // Left the room meanwhile: nothing to reply in.
+          for (const start of starts) if (get().rooms[msg.room_id]) start.run();
         }
         break;
       case "search_results": {
