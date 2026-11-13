@@ -673,9 +673,12 @@ export const useChat = create<ChatState>((set, get) => {
     const room = s.rooms[roomId];
     const usable = s.messages[roomId] ?? [];
     const byId = new Map(usable.map((m) => [m.id, m]));
+    // Messages the room's shared summary already covers are replaced by it, so
+    // they don't widen the prompt.
+    const upto = room?.summary_upto_seq ?? 0;
     const history: HistoryItem[] = usable
-      .filter((m) => m.seq <= anchor.seq && !m.deleted && (m.kind === "human" || m.status === "complete"))
-      .map((m) => ({ kind: m.kind, author_name: m.author_name, content: historyText(m, byId) }));
+      .filter((m) => m.seq <= anchor.seq && m.seq > upto && !m.deleted && (m.kind === "human" || m.status === "complete"))
+      .map((m) => ({ kind: m.kind, author_name: m.author_name, content: historyText(m, byId), seq: m.seq }));
 
     const id = crypto.randomUUID();
     if (!relay?.send({ type: "ai_start", room_id: roomId, id, anchor_id: anchor.id, model: profile.model })) {
@@ -700,7 +703,7 @@ export const useChat = create<ChatState>((set, get) => {
     };
 
     backend
-      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", !!stopDelegatedTracking, (ev) => {
+      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", room?.summary ?? "", !!stopDelegatedTracking, (ev) => {
         if (ev.event === "delta") {
           relay?.send({ type: "ai_delta", room_id: roomId, id, delta: ev.text });
         } else if (ev.event === "reasoning") {
@@ -743,6 +746,13 @@ export const useChat = create<ChatState>((set, get) => {
               get().toast(`Couldn't share an image: ${errorText(e)}`);
             }
           });
+        } else if (ev.event === "summary") {
+          // The reply summarized the older history: share it with the room, so
+          // every member's AI uses the same one.
+          relay?.send({ type: "set_room_summary", room_id: roomId, summary: ev.text, upto_seq: ev.upto_seq });
+          patchRoom(roomId, (r) =>
+            r.summary_upto_seq < ev.upto_seq ? { ...r, summary: ev.text, summary_upto_seq: ev.upto_seq } : r,
+          );
         } else if (ev.event === "notice") {
           get().toast(ev.message, "info");
         } else if (ev.event === "done") {
@@ -1088,6 +1098,12 @@ export const useChat = create<ChatState>((set, get) => {
         break;
       case "room_updated":
         patchRoom(msg.room_id, (r) => ({ ...r, system_prompt: msg.system_prompt }));
+        break;
+      case "room_summary":
+        // Another member's AI summarized the older history; only a newer one applies.
+        patchRoom(msg.room_id, (r) =>
+          r.summary_upto_seq < msg.upto_seq ? { ...r, summary: msg.summary, summary_upto_seq: msg.upto_seq } : r,
+        );
         break;
       case "link_code": {
         const pending = msg.request_id ? pendingRequests.get(msg.request_id) : undefined;

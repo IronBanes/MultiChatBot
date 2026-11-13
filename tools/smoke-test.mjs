@@ -228,6 +228,19 @@ alice.send({ type: "set_room_prompt", room_id: room.id, system_prompt: "Be brief
 await alice.wait(type("room_updated", (m) => m.system_prompt === "Be brief."), "room_updated");
 ok(true, "room prompt updated");
 
+// Room summaries: a member's AI shares the summary the whole room then uses;
+// only a newer one is accepted, so a repeat never broadcasts.
+{
+  const upto = human.message.seq; // the "hi humans" message sent earlier
+  alice.send({ type: "set_room_summary", room_id: room.id, summary: "Bob said hi.", upto_seq: upto });
+  const sum = await alice.wait(type("room_summary", (m) => m.upto_seq === upto), "room_summary");
+  ok(sum.summary === "Bob said hi." && sum.updated_by === alice.userId, "a room summary is stored and broadcast to the room");
+  // The same `upto_seq` again is refused: no second room_summary.
+  alice.send({ type: "set_room_summary", room_id: room.id, summary: "Stale.", upto_seq: upto });
+  await new Promise((r) => setTimeout(r, 150));
+  ok(!alice.inbox.some((m) => m.type === "room_summary" && m.summary === "Stale."), "an equal upto_seq never broadcasts a second summary");
+}
+
 // Persistence: a fresh connection sees the full history with final statuses.
 const bob2 = new Client("Bob");
 bob2.userId = bob.userId;

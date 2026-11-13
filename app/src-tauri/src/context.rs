@@ -1,5 +1,7 @@
 //! Turns room history into a provider-neutral prompt: system text plus an
-//! alternating user/assistant message list, trimmed to the profile's budget.
+//! alternating user/assistant message list, trimmed to the profile's budget —
+//! and, instead of trimming, the oldest messages can be folded into a summary
+//! the whole room shares (see `plan_summary` / `summary_request`).
 
 use serde::Deserialize;
 
@@ -28,6 +30,9 @@ pub struct HistoryItem {
     pub kind: Kind,
     pub author_name: String,
     pub content: String,
+    /// The room message's `seq`; 0 when missing. Where the summary boundary is.
+    #[serde(default)]
+    pub seq: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,13 +65,19 @@ pub fn output_reserve(max_context_tokens: u32) -> u32 {
     (max_context_tokens / 4).clamp(256, 16_000)
 }
 
-pub fn system_prompt(room_prompt: &str) -> String {
+pub fn system_prompt(room_prompt: &str, summary: &str) -> String {
     let room_prompt = room_prompt.trim();
-    if room_prompt.is_empty() {
+    let mut prompt = if room_prompt.is_empty() {
         BASE_SYSTEM_PROMPT.to_string()
     } else {
         format!("{BASE_SYSTEM_PROMPT}\n\nRoom instructions (set by the members of this room):\n{room_prompt}")
+    };
+    let summary = summary.trim();
+    if !summary.is_empty() {
+        prompt.push_str("\n\nSummary of the earlier conversation (those messages are not shown):\n");
+        prompt.push_str(summary);
     }
+    prompt
 }
 
 fn to_message(item: &HistoryItem) -> ChatMessage {
@@ -79,8 +90,84 @@ fn to_message(item: &HistoryItem) -> ChatMessage {
     }
 }
 
-pub fn build(history: &[HistoryItem], room_prompt: &str, max_context_tokens: u32) -> Prompt {
-    let system = system_prompt(room_prompt);
+/// How many of the newest history items are always kept verbatim when the rest
+/// is summarized.
+const KEEP_RECENT: usize = 6;
+
+/// How many of the oldest history items should be folded into the room summary
+/// instead of trimmed away. None while the prompt still fits comfortably or the
+/// history is too short to be worth a summary.
+pub fn plan_summary(
+    history: &[HistoryItem],
+    room_prompt: &str,
+    summary: &str,
+    max_context_tokens: u32,
+) -> Option<usize> {
+    if history.len() <= KEEP_RECENT {
+        return None;
+    }
+    let budget = max_context_tokens.saturating_sub(output_reserve(max_context_tokens));
+    // The summary is part of the system text, so the budget already accounts for it.
+    let total = estimate_tokens(&system_prompt(room_prompt, summary))
+        + history
+            .iter()
+            .filter(|h| !h.content.trim().is_empty())
+            .map(|h| estimate_tokens(&h.content))
+            .sum::<usize>();
+    if total > (budget as f64 * 0.8) as usize {
+        Some(history.len() - KEEP_RECENT)
+    } else {
+        None
+    }
+}
+
+/// The request that asks the model to write (or extend) the room summary from
+/// `items`, the oldest history entries to fold in. Returns the system text and
+/// the single user message. If the text doesn't fit the input budget, the
+/// oldest items are dropped until it does (the newest folded items matter most).
+pub fn summary_request(
+    previous: &str,
+    items: &[HistoryItem],
+    max_context_tokens: u32,
+) -> (String, Vec<ChatMessage>) {
+    let system = "\
+You maintain a running summary of a group chat. \
+Keep who said what (names), decisions that were made, open questions, facts people shared \
+and what the AI was asked to do. \
+Write plain prose under about 400 words, no preamble.";
+
+    let render = |items: &[&HistoryItem]| {
+        let mut text = String::new();
+        let previous = previous.trim();
+        if !previous.is_empty() {
+            text.push_str("Current summary:\n");
+            text.push_str(previous);
+            text.push_str("\n\nNew messages to fold in:\n");
+        }
+        for h in items.iter().filter(|h| !h.content.trim().is_empty()) {
+            let name = match h.kind {
+                Kind::Human => h.author_name.as_str(),
+                Kind::Ai => "AI",
+            };
+            text.push_str(&format!("[{name}]: {}\n", h.content));
+        }
+        text
+    };
+
+    let budget = (max_context_tokens.saturating_sub(output_reserve(max_context_tokens)) as usize)
+        .saturating_sub(estimate_tokens(system));
+    // Drop the oldest items until the user message fits; keep at least one.
+    let items: Vec<&HistoryItem> = items.iter().filter(|h| !h.content.trim().is_empty()).collect();
+    let mut start = 0;
+    while items.len() - start > 1 && estimate_tokens(&render(&items[start..])) > budget {
+        start += 1;
+    }
+    let messages = vec![ChatMessage { role: Role::User, content: render(&items[start..]) }];
+    (system.to_string(), messages)
+}
+
+pub fn build(history: &[HistoryItem], room_prompt: &str, summary: &str, max_context_tokens: u32) -> Prompt {
+    let system = system_prompt(room_prompt, summary);
     let converted: Vec<ChatMessage> = history
         .iter()
         .filter(|h| !h.content.trim().is_empty())
@@ -124,16 +211,17 @@ mod tests {
     use super::*;
 
     fn human(name: &str, text: &str) -> HistoryItem {
-        HistoryItem { kind: Kind::Human, author_name: name.into(), content: text.into() }
+        HistoryItem { kind: Kind::Human, author_name: name.into(), content: text.into(), seq: 0 }
     }
     fn ai(text: &str) -> HistoryItem {
-        HistoryItem { kind: Kind::Ai, author_name: "x".into(), content: text.into() }
+        HistoryItem { kind: Kind::Ai, author_name: "x".into(), content: text.into(), seq: 0 }
     }
 
     #[test]
     fn prefixes_names_and_merges_same_role() {
         let p = build(
             &[human("Alice", "hi"), human("Bob", "yo"), ai("hello both"), ai("more"), human("Alice", "square?")],
+            "",
             "",
             100_000,
         );
@@ -146,9 +234,62 @@ mod tests {
 
     #[test]
     fn room_prompt_is_appended() {
-        let p = build(&[human("A", "x")], "Talk like a pirate", 1000);
+        let p = build(&[human("A", "x")], "Talk like a pirate", "", 1000);
         assert!(p.system.starts_with(BASE_SYSTEM_PROMPT));
         assert!(p.system.ends_with("Talk like a pirate"));
+    }
+
+    #[test]
+    fn summary_appears_in_the_system_prompt() {
+        let p = build(&[human("A", "x")], "", "They agreed to meet Friday.", 1000);
+        assert!(p.system.ends_with("They agreed to meet Friday."));
+        assert!(p.system.contains("Summary of the earlier conversation"));
+        // Whitespace-only summaries are treated as empty.
+        let p = build(&[human("A", "x")], "", "  \n ", 1000);
+        assert!(!p.system.contains("Summary of the earlier conversation"));
+    }
+
+    #[test]
+    fn plan_summary_returns_none_under_the_threshold() {
+        // Five short messages: below both the 80% budget and the KEEP_RECENT count.
+        let history: Vec<_> = (0..5).map(|i| human(&format!("A{i}"), "hello")).collect();
+        assert_eq!(plan_summary(&history, "", "", 100_000), None);
+        // Seven short messages still fit well under 80% of the budget.
+        let history: Vec<_> = (0..7).map(|i| human(&format!("A{i}"), "hello")).collect();
+        assert_eq!(plan_summary(&history, "", "", 100_000), None);
+    }
+
+    #[test]
+    fn plan_summary_folds_all_but_the_recent_items() {
+        let long = "x".repeat(4000); // ~1004 tokens per message
+        let history: Vec<_> = (0..10).map(|i| human(&format!("A{i}"), &long)).collect();
+        assert_eq!(plan_summary(&history, "", "", 2000), Some(10 - KEEP_RECENT));
+    }
+
+    #[test]
+    fn plan_summary_needs_more_than_the_kept_items() {
+        // Over budget, but with only KEEP_RECENT items there is nothing to fold.
+        let long = "x".repeat(4000);
+        let history: Vec<_> = (0..KEEP_RECENT).map(|i| human(&format!("A{i}"), &long)).collect();
+        assert_eq!(plan_summary(&history, "", "", 2000), None);
+    }
+
+    #[test]
+    fn summary_request_carries_previous_summary_and_fits_budget() {
+        let items: Vec<_> = (0..5).map(|i| human(&format!("A{i}"), &format!("note {i}"))).collect();
+        let (system, messages) = summary_request("They discussed the budget.", &items, 100_000);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, Role::User);
+        assert!(messages[0].content.contains("They discussed the budget."));
+        assert!(messages[0].content.contains("[A0]: note 0"));
+        assert!(messages[0].content.contains("[A4]: note 4"));
+        assert!(system.contains("running summary"));
+        // Oversized: the oldest items are dropped until it fits, the newest kept.
+        let long = "y".repeat(8000);
+        let items: Vec<_> = (0..8).map(|i| human(&format!("A{i}"), &long)).collect();
+        let (_, messages) = summary_request("", &items, 2000);
+        assert!(messages[0].content.contains(&format!("[A{}]: ", items.len() - 1)));
+        assert!(!messages[0].content.contains("[A0]: "));
     }
 
     #[test]
@@ -156,7 +297,7 @@ mod tests {
         let long = "x".repeat(4000); // ~1004 tokens
         let history = vec![human("A", &long), ai(&long), human("B", &long), ai(&long), human("C", "last")];
         // 2000 context - 500 reserve - ~system => room for roughly one long message.
-        let p = build(&history, "", 2000);
+        let p = build(&history, "", "", 2000);
         assert!(p.trimmed >= 3);
         assert_eq!(p.messages.last().unwrap().content, "[C]: last");
         assert_eq!(p.messages.first().unwrap().role, Role::User);
@@ -165,7 +306,7 @@ mod tests {
     #[test]
     fn trigger_kept_even_if_over_budget() {
         let huge = "y".repeat(100_000);
-        let p = build(&[human("A", "old"), human("B", &huge)], "", 1000);
+        let p = build(&[human("A", "old"), human("B", &huge)], "", "", 1000);
         assert_eq!(p.messages.len(), 1);
         assert!(p.messages[0].content.starts_with("[B]: "));
     }
@@ -173,7 +314,7 @@ mod tests {
     #[test]
     fn drops_leading_assistant_after_trim() {
         let long = "z".repeat(2400);
-        let p = build(&[human("A", &long), ai("short reply"), human("B", "q")], "", 1300);
+        let p = build(&[human("A", &long), ai("short reply"), human("B", "q")], "", "", 1300);
         assert_eq!(p.messages[0].role, Role::User);
     }
 }

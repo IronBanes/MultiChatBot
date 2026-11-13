@@ -22,6 +22,8 @@ message triggered it. The relay server never sees keys or endpoints.
 ```sql
 users    (id TEXT PK, display_name TEXT, updated_at INTEGER)
 rooms    (id TEXT PK, name TEXT, invite_code TEXT UNIQUE, system_prompt TEXT,
+          summary TEXT,                       -- conversation summary of older messages
+          summary_upto_seq INTEGER,           -- seq of the last message it covers (0 = none)
           created_by TEXT, created_at INTEGER)
 members  (room_id TEXT, user_id TEXT, joined_at INTEGER, PRIMARY KEY(room_id, user_id))
 messages (seq INTEGER PK AUTOINCREMENT,      -- global ordering
@@ -100,6 +102,7 @@ all rooms. The first client frame must be `hello`.
 | `ai_complete` | `room_id, id, content` | full final text, persisted with reasoning, tool activity and attachments |
 | `ai_error` | `room_id, id, error` | short, sanitized reason |
 | `set_room_prompt` | `room_id, system_prompt` | any member |
+| `set_room_summary` | `room_id, summary, upto_seq` | any member; stores the room's shared summary covering messages up to `upto_seq` — only accepted when it is newer than the stored one and doesn't point past the room's last message → `room_summary` |
 | `react` | `room_id, message_id, emoji, on` | add (`on` true) or remove a reaction; any member, any message; ≤ 20 distinct emoji per message |
 | `typing` | `room_id, typing` | live "I'm typing" state; members only, relayed as `typing` and never stored; the relay passes at most one `typing: true` per second per connection, and a `typing: false` only when it ends a relayed `true` and no other device of that user is still typing there |
 | `edit_message` | `room_id, message_id, content` | edit your own human message; same empty/length rule as `send_message` → `message_updated` |
@@ -137,6 +140,7 @@ all rooms. The first client frame must be `hello`.
 | `presence` | `room_id, user_id, online` |
 | `typing` | `room_id, user_id, display_name, typing` (ephemeral; never persisted) |
 | `room_updated` | `room_id, system_prompt, updated_by` |
+| `room_summary` | `room_id, summary, upto_seq, updated_by` (the summary moved forward; every member's AI uses it) |
 | `reactions` | `room_id, message_id, reactions: Reaction[]` (the message's full current list) |
 | `message_updated` | `room_id, message: Message` (the full row after an edit or delete) |
 | `ai_requested` | `request_id, room_id, anchor_id, profile_id, from_device_id` (answers `request_ai`; delivered to the target device's first matching connection only, never stored) |
@@ -147,7 +151,7 @@ all rooms. The first client frame must be `hello`.
 | `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline, or shares profiles) |
 | `error` | `request_id?, message` |
 
-`RoomInfo = {id, name, invite_code, system_prompt, members: Member[]}`
+`RoomInfo = {id, name, invite_code, system_prompt, summary, summary_upto_seq, members: Member[]}`
 `Member = {user_id, display_name, online}`
 `Device = {device_id, device_name, platform, profiles: SharedProfile[], mcp_servers: SharedMcpServer[], remote_control}` (empty and false unless that device sent `share_profiles`)
 `SharedProfile = {id, label, model, enabled}`
@@ -242,13 +246,27 @@ back when it signs in, even if its old connection hadn't closed yet.
 
 ## Context building (Rust, `app/src-tauri/src/context.rs`)
 
-1. History = room messages in `seq` order up to and including the anchor; human messages
-   (incl. human-only) and *complete* AI messages.
+1. History = room messages in `seq` order up to and including the anchor and after the
+   summary boundary; human messages (incl. human-only) and *complete* AI messages.
 2. Human → `user` `"[Name]: text"`; AI → `assistant` (whoever generated it).
-3. System prompt = group-chat preamble + optional room prompt.
+3. System prompt = group-chat preamble + optional room prompt + the room's shared
+   summary of the messages before the boundary, if any.
 4. Trim oldest until `estimate(system) + Σ estimate(msg) + output_reserve ≤ max_context`
    (estimate ≈ chars/4 + 4). The anchor message is always kept.
 5. Drop leading `assistant` messages, merge consecutive same-role messages.
+
+### Summaries
+
+Instead of silently dropping the oldest messages when a room's history no longer fits
+the profile's context, the replying device first asks its model to summarize them
+(keeping the newest 6 messages verbatim). The summary is shared with the room through
+the relay (`set_room_summary`, ≤ 12,000 chars), so every member's AI replies from the
+same summary, and the room stores it (`rooms.summary`,
+`rooms.summary_upto_seq` = the `seq` of the last message it covers). The relay accepts
+a summary only when `upto_seq` is newer than the stored one and not past the room's
+last message — one compare-and-set, so concurrent writers can't regress it, and only
+the writer that advanced it broadcasts `room_summary`. If summarizing fails, the reply
+falls back to trimming, as before.
 
 ## Provider trait
 

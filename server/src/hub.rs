@@ -14,6 +14,8 @@ const MAX_NAME: usize = 40;
 const MAX_ROOM_NAME: usize = 80;
 const MAX_CONTENT: usize = 200_000;
 const MAX_PROMPT: usize = 8_000;
+/// Characters kept from a room summary (set with `set_room_summary`).
+const MAX_SUMMARY: usize = 12_000;
 const MAX_ERROR: usize = 300;
 /// Messages sent in one `room_history` when a room is opened.
 const HISTORY_PAGE: i64 = 200;
@@ -293,6 +295,8 @@ impl State {
             name: row.name,
             invite_code: row.invite_code,
             system_prompt: row.system_prompt,
+            summary: row.summary,
+            summary_upto_seq: row.summary_upto_seq,
             members,
         }))
     }
@@ -735,6 +739,24 @@ impl State {
                     &room_id,
                     ServerMsg::RoomUpdated { room_id: room_id.clone(), system_prompt: prompt, updated_by: user_id },
                 );
+            }
+
+            ClientMsg::SetRoomSummary { room_id, summary, upto_seq } => {
+                if !self.in_room(conn, &room_id) {
+                    return Ok(());
+                }
+                let summary: String = summary.trim().chars().take(MAX_SUMMARY).collect();
+                if summary.is_empty() || upto_seq <= 0 {
+                    return Ok(());
+                }
+                // One compare-and-set: the stored summary only moves forward, never past
+                // the room's last message, and only the writer that advanced it broadcasts.
+                if db::set_room_summary(&self.db, &room_id, &summary, upto_seq).await? {
+                    self.broadcast(
+                        &room_id,
+                        ServerMsg::RoomSummary { room_id: room_id.clone(), summary, upto_seq, updated_by: user_id },
+                    );
+                }
             }
 
             ClientMsg::React { room_id, message_id, emoji, on } => {

@@ -52,6 +52,10 @@ export interface RoomInfo {
   name: string;
   invite_code: string;
   system_prompt: string;
+  /** Conversation summary of the messages up to `summary_upto_seq` ("" = none). */
+  summary: string;
+  /** `seq` of the last message the summary covers; 0 = no summary. */
+  summary_upto_seq: number;
   members: Member[];
 }
 
@@ -137,6 +141,7 @@ export type ClientMsg =
   | { type: "ai_complete"; room_id: string; id: string; content: string }
   | { type: "ai_error"; room_id: string; id: string; error: string }
   | { type: "set_room_prompt"; room_id: string; system_prompt: string }
+  | { type: "set_room_summary"; room_id: string; summary: string; upto_seq: number }
   | { type: "react"; room_id: string; message_id: string; emoji: string; on: boolean }
   | { type: "typing"; room_id: string; typing: boolean }
   | { type: "edit_message"; room_id: string; message_id: string; content: string }
@@ -173,6 +178,7 @@ export type ServerMsg =
   | { type: "presence"; room_id: string; user_id: string; online: boolean }
   | { type: "typing"; room_id: string; user_id: string; display_name: string; typing: boolean }
   | { type: "room_updated"; room_id: string; system_prompt: string; updated_by: string }
+  | { type: "room_summary"; room_id: string; summary: string; upto_seq: number; updated_by: string }
   | { type: "reactions"; room_id: string; message_id: string; reactions: Reaction[] }
   | { type: "ai_requested"; request_id: string; room_id: string; anchor_id: string; anchor_seq: number; profile_id: string; from_device_id: string }
   | { type: "device_command"; request_id: string; from_device_id: string; command: DeviceCommand }
@@ -289,11 +295,15 @@ export interface HistoryItem {
   kind: "human" | "ai";
   author_name: string;
   content: string;
+  /** The room message's `seq`; 0 when missing. Where the summary boundary is. */
+  seq: number;
 }
 
 export type GenEvent =
   | { event: "delta"; text: string }
   | { event: "reasoning"; text: string }
+  /** The room's new shared summary; stored with the relay for every member. */
+  | { event: "summary"; text: string; upto_seq: number }
   | {
       event: "tool";
       call_id: string;

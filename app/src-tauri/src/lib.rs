@@ -692,7 +692,15 @@ fn resolve_tool_call(state: State<'_, AppState>, id: String, call_id: String, ap
 
 // ------------------------------------------------------------------ generation
 
+/// How long the summarizing pre-step may take before the reply falls back to
+/// trimming the oldest messages.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Streams a reply for AI message `id` on `on_event` (see `generate::GenEvent`).
+/// When the history won't fit the profile's context, the oldest messages are
+/// first summarized by the same model; the summary is shared with the room
+/// through the webview, and only on failure does the reply fall back to today's
+/// trimming.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn generate(
@@ -703,6 +711,7 @@ fn generate(
     room_id: String,
     history: Vec<HistoryItem>,
     room_prompt: String,
+    summary: Option<String>,
     delegated: Option<bool>,
     on_event: Channel<GenEvent>,
 ) -> Result<(), String> {
@@ -720,13 +729,9 @@ fn generate(
     }
     let key = secrets::get_key(&profile.id, &profile.base_url)?;
     let provider = providers::for_profile(&profile, key.clone(), state.http.clone());
-    let prompt = context::build(&history, &room_prompt, profile.max_context_tokens);
-    if prompt.messages.is_empty() {
-        return Err("Nothing to reply to".into());
-    }
-    if prompt.trimmed > 0 {
-        eprintln!("[context] dropped {} oldest message(s) to fit {} tokens", prompt.trimmed, profile.max_context_tokens);
-    }
+    // The summarizing pre-step happens inside the spawned task, so the prompt is
+    // built there too (with the summary it produced).
+    let fold = context::plan_summary(&history, &room_prompt, summary.as_deref().unwrap_or(""), profile.max_context_tokens);
     let servers = cfg
         .mcp_for_reply(&room_id, delegated)
         .into_iter()
@@ -735,35 +740,117 @@ fn generate(
             (s, m, sec)
         })
         .collect();
-    let req = ChatRequest {
-        model: profile.model.clone(),
-        system: prompt.system,
-        messages: prompt.messages,
-        max_output_tokens: context::output_reserve(profile.max_context_tokens),
-        temperature: profile.temperature,
-        show_reasoning: profile.show_reasoning,
-        reasoning_effort: profile.reasoning_effort.clone(),
-        tools: Vec::new(),
-        allow_tool_calls: true,
-        continuation: Vec::new(),
-    };
 
-    let (stop_tx, stop) = oneshot::channel::<()>();
+    let (stop_tx, mut stop) = oneshot::channel::<()>();
     state.generations.lock().map_err(|_| "lock poisoned")?.insert(id.clone(), stop_tx);
 
     let base_url = profile.base_url.clone();
-    let job = generate::Job {
-        id: id.clone(),
-        provider,
-        req,
-        servers,
-        mcp: state.mcp.clone(),
-        approvals: state.approvals.clone(),
-        scrub: Box::new(move |e: ProviderError| providers::sanitize(&e.0, key.as_deref(), &base_url)),
-        events: on_event,
-        stop,
-    };
+    let scrub =
+        move |e: ProviderError| providers::sanitize(&e.0, key.as_deref(), &base_url);
+    let mcp = state.mcp.clone();
+    let approvals = state.approvals.clone();
     tauri::async_runtime::spawn(async move {
+        // The summary the reply is built with: the room's shared one, replaced by
+        // a fresh one when this run summarizes, and kept on failure (the reply
+        // then falls back to today's trimming).
+        let mut summary = summary.unwrap_or_default();
+        // Which history the reply is built from: after a successful summary only
+        // the messages it doesn't cover; the full history otherwise (it trims).
+        let mut kept: &[HistoryItem] = &history;
+        if let Some(n) = fold {
+            // Fold the oldest `n` messages into a new summary first. Errors go
+            // through the same scrub as replies, so the API key never appears;
+            // neither the summary nor any message content is ever logged.
+            let (system, messages) = context::summary_request(&summary, &history[..n], profile.max_context_tokens);
+            let req = ChatRequest {
+                model: profile.model.clone(),
+                system,
+                messages,
+                max_output_tokens: 1024,
+                temperature: profile.temperature,
+                show_reasoning: false,
+                reasoning_effort: None,
+                tools: Vec::new(),
+                allow_tool_calls: false,
+                continuation: Vec::new(),
+            };
+            let summarize = async {
+                let mut stream = provider.stream_chat(&req).await.map_err(&scrub)?;
+                let mut text = String::new();
+                while let Some(ev) = stream.next().await {
+                    match ev.map_err(&scrub)? {
+                        StreamEvent::Text(t) => text.push_str(&t),
+                        StreamEvent::Reasoning(_) | StreamEvent::ToolCalls { .. } => {}
+                    }
+                }
+                Ok::<_, String>(text)
+            };
+            let outcome = tokio::select! {
+                _ = &mut stop => None,
+                r = tokio::time::timeout(SUMMARY_TIMEOUT, summarize) => match r {
+                    Ok(Ok(text)) if !text.trim().is_empty() => Some(text),
+                    _ => None,
+                },
+            };
+            match outcome {
+                Some(text) => {
+                    summary = text;
+                    let upto_seq = history[n - 1].seq;
+                    let _ = on_event.send(GenEvent::Summary { text: summary.clone(), upto_seq });
+                    // The folded messages leave the prompt; the summary covers them.
+                    kept = &history[n..];
+                }
+                None if stop.is_terminated() => {
+                    // The user stopped while summarizing: no reply at all.
+                    let _ = on_event.send(GenEvent::Done { content: String::new(), stopped: true });
+                    if let Ok(mut g) = app.state::<AppState>().generations.lock() {
+                        g.remove(&id);
+                    }
+                    return;
+                }
+                None => {
+                    let _ = on_event.send(GenEvent::Notice {
+                        message: "Couldn't summarize earlier messages, so the oldest were left out".into(),
+                    });
+                    // Fall back to today's behavior: the old summary and the full
+                    // history, which trims.
+                }
+            }
+        }
+        let prompt = context::build(kept, &room_prompt, &summary, profile.max_context_tokens);
+        if prompt.messages.is_empty() {
+            let _ = on_event.send(GenEvent::Error { message: "Nothing to reply to".into(), partial: String::new() });
+            if let Ok(mut g) = app.state::<AppState>().generations.lock() {
+                g.remove(&id);
+            }
+            return;
+        }
+        if prompt.trimmed > 0 {
+            eprintln!("[context] dropped {} oldest message(s) to fit {} tokens", prompt.trimmed, profile.max_context_tokens);
+        }
+        let req = ChatRequest {
+            model: profile.model.clone(),
+            system: prompt.system,
+            messages: prompt.messages,
+            max_output_tokens: context::output_reserve(profile.max_context_tokens),
+            temperature: profile.temperature,
+            show_reasoning: profile.show_reasoning,
+            reasoning_effort: profile.reasoning_effort.clone(),
+            tools: Vec::new(),
+            allow_tool_calls: true,
+            continuation: Vec::new(),
+        };
+        let job = generate::Job {
+            id: id.clone(),
+            provider,
+            req,
+            servers,
+            mcp,
+            approvals,
+            scrub: Box::new(scrub),
+            events: on_event,
+            stop,
+        };
         generate::run(job).await;
         if let Ok(mut g) = app.state::<AppState>().generations.lock() {
             g.remove(&id);

@@ -64,6 +64,8 @@ export const backend = {
     roomId: string,
     history: HistoryItem[],
     roomPrompt: string,
+    /** The room's shared summary of messages before `history` ("" = none). */
+    summary: string,
     /** For another of this user's devices: MCP tools only with remote control on, and
      *  every call is approved first, even on an Auto server. */
     delegated: boolean,
@@ -71,7 +73,7 @@ export const backend = {
   ) => {
     const channel = new Channel<GenEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, delegated, onEvent: channel });
+    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, summary, delegated, onEvent: channel });
   },
   stopGeneration: (id: string) => invoke<void>("stop_generation", { id }),
 
