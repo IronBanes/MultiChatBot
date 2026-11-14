@@ -115,9 +115,9 @@ all rooms. The first client frame must be `hello`.
 | `create_link_code` | `request_id, secret` | → `link_code` (8 characters); one live code per user, valid 10 min, single use; `secret` must be the account's (it's handed to the redeeming device) |
 | `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
 | `search_messages` | `request_id, room_id, query` | full-text search of that room's messages (prefix match on the last word, ≤ 200 chars); → `search_results`; members only |
-| `lend_tools` | `room_id, servers: LentServer[]` | replaces what this connection lends in that room (empty = stops lending there); requires membership; ≤ 20 servers, ≤ 100 tools in total, ≤ 256 KiB serialized, names clipped like other names, else `error`; only tool names, descriptions and input schemas ever leave the lender → broadcast as `room_tools` |
-| `call_lent_tool` | `request_id, room_id, device_id, server_id, tool, args` | a room member's AI calls a tool of a connection of a room member's `device_id` that currently lends `server_id` containing `tool` there; `args` ≤ 64 KiB, at most 4 outstanding per calling connection → `lent_tool_call` to the lender only (or `error` with the request_id, e.g. "That tool isn't shared here anymore"); never stored |
-| `lent_tool_result` | `request_id, content, is_error, images: LentImage[]` | the lender's answer; accepted only from the lender connection recorded for that `request_id`; content clipped to 200,000 chars, ≤ 4 images of png/jpeg/webp/gif and ≤ the attachment size cap (others dropped) → `lent_tool_result` to the caller only, and the pending entry is removed |
+| `lend_tools` | `room_id, servers: LentServer[]` | replaces what this connection lends in that room (empty = stops lending there); requires membership; ≤ 20 servers, ≤ 100 tools in total, ≤ 256 KiB serialized, names clipped like other names and descriptions to 2,000 chars, else `error`; only tool names, descriptions and input schemas ever leave the lender → broadcast as `room_tools` |
+| `call_lent_tool` | `request_id, room_id, device_id, server_id, tool, args` | a room member's AI calls a tool of a connection of a room member's `device_id` that currently lends `server_id` containing `tool` there; `args` ≤ 64 KiB, at most 4 outstanding per calling connection → `lent_tool_call` to the lender only, under an id the relay makes up (the lender never sees the caller's `request_id`, so a caller can't reuse another caller's id to take over their result), or `error` with the request_id, e.g. "That tool isn't shared here anymore"; never stored |
+| `lent_tool_result` | `request_id, content, is_error, images: LentImage[]` | the lender's answer, under the relay's id from `lent_tool_call`; accepted only from the lender connection recorded for it; content clipped to 200,000 chars, ≤ 4 images of png/jpeg/webp/gif and ≤ the attachment size cap (others dropped) → `lent_tool_result` to the caller only, and the pending entry is removed |
 | `cancel_lent_tool` | `request_id` | the caller gives up; accepted only from the caller connection → `lent_tool_cancelled` to the lender, pending entry removed |
 
 ### Server → client
@@ -155,8 +155,8 @@ all rooms. The first client frame must be `hello`.
 | `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline, or shares profiles) |
 | `room_tools` | `room_id, user_id, display_name, device_id, servers: LentServer[]` (what one connection lends there: on every `lend_tools`, one per other lending connection when a connection joins or opens the room, and empty `servers` when that connection stops lending — on `lend_tools` with an empty list, leaving, or disconnecting) |
 | `lent_tool_call` | `request_id, room_id, from_user_id, from_name, server_id, tool, args` (delivered to the lender connection only; `from_user_id`/`from_name` are stamped by the relay, never taken from the caller; never stored) |
-| `lent_tool_result` | `request_id, content, is_error, images: LentImage[]` (delivered to the caller connection only) |
-| `lent_tool_cancelled` | `request_id` (the caller gave up; delivered to the lender connection only) |
+| `lent_tool_result` | `request_id, content, is_error, images: LentImage[]` (delivered to the caller connection only, under the caller's own `request_id`) |
+| `lent_tool_cancelled` | `request_id` (the relay's id; the caller gave up or left; delivered to the lender connection only) |
 | `error` | `request_id?, message` |
 
 `RoomInfo = {id, name, invite_code, system_prompt, summary, summary_upto_seq, members: Member[]}`
