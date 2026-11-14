@@ -11,10 +11,10 @@ mod net;
 mod providers;
 mod secrets;
 
-use config::{Config, McpMode, McpServer, McpTransport, NotifyMode, Profile};
+use config::{Config, LendRule, McpMode, McpServer, McpTransport, NotifyMode, Profile};
 use context::HistoryItem;
 use futures_util::StreamExt;
-use generate::{Approvals, GenEvent};
+use generate::{Approvals, GenEvent, LentResult, LentToolSpec};
 use mcp::McpManager;
 use providers::{ChatRequest, ModelInfo, ProviderError, StreamEvent};
 use secrets::McpSecrets;
@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::ipc::Channel;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tokio::sync::oneshot;
 
 struct AppState {
@@ -34,6 +34,8 @@ struct AppState {
     /// In-flight generations by AI message id; sending stops the stream.
     generations: Mutex<HashMap<String, oneshot::Sender<()>>>,
     approvals: Approvals,
+    /// Lenders' answers to borrowed tool calls: "<message id>:<call id>".
+    lent_results: generate::LentResults,
     mcp: Arc<McpManager>,
     host: Arc<host::Host>,
     /// Held for a whole secret-plus-settings save, so two saves can't interleave their
@@ -92,6 +94,23 @@ fn mcp_view(server: McpServer) -> McpServerView {
     McpServerView { server, env_names: s.env.into_keys().collect(), header_names: s.headers.into_keys().collect() }
 }
 
+/// The servers this device lends in a room, as `lend_tools` sends them: each
+/// server's real tool names, descriptions and input schemas.
+#[derive(Serialize)]
+struct LentServerOut {
+    id: String,
+    name: String,
+    tools: Vec<LentToolOut>,
+}
+
+/// One lent tool in the relay's `LentTool` shape.
+#[derive(Serialize)]
+struct LentToolOut {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
+}
+
 #[derive(Serialize)]
 struct ClientState {
     instance: String,
@@ -108,6 +127,8 @@ struct ClientState {
     mcp_servers: Vec<McpServerView>,
     mcp_modes_by_room: HashMap<String, HashMap<String, McpMode>>,
     notify_by_room: HashMap<String, NotifyMode>,
+    lent_mcp_by_room: HashMap<String, HashMap<String, LendRule>>,
+    borrowed_mcp_by_room: HashMap<String, Vec<String>>,
     remote_control: bool,
 }
 
@@ -158,6 +179,8 @@ fn get_state(state: State<'_, AppState>) -> Result<ClientState, String> {
         mcp_servers: cfg.mcp_servers.into_iter().map(mcp_view).collect(),
         mcp_modes_by_room: cfg.mcp_modes_by_room,
         notify_by_room: cfg.notify_by_room,
+        lent_mcp_by_room: cfg.lent_mcp_by_room,
+        borrowed_mcp_by_room: cfg.borrowed_mcp_by_room,
         remote_control: cfg.remote_control,
     })
 }
@@ -618,6 +641,10 @@ async fn delete_mcp_server(state: State<'_, AppState>, id: String) -> Result<(),
         for modes in c.mcp_modes_by_room.values_mut() {
             modes.remove(&id);
         }
+        // Lending a deleted server means nothing: the rule goes with it.
+        for rules in c.lent_mcp_by_room.values_mut() {
+            rules.remove(&id);
+        }
     })
 }
 
@@ -690,6 +717,257 @@ fn resolve_tool_call(state: State<'_, AppState>, id: String, call_id: String, ap
     }
 }
 
+// ------------------------------------------------------- lending MCP tools
+
+/// Refuses what only the desktop app may do (lending runs its tools here).
+fn refuse_mobile_lending() -> Result<(), String> {
+    #[cfg(mobile)]
+    {
+        return Err("Lending tools needs the desktop app".into());
+    }
+    #[cfg(not(mobile))]
+    Ok(())
+}
+
+/// Lends (or unlends) one of this device's MCP servers to a room. Only set
+/// here, never through a `device_command` or from the relay.
+#[tauri::command]
+fn set_mcp_lend(state: State<'_, AppState>, room_id: String, server_id: String, lent: bool) -> Result<(), String> {
+    refuse_mobile_lending()?;
+    state.update(|c| {
+        if lent {
+            c.lent_mcp_by_room.entry(room_id).or_default().insert(server_id, LendRule::default());
+        } else if let Some(rules) = c.lent_mcp_by_room.get_mut(&room_id) {
+            rules.remove(&server_id);
+        }
+        Ok(())
+    })?
+}
+
+/// Lets one member's AI run a lent server's tools without asking, or asks
+/// again. Only set here; the confirmation in the UI warns what it means.
+#[tauri::command]
+fn set_mcp_lend_auto(state: State<'_, AppState>, room_id: String, server_id: String, user_id: String, auto: bool) -> Result<(), String> {
+    refuse_mobile_lending()?;
+    state.update(|c| {
+        // Only a server that is lent in that room has an Auto to turn on.
+        let Some(rule) = c.lent_mcp_by_room.get_mut(&room_id).and_then(|r| r.get_mut(&server_id)) else {
+            return Err("That server isn't shared with this room".into());
+        };
+        if auto {
+            if !rule.auto_users.contains(&user_id) {
+                rule.auto_users.push(user_id);
+            }
+        } else {
+            rule.auto_users.retain(|u| *u != user_id);
+        }
+        Ok(())
+    })?
+}
+
+/// The servers this device lends in a room, with their real tool names,
+/// descriptions and input schemas (unqualified). Servers that fail to
+/// connect are left out.
+#[tauri::command]
+async fn lent_tools(state: State<'_, AppState>, room_id: String) -> Result<Vec<LentServerOut>, String> {
+    refuse_mobile_lending()?;
+    let cfg = state.snapshot()?;
+    let Some(rules) = cfg.lent_mcp_by_room.get(&room_id) else { return Ok(Vec::new()) };
+    let servers: Vec<(McpServer, McpSecrets)> = rules
+        .keys()
+        .filter_map(|id| cfg.mcp_servers.iter().find(|s| s.id == *id).cloned())
+        .map(|s| {
+            let sec = mcp_secrets_for(&s);
+            (s, sec)
+        })
+        .collect();
+    let (device_id, owner_name) = (cfg.device_id.clone(), cfg.display_name.clone());
+    let tools = state.mcp.lent_tools(&servers, &device_id, &owner_name).await;
+    let mut out: Vec<LentServerOut> = Vec::new();
+    for t in tools {
+        let tool = LentToolOut { name: t.tool, description: t.description, input_schema: t.schema };
+        match out.iter_mut().find(|s| s.id == t.server_id) {
+            Some(server) => server.tools.push(tool),
+            None => out.push(LentServerOut { id: t.server_id, name: t.server_name, tools: vec![tool] }),
+        }
+    }
+    Ok(out)
+}
+
+/// The answer to `lent_tool_call`: resolves `lent:<approval_id>` in `state.approvals`.
+#[tauri::command]
+fn answer_lent_tool(state: State<'_, AppState>, approval_id: String, approved: bool) -> Result<(), String> {
+    let tx = state.approvals.lock().map_err(|_| "lock poisoned")?.remove(&format!("lent:{approval_id}"));
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(approved);
+            Ok(())
+        }
+        None => Err("That tool call is no longer waiting for approval".into()),
+    }
+}
+
+/// Resolves a waiting lent-tool approval as denied (the room closed, a
+/// `lent_tool_cancelled` arrived, or the user dismissed the prompt).
+#[tauri::command]
+fn cancel_lent_tool(state: State<'_, AppState>, approval_id: String) -> Result<(), String> {
+    let tx = state.approvals.lock().map_err(|_| "lock poisoned")?.remove(&format!("lent:{approval_id}"));
+    if let Some(tx) = tx {
+        let _ = tx.send(false);
+    }
+    Ok(())
+}
+
+/// Runs a tool a room member's AI asked for (the lender side). The config is
+/// re-checked under the lock before asking and again before running.
+#[derive(Serialize)]
+struct LentRunOut {
+    content: String,
+    is_error: bool,
+    images: Vec<mcp::ToolImage>,
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+async fn run_lent_tool(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    approval_id: String,
+    room_id: String,
+    from_user_id: String,
+    from_name: String,
+    server_id: String,
+    tool: String,
+    args: serde_json::Value,
+) -> Result<LentRunOut, String> {
+    use generate::APPROVAL_TIMEOUT;
+    refuse_mobile_lending()?;
+    // 1. What this room's lending allows for this member, under the lock.
+    let (server, mode) = {
+        let cfg = state.config.lock().map_err(|_| "config lock poisoned")?;
+        let server = cfg.mcp_servers.iter().find(|s| s.id == server_id).cloned();
+        match cfg.lend_mode(&room_id, &server_id, &from_user_id) {
+            None => return Err("That tool isn't shared in this room".into()),
+            Some(mode) => (server, mode),
+        }
+    };
+    let Some(server) = server else { return Err("That tool isn't shared in this room".into()) };
+    let my_name = state.snapshot()?.display_name;
+    // 2. Ask here at this desktop, unless Auto for this member.
+    if mode == McpMode::Ask {
+        // Waiting before the prompt shows, so a quick answer or cancel can't arrive first.
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut a) = state.approvals.lock() {
+            a.insert(format!("lent:{approval_id}"), tx);
+        }
+        let _ = app.emit(
+            "lent_tool_approval",
+            &LentApproval {
+                approval_id: approval_id.clone(),
+                room_id: room_id.clone(),
+                from_user_id: from_user_id.clone(),
+                from_name: from_name.clone(),
+                server_name: server.name.clone(),
+                tool: tool.clone(),
+                args: serde_json::to_string_pretty(&args).unwrap_or_default(),
+            },
+        );
+        let approved = tokio::select! {
+            r = rx => r.ok(),
+            _ = tokio::time::sleep(APPROVAL_TIMEOUT) => None,
+        };
+        if let Ok(mut a) = state.approvals.lock() {
+            a.remove(&format!("lent:{approval_id}"));
+        }
+        match approved {
+            Some(true) => {}
+            Some(false) => {
+                return Ok(LentRunOut {
+                    content: format!("{my_name} declined to run this tool."),
+                    is_error: true,
+                    images: Vec::new(),
+                })
+            }
+            None => {
+                return Ok(LentRunOut {
+                    content: format!("{my_name} didn't answer in time."),
+                    is_error: true,
+                    images: Vec::new(),
+                })
+            }
+        }
+    }
+    // 3. Lending may have been turned off, or the server edited, while waiting:
+    // check again and run the server as it is now.
+    let server = {
+        let cfg = state.config.lock().map_err(|_| "config lock poisoned")?;
+        if cfg.lend_mode(&room_id, &server_id, &from_user_id).is_none() {
+            return Err("That tool isn't shared in this room".into());
+        }
+        cfg.mcp_servers.iter().find(|s| s.id == server_id).cloned()
+    };
+    let Some(server) = server else { return Err("That tool isn't shared in this room".into()) };
+    // 4. Run it here, exactly like a local reply's tool call.
+    let secrets = mcp_secrets_for(&server);
+    let out = state.mcp.call(&server, &secrets, &tool, args).await;
+    let images = if server.share_images { out.images.into_iter().take(4).collect() } else { Vec::new() };
+    Ok(LentRunOut { content: out.text, is_error: out.is_error, images })
+}
+
+/// What a `lent_tool_approval` event carries to the webview. Arguments stay
+/// on this device; nothing here is ever logged.
+#[derive(Serialize, Clone)]
+struct LentApproval {
+    approval_id: String,
+    room_id: String,
+    from_user_id: String,
+    from_name: String,
+    server_name: String,
+    tool: String,
+    args: String,
+}
+
+/// The lender's answer to a borrowed tool call, handed to `generate::run`
+/// through `lent_results` by `lent_tool_result`.
+#[tauri::command]
+fn lent_tool_result(
+    state: State<'_, AppState>,
+    message_id: String,
+    call_id: String,
+    content: String,
+    is_error: bool,
+    images: Vec<mcp::ToolImage>,
+) -> Result<(), String> {
+    let tx = state
+        .lent_results
+        .lock()
+        .map_err(|_| "lock poisoned")?
+        .remove(&format!("{message_id}:{call_id}"));
+    match tx {
+        Some(tx) => {
+            let _ = tx.send(LentResult { content, is_error, images });
+            Ok(())
+        }
+        None => Err("That lent tool call is no longer waiting".into()),
+    }
+}
+
+/// Which of another member's lent servers this device borrows in a room.
+#[tauri::command]
+fn set_mcp_borrow(state: State<'_, AppState>, room_id: String, key: String, on: bool) -> Result<(), String> {
+    state.update(|c| {
+        let list = c.borrowed_mcp_by_room.entry(room_id).or_default();
+        if on {
+            if !list.contains(&key) {
+                list.push(key);
+            }
+        } else {
+            list.retain(|k| *k != key);
+        }
+        Ok(())
+    })?
+}
+
 // ------------------------------------------------------------------ generation
 
 /// How long the summarizing pre-step (all its requests) may take before the reply falls back to
@@ -716,6 +994,8 @@ fn generate(
     // still streaming, or a gap in the loaded history); None = no limit.
     fold_before: Option<i64>,
     delegated: Option<bool>,
+    // Tools borrowed from room members (ignored for delegated replies).
+    lent_tools: Option<Vec<LentToolSpec>>,
     on_event: Channel<GenEvent>,
 ) -> Result<(), String> {
     let cfg = state.snapshot()?;
@@ -757,6 +1037,8 @@ fn generate(
         move |e: ProviderError| providers::sanitize(&e.0, key.as_deref(), &base_url);
     let mcp = state.mcp.clone();
     let approvals = state.approvals.clone();
+    // Cloned before the spawn too: the task must not hold the `State` reference.
+    let lent_results = state.lent_results.clone();
     tauri::async_runtime::spawn(async move {
         // The summary the reply is built with: the room's shared one, replaced by
         // a fresh one when this run summarizes, and kept on failure (the reply
@@ -906,13 +1188,18 @@ fn generate(
             allow_tool_calls: true,
             continuation: Vec::new(),
         };
+        // A reply this desktop generates for the user's phone gets no
+        // borrowed tools in this version.
+        let lent_tools = if delegated { Vec::new() } else { lent_tools.unwrap_or_default() };
         let job = generate::Job {
             id: id.clone(),
             provider,
             req,
             servers,
+            lent_tools,
             mcp,
             approvals,
+            lent_results,
             scrub: Box::new(scrub),
             events: on_event,
             stop,
@@ -1002,6 +1289,7 @@ pub fn run() {
                 http,
                 generations: Mutex::new(HashMap::new()),
                 approvals: Arc::new(Mutex::new(HashMap::new())),
+                lent_results: Arc::new(Mutex::new(HashMap::new())),
                 mcp: Arc::new(McpManager::default()),
                 host,
                 saving: Mutex::new(()),
@@ -1028,6 +1316,14 @@ pub fn run() {
             set_room_notify,
             forget_room_notify,
             resolve_tool_call,
+            set_mcp_lend,
+            set_mcp_lend_auto,
+            lent_tools,
+            answer_lent_tool,
+            cancel_lent_tool,
+            run_lent_tool,
+            lent_tool_result,
+            set_mcp_borrow,
             generate,
             stop_generation,
             host_status,

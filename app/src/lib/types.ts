@@ -124,6 +124,27 @@ export interface SearchHit {
   snippet: string;
 }
 
+/** A tool one room member's AI may call on another member's computer.
+ *  Only names, descriptions and input schemas cross the wire. */
+export interface LentTool {
+  name: string;
+  description: string;
+  input_schema: unknown;
+}
+
+/** An MCP server one room member lends to the room. */
+export interface LentServer {
+  id: string;
+  name: string;
+  tools: LentTool[];
+}
+
+/** An image returned by a lent tool call (base64). */
+export interface LentImage {
+  mime: string;
+  data: string;
+}
+
 export type ClientMsg =
   | { type: "hello"; user_id: string; display_name: string; device_id: string; device_name: string; platform: string; secret: string }
   | { type: "create_room"; request_id: string; name: string }
@@ -153,7 +174,11 @@ export type ClientMsg =
   | { type: "ai_request_failed"; request_id: string; to_device_id: string; message: string }
   | { type: "create_link_code"; request_id: string; secret: string }
   | { type: "redeem_link_code"; request_id: string; code: string }
-  | { type: "search_messages"; request_id: string; room_id: string; query: string };
+  | { type: "search_messages"; request_id: string; room_id: string; query: string }
+  | { type: "lend_tools"; room_id: string; servers: LentServer[] }
+  | { type: "call_lent_tool"; request_id: string; room_id: string; user_id: string; device_id: string; server_id: string; tool: string; args: unknown }
+  | { type: "lent_tool_result"; request_id: string; content: string; is_error: boolean; images: LentImage[] }
+  | { type: "cancel_lent_tool"; request_id: string };
 
 export type ServerMsg =
   | { type: "welcome"; user_id: string; rooms: RoomInfo[] }
@@ -186,6 +211,10 @@ export type ServerMsg =
   | { type: "link_code"; request_id: string; code: string; expires_in_secs: number }
   | { type: "linked"; request_id: string; user_id: string; display_name: string; secret: string }
   | { type: "devices"; devices: Device[] }
+  | { type: "room_tools"; room_id: string; user_id: string; display_name: string; device_id: string; servers: LentServer[] }
+  | { type: "lent_tool_call"; request_id: string; room_id: string; from_user_id: string; from_name: string; server_id: string; tool: string; args: unknown }
+  | { type: "lent_tool_result"; request_id: string; content: string; is_error: boolean; images: LentImage[] }
+  | { type: "lent_tool_cancelled"; request_id: string }
   | { type: "error"; request_id: string | null; message: string };
 
 // ---- Tauri backend ----
@@ -271,6 +300,10 @@ export interface ClientState {
   profiles: ProfileView[];
   mcp_servers: McpServerView[];
   mcp_modes_by_room: Record<string, Record<string, McpMode>>;
+  /** room id → server id → rule for lending that server to the room. */
+  lent_mcp_by_room: Record<string, Record<string, LendRule>>;
+  /** room id → "<device_id>:<server_id>" this device borrows in that room. */
+  borrowed_mcp_by_room: Record<string, string[]>;
   /** Rooms without an entry use "mentions". */
   notify_by_room: Record<string, NotifyMode>;
   /** Lets this user's other devices control this one (desktop, off by default). */
@@ -299,6 +332,32 @@ export interface HistoryItem {
   seq: number;
 }
 
+/** How a lent server treats one member: ask for each call, or Auto (never ask). */
+export interface LendRule {
+  /** User ids whose calls run without asking. */
+  auto_users: string[];
+}
+
+/** One borrowed MCP server tool passed to `generate` (borrowed from a room member). */
+export interface LentToolSpec {
+  /** The lender's account (device ids are self-reported; the relay routes by both). */
+  owner_user_id: string;
+  device_id: string;
+  owner_name: string;
+  server_id: string;
+  server_name: string;
+  tool: string;
+  description: string;
+  schema: unknown;
+}
+
+/** The lender's answer to a borrowed tool call. */
+export interface LentResult {
+  content: string;
+  is_error: boolean;
+  images: LentImage[];
+}
+
 export type GenEvent =
   | { event: "delta"; text: string }
   | { event: "reasoning"; text: string }
@@ -315,6 +374,8 @@ export type GenEvent =
       detail: string | null;
     }
   | { event: "image"; call_id: string; mime: string; data: string }
+  /** A borrowed tool call: the webview sends `call_lent_tool` for it. */
+  | { event: "lent_call"; call_id: string; user_id: string; device_id: string; server_id: string; tool: string; args: unknown }
   | { event: "notice"; message: string }
   | { event: "done"; content: string; stopped: boolean }
   | { event: "error"; message: string; partial: string };

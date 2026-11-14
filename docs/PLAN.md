@@ -115,6 +115,10 @@ all rooms. The first client frame must be `hello`.
 | `create_link_code` | `request_id, secret` | → `link_code` (8 characters); one live code per user, valid 10 min, single use; `secret` must be the account's (it's handed to the redeeming device) |
 | `redeem_link_code` | `request_id, code` | → `linked` with the code owner's `user_id` and `display_name`; max 5 failed tries per connection |
 | `search_messages` | `request_id, room_id, query` | full-text search of that room's messages (prefix match on the last word, ≤ 200 chars); → `search_results`; members only |
+| `lend_tools` | `room_id, servers: LentServer[]` | replaces what this connection lends in that room (empty = stops lending there); requires membership; ≤ 20 servers, ≤ 100 tools in total, ≤ 256 KiB serialized, names clipped like other names and descriptions to 2,000 chars, else `error`; only tool names, descriptions and input schemas ever leave the lender → broadcast as `room_tools` |
+| `call_lent_tool` | `request_id, room_id, user_id, device_id, server_id, tool, args` | a room member's AI calls a tool of a connection of the lender's account `user_id` and its `device_id` (device ids are self-reported, so the account is what binds the call to the right lender) that currently lends `server_id` containing `tool` there; `args` ≤ 64 KiB, at most 4 outstanding per calling connection → `lent_tool_call` to the lender only, under an id the relay makes up (the lender never sees the caller's `request_id`, so a caller can't reuse another caller's id to take over their result), or `error` with the request_id, e.g. "That tool isn't shared here anymore"; never stored |
+| `lent_tool_result` | `request_id, content, is_error, images: LentImage[]` | the lender's answer, under the relay's id from `lent_tool_call`; accepted only from the lender connection recorded for it; content clipped to 200,000 chars, ≤ 4 images of png/jpeg/webp/gif and ≤ the attachment size cap (others dropped) → `lent_tool_result` to the caller only, and the pending entry is removed |
+| `cancel_lent_tool` | `request_id` | the caller gives up; accepted only from the caller connection → `lent_tool_cancelled` to the lender, pending entry removed |
 
 ### Server → client
 
@@ -149,6 +153,10 @@ all rooms. The first client frame must be `hello`.
 | `link_code` | `request_id, code, expires_in_secs` |
 | `linked` | `request_id, user_id, display_name, secret` (the account's secret) |
 | `devices` | `devices: Device[]` (sent after hello and whenever one of the user's devices goes on- or offline, or shares profiles) |
+| `room_tools` | `room_id, user_id, display_name, device_id, servers: LentServer[]` (what one connection lends there, listed by borrowers per `user_id` + `device_id`; when a connection disconnects while another connection of the same device still lends there, the room gets that one's listing instead of an empty one: on every `lend_tools`, one per other lending connection when a connection joins or opens the room, and empty `servers` when that connection stops lending — on `lend_tools` with an empty list, leaving, or disconnecting) |
+| `lent_tool_call` | `request_id, room_id, from_user_id, from_name, server_id, tool, args` (delivered to the lender connection only; `from_user_id`/`from_name` are stamped by the relay, never taken from the caller; never stored) |
+| `lent_tool_result` | `request_id, content, is_error, images: LentImage[]` (delivered to the caller connection only, under the caller's own `request_id`) |
+| `lent_tool_cancelled` | `request_id` (the relay's id; the caller gave up or left; delivered to the lender connection only) |
 | `error` | `request_id?, message` |
 
 `RoomInfo = {id, name, invite_code, system_prompt, summary, summary_upto_seq, members: Member[]}`
@@ -156,6 +164,9 @@ all rooms. The first client frame must be `hello`.
 `Device = {device_id, device_name, platform, profiles: SharedProfile[], mcp_servers: SharedMcpServer[], remote_control}` (empty and false unless that device sent `share_profiles`)
 `SharedProfile = {id, label, model, enabled}`
 `SharedMcpServer = {id, name, default_mode, room_modes: {room_id: mode}}` (modes are `off`, `ask` or `auto`; a server with any other default isn't listed, and any other room mode is dropped)
+`LentServer = {id, name, tools: LentTool[]}`, `LentTool = {name, description, input_schema}` (a member's
+real tool names, descriptions and input schemas; never the server's command, URL, env or headers)
+`LentImage = {mime, data}` (base64; png, jpeg, webp or gif)
 `DeviceCommand` is tagged by `kind`: `set_mcp_mode {room_id, server_id, mode}`, `set_profile_enabled {profile_id, enabled}`, `tool_approval {room_id, message_id, call_id, server, tool, args}`, `answer_tool {message_id, call_id, approved}`
 `Reaction = {emoji, user_ids}` (grouped per emoji, in first-use order)
 `Message = {id, room_id, seq, kind, author_id, author_name, content, reasoning, tools,
@@ -243,6 +254,43 @@ To approve, a device needs the tool's arguments, so `tool_approval` carries them
 stored or sent to the room. Results stay on the desktop, as for any other reply. A waiting
 approval is offered again on every `devices` frame, so a phone that dropped off gets it
 back when it signs in, even if its old connection hadn't closed yet.
+
+### Lending tools to a room
+
+An MCP server only works for replies generated on the computer that has it. Lending
+lets a room member's AI use another member's server: the **lender**'s device publishes
+the server's tool names, descriptions and input schemas with `lend_tools`; the
+**borrower**'s model sees those tools among its own, and when it calls one the call
+travels as `call_lent_tool` → `lent_tool_call` to the lender, runs there, and the result
+comes back as `lent_tool_result` (twice: lender → relay → caller). The lender's API key
+and MCP secrets are never involved; only tool metadata and results cross, and nothing
+is stored by the relay.
+
+- **Off by default, per room and per server, and only set at the lender's own desktop**
+  (a Tauri command, never through `device_command`, never from the relay). `lend_tools`
+  with an empty list stops lending in that room.
+- **Every lent call is approved at the lender's desktop**, unless the lender turned on
+  **Auto for that one person** (user id) on that server in that room — which always
+  asks a warning confirmation first, because that person's AI can then run any of the
+  server's tools, as often as it wants, without the lender seeing the request. Auto
+  per person also trusts the relay's report of who is asking: the relay stamps
+  `from_user_id`/`from_name` itself, but whoever runs the relay could forge them, so
+  Auto is only for someone who already trusts the relay's operator.
+- The lender's Rust backend re-checks the config **under the settings lock** for every
+  call (`Config::lend_mode`), right before asking and again before running — never the
+  webview's cached copy. Turning lending off stops calls at once; a call that was
+  waiting on an approval is then refused.
+- **Only tool names, descriptions and input schemas leave the lender.** A server's
+  command, URL, env vars and headers never do; `lent_tools` reads them from a live
+  MCP connection, and a server that fails to connect simply isn't lent.
+- The relay stores nothing of this: it forwards between members of the room only,
+  caps what crosses (≤ 20 servers, ≤ 100 tools, ≤ 256 KiB per `lend_tools`; ≤ 64 KiB
+  args and ≤ 4 outstanding calls per caller; results clipped to 200,000 chars and
+  ≤ 4 images of png/jpeg/webp/gif), and answers a caller whose lender went offline
+  with an error result.
+- A borrower picks which lent servers to use per room ("Shared with you"), off by
+  default; a delegated reply (one this desktop makes for the user's phone) gets no
+  borrowed tools in this version.
 
 ## Context building (Rust, `app/src-tauri/src/context.rs`)
 

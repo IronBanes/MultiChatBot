@@ -6,6 +6,9 @@ import type {
   GenEvent,
   HistoryItem,
   HostStatus,
+  LentImage,
+  LentServer,
+  LentToolSpec,
   McpMode,
   McpServer,
   McpServerView,
@@ -16,6 +19,12 @@ import type {
   ProfileView,
   SecretEdit,
 } from "./types";
+
+/** A lent server as `lent_tools` returns it (real tools, unqualified names). */
+export type LentServerOut = LentServer;
+
+/** An image from `run_lent_tool` (base64). */
+export type LentImageOut = LentImage;
 
 export const backend = {
   getState: () => invoke<ClientState>("get_state"),
@@ -58,6 +67,47 @@ export const backend = {
   resolveToolCall: (id: string, callId: string, approved: boolean, remote = false) =>
     invoke<void>("resolve_tool_call", { id, callId, approved, remote }),
 
+  // ---- lending MCP tools to a room ----
+  /** Lends (or unlends) one of this device's servers to a room. */
+  setMcpLend: (roomId: string, serverId: string, lent: boolean) =>
+    invoke<void>("set_mcp_lend", { roomId, serverId, lent }),
+  /** Auto for one member: their AI runs a lent server's tools without asking. */
+  setMcpLendAuto: (roomId: string, serverId: string, userId: string, auto: boolean) =>
+    invoke<void>("set_mcp_lend_auto", { roomId, serverId, userId, auto }),
+  /** The servers this device lends in a room, with their real tools. */
+  lentTools: (roomId: string) => invoke<LentServerOut[]>("lent_tools", { roomId }),
+  /** Answers a lent tool approval prompt. */
+  answerLentTool: (approvalId: string, approved: boolean) =>
+    invoke<void>("answer_lent_tool", { approvalId, approved }),
+  /** Dismisses a lent tool approval prompt (counts as denied). */
+  cancelLentTool: (approvalId: string) =>
+    invoke<void>("cancel_lent_tool", { approvalId }),
+  /** Runs another member's tool call on this computer (lender side). */
+  runLentTool: (
+    approvalId: string,
+    roomId: string,
+    fromUserId: string,
+    fromName: string,
+    serverId: string,
+    tool: string,
+    args: unknown,
+  ) =>
+    invoke<{ content: string; is_error: boolean; images: LentImageOut[] }>("run_lent_tool", {
+      approvalId,
+      roomId,
+      fromUserId,
+      fromName,
+      serverId,
+      tool,
+      args,
+    }),
+  /** Hands the lender's answer to a waiting borrowed tool call. */
+  lentToolResult: (messageId: string, callId: string, content: string, isError: boolean, images: LentImageOut[]) =>
+    invoke<void>("lent_tool_result", { messageId, callId, content, isError, images }),
+  /** Switches one of another member's lent servers on or off for this device. */
+  setMcpBorrow: (roomId: string, key: string, on: boolean) =>
+    invoke<void>("set_mcp_borrow", { roomId, key, on }),
+
   generate: (
     id: string,
     profileId: string,
@@ -71,11 +121,13 @@ export const backend = {
     /** For another of this user's devices: MCP tools only with remote control on, and
      *  every call is approved first, even on an Auto server. */
     delegated: boolean,
+    /** Tools borrowed from room members (see `room_tools` / `call_lent_tool`). */
+    lentTools: LentToolSpec[],
     onEvent: (e: GenEvent) => void,
   ) => {
     const channel = new Channel<GenEvent>();
     channel.onmessage = onEvent;
-    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, summary, foldBefore, delegated, onEvent: channel });
+    return invoke<void>("generate", { id, profileId, roomId, history, roomPrompt, summary, foldBefore, delegated, lentTools, onEvent: channel });
   },
   stopGeneration: (id: string) => invoke<void>("stop_generation", { id }),
 

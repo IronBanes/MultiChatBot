@@ -3,6 +3,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { isPermissionGranted, onAction, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
 import { create, type StoreApi } from "zustand";
+import { listen } from "@tauri-apps/api/event";
 import { backend, errorText } from "./lib/backend";
 import { prepareImage } from "./lib/images";
 import { Relay, type ConnStatus } from "./lib/relay";
@@ -12,6 +13,8 @@ import type {
   Device,
   DeviceCommand,
   HistoryItem,
+  LentServer,
+  LentToolSpec,
   McpMode,
   Message,
   NotifyMode,
@@ -40,6 +43,24 @@ export interface Toast {
   id: number;
   text: string;
   kind: "error" | "info";
+}
+
+/** One member's AI waiting to run a tool on this computer (lender side). */
+export interface LentPrompt {
+  approvalId: string;
+  roomId: string;
+  fromName: string;
+  serverName: string;
+  tool: string;
+  args: string;
+}
+
+/** What one room member currently lends: their identity plus their lent servers. */
+export interface RoomLender {
+  user_id: string;
+  device_id: string;
+  display_name: string;
+  servers: LentServer[];
 }
 
 interface ChatState {
@@ -72,6 +93,11 @@ interface ChatState {
   remoteTools: Record<string, Record<string, RemoteTool>>;
   /** attachment id → data URL ("" while loading). */
   images: Record<string, string>;
+  /** Room id → "<user id>:<device id>" → what that member's device lends there. A
+   *  device id alone is self-reported, so another account could claim it. */
+  roomTools: Record<string, Record<string, RoomLender>>;
+  /** Approvals waiting here: another member's AI wants to run a lent tool. */
+  lentPrompts: LentPrompt[];
   /** Room id → user id → who is typing and when that expires (never persisted). */
   typing: Record<string, Record<string, { name: string; until: number }>>;
   /** A pending "scroll to this message" from a search jump: MessageList scrolls
@@ -132,6 +158,17 @@ interface ChatState {
   /** Settings → General: asks for the OS permission if needed, then shows a sample. */
   testNotification(): Promise<void>;
   answerToolCall(id: string, callId: string, approved: boolean): void;
+  /** Lender: shares (or unshares) one of this device's servers with a room. */
+  setMcpLend(roomId: string, serverId: string, lent: boolean): Promise<void>;
+  /** Lender: lets one member's AI run a lent server without asking. */
+  setMcpLendAuto(roomId: string, serverId: string, userId: string, auto: boolean): Promise<void>;
+  /** Borrower: switches one of another member's lent servers on or off. */
+  setMcpBorrow(roomId: string, key: string, on: boolean): Promise<void>;
+  /** Lender: answers a room member's tool call request. */
+  answerLentTool(approvalId: string, approved: boolean): Promise<void>;
+  /** Lender: tells each room again what this device shares there (after a server
+   *  it shares was edited or removed). */
+  shareLentTools(): Promise<void>;
   loadImage(attachmentId: string): void;
   toast(text: string, kind?: Toast["kind"]): void;
   dismissToast(id: number): void;
@@ -156,6 +193,35 @@ export function mentions(content: string, name: string): boolean {
 /** A profile on another of this user's devices is referenced as `remote:<device_id>:<profile_id>`. */
 export function remoteProfileId(deviceId: string, profileId: string): string {
   return `remote:${deviceId}:${profileId}`;
+}
+
+/** The borrowed tools a reply in `roomId` may use: the servers this device
+ *  switched on (per-device choice) from what other members currently lend. */
+export function lentToolsFor(roomId: string, s: { client: ClientState | null; roomTools: Record<string, Record<string, RoomLender>> }) {
+  const on = s.client?.borrowed_mcp_by_room[roomId] ?? [];
+  if (on.length === 0) return [];
+  const out: LentToolSpec[] = [];
+  const seen = new Set<string>();
+  for (const [lenderKey, lender] of Object.entries(s.roomTools[roomId] ?? {})) {
+    for (const server of lender.servers) {
+      for (const t of server.tools) {
+        const key = `${lenderKey}:${server.id}`;
+        if (!on.includes(key) || seen.has(`${key}:${t.name}`)) continue;
+        seen.add(`${key}:${t.name}`);
+        out.push({
+          owner_user_id: lender.user_id,
+          device_id: lender.device_id,
+          owner_name: lender.display_name,
+          server_id: server.id,
+          server_name: server.name,
+          tool: t.name,
+          description: t.description,
+          schema: t.input_schema,
+        });
+      }
+    }
+  }
+  return out;
 }
 
 /** What a remote server does for replies in `roomId`. Auto counts as Ask: a delegated
@@ -187,6 +253,10 @@ const delegatedGenerations = new Map<string, string>();
 /** "<message id>:<call id>" → the approval a delegated reply is waiting on, kept so
  *  it can be sent again if the asking device was away (phones drop off often). */
 const pendingApprovals = new Map<string, { deviceId: string; command: DeviceCommand }>();
+/** Counts `shareMyLentTools` runs, so only the newest one sends. */
+let lentPublishes = 0;
+/** "<message id>:<call id>" → the lent call this client is waiting on (borrower side). */
+const pendingLentCalls = new Map<string, { deviceId: string }>();
 /** Tool arguments sent for approval: enough to judge, and well inside the relay's limit. */
 const MAX_APPROVAL_ARGS = 16_000;
 /** The profile list last shared on the current connection (null: none yet). */
@@ -450,6 +520,48 @@ export const useChat = create<ChatState>((set, get) => {
     return request<void>((request_id) => ({ type: "device_command", request_id, device_id: deviceId, command }));
   }
 
+  /** Publishes what this device lends in each room, on this connection and
+   *  whenever lending changes. Lending is only decided here, never through a
+   *  `device_command`: the backend refuses those on every path anyway. */
+  async function shareMyLentTools() {
+    const client = get().client;
+    if (!relay || !client || client.platform !== "desktop") return;
+    // Listing tools can be slow; a newer publish reads newer settings, so an older
+    // one still running must not send after it (the relay keeps the last frame).
+    const publish = ++lentPublishes;
+    for (const roomId of Object.keys(client.lent_mcp_by_room)) {
+      try {
+        const servers = await backend.lentTools(roomId);
+        if (publish !== lentPublishes) return;
+        // Sending an empty list stops lending there (the last one was unlent).
+        relay?.send({ type: "lend_tools", room_id: roomId, servers });
+      } catch {
+        // Never log the failure: tool names could hint at what's shared.
+      }
+    }
+  }
+
+  /** Answers a room member's tool call (the `lent_tool_call` handler). */
+  async function runLentTool(
+    requestId: string,
+    roomId: string,
+    fromUserId: string,
+    fromName: string,
+    serverId: string,
+    tool: string,
+    args: unknown,
+  ) {
+    try {
+      const out = await backend.runLentTool(requestId, roomId, fromUserId, fromName, serverId, tool, args);
+      relay?.send({ type: "lent_tool_result", request_id: requestId, content: out.content, is_error: out.is_error, images: out.images });
+    } catch (e) {
+      relay?.send({ type: "lent_tool_result", request_id: requestId, content: errorText(e), is_error: true, images: [] });
+    } finally {
+      // Answered here, timed out, or refused: the prompt (if any) is done.
+      set((s) => ({ lentPrompts: s.lentPrompts.filter((p) => p.approvalId !== requestId) }));
+    }
+  }
+
   /** Offers a waiting tool call to the device the reply is for. Best effort: the PC
    *  shows the same prompt, and it's offered again on the next `devices` frame. */
   function offerApproval(p: { deviceId: string; command: DeviceCommand }) {
@@ -563,6 +675,16 @@ export const useChat = create<ChatState>((set, get) => {
           }
           // The relay marks our in-flight replies as interrupted when the socket drops.
           if (status === "offline") stopAllGenerations();
+          // Lending state lives on the relay: a new connection hears it again
+          // from its room frames. Borrowed calls in flight can't return.
+          if (status === "offline") {
+            pendingLentCalls.clear();
+            set({ roomTools: {} });
+            // The relay ended the calls waiting on this device too: deny them here,
+            // so a late Approve can't run a tool nobody is waiting for.
+            for (const p of get().lentPrompts) void backend.cancelLentTool(p.approvalId).catch(() => {});
+            set({ lentPrompts: [] });
+          }
           if (status !== "online") set({ devices: [] });
           if (status === "online") set({ status, connError: null });
           else if (error) set({ status, connError: error });
@@ -727,6 +849,10 @@ export const useChat = create<ChatState>((set, get) => {
       if (streaming) foldBefore = streaming.seq;
     }
 
+    // Borrowed tools: the switched-on servers of other members that are
+    // currently lending in this room (a per-device choice, off by default).
+    const borrowed = lentToolsFor(roomId, s);
+
     const id = crypto.randomUUID();
     if (!relay?.send({ type: "ai_start", room_id: roomId, id, anchor_id: anchor.id, model: profile.model })) {
       get().toast("Not connected to the server");
@@ -743,6 +869,13 @@ export const useChat = create<ChatState>((set, get) => {
     const finish = () => {
       stopDelegatedTracking?.();
       dropApprovals(id);
+      // Borrowed calls still waiting are cancelled: the reply is over.
+      for (const requestId of [...pendingLentCalls.keys()]) {
+        if (requestId.startsWith(`${id}:`)) {
+          pendingLentCalls.delete(requestId);
+          relay?.send({ type: "cancel_lent_tool", request_id: requestId });
+        }
+      }
       set((st) => {
         const { [id]: _, ...rest } = st.myGenerations;
         return { myGenerations: rest };
@@ -750,7 +883,7 @@ export const useChat = create<ChatState>((set, get) => {
     };
 
     backend
-      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", summary, foldBefore, !!stopDelegatedTracking, (ev) => {
+      .generate(id, profileId, roomId, history, room?.system_prompt ?? "", summary, foldBefore, !!stopDelegatedTracking, borrowed, (ev) => {
         if (ev.event === "delta") {
           relay?.send({ type: "ai_delta", room_id: roomId, id, delta: ev.text });
         } else if (ev.event === "reasoning") {
@@ -793,6 +926,28 @@ export const useChat = create<ChatState>((set, get) => {
               get().toast(`Couldn't share an image: ${errorText(e)}`);
             }
           });
+        } else if (ev.event === "lent_call") {
+          // A borrowed tool: the request id ties the relay frame to the
+          // waiting generate task ("<message id>:<call id>").
+          const request_id = `${id}:${ev.call_id}`;
+          pendingLentCalls.set(request_id, { deviceId: ev.device_id });
+          const ok = relay?.send({
+            type: "call_lent_tool",
+            request_id,
+            room_id: roomId,
+            user_id: ev.user_id,
+            device_id: ev.device_id,
+            server_id: ev.server_id,
+            tool: ev.tool,
+            args: ev.args,
+          });
+          if (!ok) {
+            pendingLentCalls.delete(request_id);
+            // Nothing will come back: the reply shouldn't wait out the timeout.
+            void backend
+              .lentToolResult(id, ev.call_id, "Not connected to the server", true, [])
+              .catch(() => {});
+          }
         } else if (ev.event === "summary") {
           // The reply summarized the older history: share it with the room, so
           // every member's AI uses the same one.
@@ -830,6 +985,8 @@ export const useChat = create<ChatState>((set, get) => {
         // A new connection starts with nothing shared: publish this desktop's profiles.
         lastSharedProfiles = null;
         shareMyProfiles();
+        // ...and what it lends to each room, if anything.
+        void shareMyLentTools();
         const rooms: Record<string, RoomInfo> = {};
         for (const r of msg.rooms) rooms[r.id] = r;
         const order = msg.rooms.map((r) => r.id);
@@ -882,6 +1039,9 @@ export const useChat = create<ChatState>((set, get) => {
           // A load_older sent around leaving is refused without an answer; a flag left
           // set would block loading older pages (and replies waiting on them) after a rejoin.
           const { [msg.room_id]: _o, ...loadingOlder } = s.loadingOlder;
+          // Other members' shared tools: a rejoin hears the current ones again, and a
+          // stop missed while away must not leave a stale entry.
+          const { [msg.room_id]: _t, ...roomTools } = s.roomTools;
           const client = s.client && { ...s.client, notify_by_room: withoutKey(s.client.notify_by_room, msg.room_id) };
           return {
             client,
@@ -891,6 +1051,7 @@ export const useChat = create<ChatState>((set, get) => {
             loaded,
             hasMore,
             loadingOlder,
+            roomTools,
             activeRoomId: s.activeRoomId === msg.room_id ? (roomOrder[0] ?? null) : s.activeRoomId,
           };
         });
@@ -1001,6 +1162,60 @@ export const useChat = create<ChatState>((set, get) => {
       }
       case "device_command":
         void runDeviceCommand(msg.request_id, msg.from_device_id, msg.command);
+        break;
+      case "room_tools": {
+        // What one room member's device lends. Our own device's frames are
+        // ignored (this device's lending is configured here, not received).
+        const me = get().client;
+        if (me && msg.device_id === me.device_id && msg.user_id === me.user_id) break;
+        const lenderKey = `${msg.user_id}:${msg.device_id}`;
+        set((s) => {
+          const room = s.roomTools[msg.room_id] ?? {};
+          if (msg.servers.length === 0) {
+            if (!(lenderKey in room)) return {};
+            const { [lenderKey]: _, ...rest } = room;
+            return { roomTools: { ...s.roomTools, [msg.room_id]: rest } };
+          }
+          return {
+            roomTools: {
+              ...s.roomTools,
+              [msg.room_id]: {
+                ...room,
+                [lenderKey]: { user_id: msg.user_id, device_id: msg.device_id, display_name: msg.display_name, servers: msg.servers },
+              },
+            },
+          };
+        });
+        break;
+      }
+      case "lent_tool_call":
+        // A room member's AI wants to run one of this device's lent tools.
+        void runLentTool(
+          msg.request_id,
+          msg.room_id,
+          msg.from_user_id,
+          msg.from_name,
+          msg.server_id,
+          msg.tool,
+          msg.args,
+        );
+        break;
+      case "lent_tool_result": {
+        // The lender answered our borrowed tool call: the request id is
+        // "<message id>:<call id>".
+        pendingLentCalls.delete(msg.request_id);
+        const cut = msg.request_id.indexOf(":");
+        if (cut > 0) {
+          const messageId = msg.request_id.slice(0, cut);
+          const callId = msg.request_id.slice(cut + 1);
+          void backend.lentToolResult(messageId, callId, msg.content, msg.is_error, msg.images).catch(() => {});
+        }
+        break;
+      }
+      case "lent_tool_cancelled":
+        // The caller gave up: drop the prompt here and deny it in the backend.
+        set((s) => ({ lentPrompts: s.lentPrompts.filter((p) => p.approvalId !== msg.request_id) }));
+        void backend.cancelLentTool(msg.request_id).catch(() => {});
         break;
       case "device_reply": {
         const pending = pendingRequests.get(msg.request_id);
@@ -1202,6 +1417,15 @@ export const useChat = create<ChatState>((set, get) => {
         if (pending && msg.request_id) {
           pendingRequests.delete(msg.request_id);
           pending.reject(new Error(msg.message));
+        } else if (msg.request_id && pendingLentCalls.delete(msg.request_id)) {
+          // A borrowed tool call was refused (say, it's no longer lent here):
+          // the waiting reply gets the reason as the tool's error text.
+          const cut = msg.request_id.indexOf(":");
+          if (cut > 0) {
+            const messageId = msg.request_id.slice(0, cut);
+            const callId = msg.request_id.slice(cut + 1);
+            void backend.lentToolResult(messageId, callId, msg.message, true, []).catch(() => {});
+          }
         } else if (!msg.request_id && SIGN_IN_REFUSED.test(msg.message)) {
           // Signing in was refused: keep saying why, not just "Connecting…".
           set({ connError: msg.message });
@@ -1232,6 +1456,8 @@ export const useChat = create<ChatState>((set, get) => {
     localTools: {},
     remoteTools: {},
     images: {},
+    roomTools: {},
+    lentPrompts: [],
     typing: {},
     jumpTarget: null,
     toasts: [],
@@ -1239,6 +1465,17 @@ export const useChat = create<ChatState>((set, get) => {
     async init() {
       await get().refreshClient();
       connect();
+      // The lender side: prompts for room members' tool calls, from the backend.
+      void listen<{ approval_id: string; room_id: string; from_name: string; server_name: string; tool: string; args: string }>(
+        "lent_tool_approval",
+        (event) => {
+        const e = event.payload;
+        const p: LentPrompt = { approvalId: e.approval_id, roomId: e.room_id, fromName: e.from_name, serverName: e.server_name, tool: e.tool, args: e.args };
+        set((s) => ({
+          lentPrompts: s.lentPrompts.some((x) => x.approvalId === p.approvalId) ? s.lentPrompts : [...s.lentPrompts, p],
+        }));
+        },
+      );
     },
 
     async refreshClient() {
@@ -1488,6 +1725,71 @@ export const useChat = create<ChatState>((set, get) => {
         ? deviceCommand(remote.deviceId, { kind: "answer_tool", message_id: id, call_id: callId, approved })
         : backend.resolveToolCall(id, callId, approved);
       answer.catch((e) => get().toast(errorText(e)));
+    },
+
+    async setMcpLend(roomId, serverId, lent) {
+      // Optimistic: the switch flips now, the save follows.
+      set((s) =>
+        s.client
+          ? {
+              client: {
+                ...s.client,
+                lent_mcp_by_room: lent
+                  ? { ...s.client.lent_mcp_by_room, [roomId]: { ...s.client.lent_mcp_by_room[roomId], [serverId]: { auto_users: s.client.lent_mcp_by_room[roomId]?.[serverId]?.auto_users ?? [] } } }
+                  : {
+                      ...s.client.lent_mcp_by_room,
+                      [roomId]: withoutKey(s.client.lent_mcp_by_room[roomId] ?? {}, serverId),
+                    },
+              },
+            }
+          : {},
+      );
+      try {
+        await backend.setMcpLend(roomId, serverId, lent);
+        await get().refreshClient();
+        await shareMyLentTools();
+      } catch (e) {
+        get().toast(errorText(e));
+        await get().refreshClient();
+        await shareMyLentTools();
+      }
+    },
+
+    async setMcpLendAuto(roomId, serverId, userId, auto) {
+      try {
+        await backend.setMcpLendAuto(roomId, serverId, userId, auto);
+        await get().refreshClient();
+      } catch (e) {
+        get().toast(errorText(e));
+      }
+    },
+
+    async setMcpBorrow(roomId, key, on) {
+      set((s) => {
+        if (!s.client) return {};
+        const list = s.client.borrowed_mcp_by_room[roomId] ?? [];
+        const borrowed_mcp_by_room = on
+          ? { ...s.client.borrowed_mcp_by_room, [roomId]: list.includes(key) ? list : [...list, key] }
+          : { ...s.client.borrowed_mcp_by_room, [roomId]: list.filter((k) => k !== key) };
+        return { client: { ...s.client, borrowed_mcp_by_room } };
+      });
+      try {
+        await backend.setMcpBorrow(roomId, key, on);
+      } catch (e) {
+        get().toast(errorText(e));
+        await get().refreshClient();
+      }
+    },
+
+    shareLentTools: () => shareMyLentTools(),
+
+    async answerLentTool(approvalId, approved) {
+      set((s) => ({ lentPrompts: s.lentPrompts.filter((p) => p.approvalId !== approvalId) }));
+      try {
+        await backend.answerLentTool(approvalId, approved);
+      } catch (e) {
+        get().toast(errorText(e));
+      }
     },
 
     loadImage(attachmentId) {

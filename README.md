@@ -402,6 +402,17 @@ Two per-server settings matter for creative tools:
 - **Tool timeout** (120 s by default, up to 3600 s). Raise it for slow tools such as image
   generation or renders.
 
+### Sharing a server with a room
+
+In the **Tools** popover, each of your servers also has a **Share with this room**
+switch (desktop only). While it's on, everyone's AI in the room can see that server's
+tools, and when one of them calls a tool the call travels through the relay to your
+computer, you approve it (or your friend's AI runs without asking, if you turned on
+Auto for them), and the result goes back to their reply. Your API key and the server's
+env vars, headers, command and URL never leave your computer; only tool names,
+descriptions and input schemas are shared, and the relay stores nothing. Each of your
+friends switches the shared servers they want to use on their side, off by default.
+
 ### Example setups
 
 These match common setups; use the paths from your own machine (for example, from your
@@ -488,8 +499,12 @@ message, generated with your own model.
   then removes the frame and says so, but the visit has already revealed your IP address to
   that site, so use **Click to run** or **Off** in rooms you don't trust. Human messages keep
   the script-free preview.
-- MCP tool arguments and results are never sent to the relay (only to the MCP server
-  itself); the relay only stores tool names and statuses. Use **Ask** mode for servers that can change files or send data.
+- For your own replies, MCP tool arguments and results are never sent to the relay (only
+  to the MCP server itself); the relay only stores tool names and statuses. Two features
+  pass them through the relay, without storing them: approving a tool call from your
+  phone (the arguments go to your phone), and a server you share with a room (a friend's
+  arguments come to your computer and the result goes back to them). Whoever runs the
+  relay can see what passes through it. Use **Ask** mode for servers that can change files or send data.
 - The HTML, SVG and CSS preview runs in an `<iframe sandbox="">`, so scripts, forms and
   same-origin access are all disabled.
 - Error text from providers has the key, the base URL and the host, plus anything that
