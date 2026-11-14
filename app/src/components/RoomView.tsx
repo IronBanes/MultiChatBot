@@ -2029,7 +2029,9 @@ function MemberList({ room, overlay, onClose }: { room: RoomInfo; overlay: boole
   const panel = (
     <aside
       className={`flex w-60 shrink-0 flex-col overflow-y-auto border-l border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950 ${
-        overlay ? "h-full shadow-2xl" : ""
+        // As an overlay it reaches the screen's top and bottom edges, so it keeps clear
+        // of the status bar and the home indicator.
+        overlay ? "h-full pt-[calc(env(safe-area-inset-top)+0.75rem)] pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-2xl" : ""
       }`}
     >
       <div className="mb-2 flex items-center justify-between px-1">
@@ -2037,7 +2039,11 @@ function MemberList({ room, overlay, onClose }: { room: RoomInfo; overlay: boole
           Members — {online}/{members.length} online
         </span>
         {overlay && (
-          <button onClick={onClose} className="rounded p-1 text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800" aria-label="Close members">
+          <button
+            onClick={onClose}
+            className="-mr-2 flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-zinc-500 hover:bg-zinc-100 sm:-mr-0 sm:min-h-0 sm:min-w-0 sm:p-1 dark:hover:bg-zinc-800"
+            aria-label="Close members"
+          >
             <Icon name="x" size={14} />
           </button>
         )}
