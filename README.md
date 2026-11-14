@@ -499,8 +499,12 @@ message, generated with your own model.
   then removes the frame and says so, but the visit has already revealed your IP address to
   that site, so use **Click to run** or **Off** in rooms you don't trust. Human messages keep
   the script-free preview.
-- MCP tool arguments and results are never sent to the relay (only to the MCP server
-  itself); the relay only stores tool names and statuses. Use **Ask** mode for servers that can change files or send data.
+- For your own replies, MCP tool arguments and results are never sent to the relay (only
+  to the MCP server itself); the relay only stores tool names and statuses. Two features
+  pass them through the relay, without storing them: approving a tool call from your
+  phone (the arguments go to your phone), and a server you share with a room (a friend's
+  arguments come to your computer and the result goes back to them). Whoever runs the
+  relay can see what passes through it. Use **Ask** mode for servers that can change files or send data.
 - The HTML, SVG and CSS preview runs in an `<iframe sandbox="">`, so scripts, forms and
   same-origin access are all disabled.
 - Error text from providers has the key, the base URL and the host, plus anything that
