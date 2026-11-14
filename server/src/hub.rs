@@ -1203,7 +1203,7 @@ impl State {
                 }
             }
 
-            ClientMsg::CallLentTool { request_id, room_id, device_id, server_id, tool, args } => {
+            ClientMsg::CallLentTool { request_id, room_id, user_id: lender_user_id, device_id, server_id, tool, args } => {
                 if !self.in_room(conn, &room_id) {
                     self.send(conn, err(Some(request_id), "Not a member of that room"));
                     return Ok(());
@@ -1227,7 +1227,10 @@ impl State {
                     .conns
                     .iter()
                     .filter(|(_, c)| {
-                        c.device_id == device_id
+                        // The lender's authenticated account and its device: a device
+                        // id alone is self-reported, so another member could claim it.
+                        c.user_id.as_deref() == Some(lender_user_id.as_str())
+                            && c.device_id == device_id
                             && c.rooms.contains(&room_id)
                             && c.lent.get(&room_id).is_some_and(|servers| {
                                 servers
@@ -1571,15 +1574,27 @@ impl State {
         let (orphaned, user_id, rooms) = {
             let mut hub = self.hub();
             let Some(c) = hub.conns.remove(&conn) else { return };
-            // What this connection lent is gone: an empty `room_tools` for each room.
+            // What this connection lent is gone. Borrowers list lenders per account and
+            // device, so if another connection of this device (one that reconnected
+            // first) lends in the room, the room hears that one's listing instead.
             for room_id in c.lent.iter().filter(|(_, s)| !s.is_empty()).map(|(room, _)| room) {
-                let msg = ServerMsg::RoomTools {
+                let survivor = hub
+                    .conns
+                    .iter()
+                    .filter(|(_, o)| {
+                        o.user_id == c.user_id
+                            && o.device_id == c.device_id
+                            && o.lent.get(room_id).is_some_and(|s| !s.is_empty())
+                    })
+                    .map(|(id, _)| *id)
+                    .max();
+                let msg = survivor.and_then(|id| hub.room_tools_msg(room_id, id)).unwrap_or_else(|| ServerMsg::RoomTools {
                     room_id: room_id.clone(),
                     user_id: c.user_id.clone().unwrap_or_default(),
                     display_name: c.display_name.clone(),
                     device_id: c.device_id.clone(),
                     servers: Vec::new(),
-                };
+                });
                 hub.broadcast(room_id, &msg);
             }
             // Its pending lent calls end, as lender and as caller.

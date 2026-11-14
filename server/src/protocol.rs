@@ -195,6 +195,9 @@ pub enum ClientMsg {
     CallLentTool {
         request_id: String,
         room_id: String,
+        /// The lender's account. A device id is self-reported, so another account
+        /// could claim it; routing needs both.
+        user_id: String,
         device_id: String,
         server_id: String,
         tool: String,

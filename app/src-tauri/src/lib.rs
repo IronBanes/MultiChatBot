@@ -896,13 +896,16 @@ async fn run_lent_tool(
             }
         }
     }
-    // 3. Lending may have been turned off while waiting: check again.
-    {
+    // 3. Lending may have been turned off, or the server edited, while waiting:
+    // check again and run the server as it is now.
+    let server = {
         let cfg = state.config.lock().map_err(|_| "config lock poisoned")?;
         if cfg.lend_mode(&room_id, &server_id, &from_user_id).is_none() {
             return Err("That tool isn't shared in this room".into());
         }
-    }
+        cfg.mcp_servers.iter().find(|s| s.id == server_id).cloned()
+    };
+    let Some(server) = server else { return Err("That tool isn't shared in this room".into()) };
     // 4. Run it here, exactly like a local reply's tool call.
     let secrets = mcp_secrets_for(&server);
     let out = state.mcp.call(&server, &secrets, &tool, args).await;

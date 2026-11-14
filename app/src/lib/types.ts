@@ -176,7 +176,7 @@ export type ClientMsg =
   | { type: "redeem_link_code"; request_id: string; code: string }
   | { type: "search_messages"; request_id: string; room_id: string; query: string }
   | { type: "lend_tools"; room_id: string; servers: LentServer[] }
-  | { type: "call_lent_tool"; request_id: string; room_id: string; device_id: string; server_id: string; tool: string; args: unknown }
+  | { type: "call_lent_tool"; request_id: string; room_id: string; user_id: string; device_id: string; server_id: string; tool: string; args: unknown }
   | { type: "lent_tool_result"; request_id: string; content: string; is_error: boolean; images: LentImage[] }
   | { type: "cancel_lent_tool"; request_id: string };
 
@@ -340,6 +340,8 @@ export interface LendRule {
 
 /** One borrowed MCP server tool passed to `generate` (borrowed from a room member). */
 export interface LentToolSpec {
+  /** The lender's account (device ids are self-reported; the relay routes by both). */
+  owner_user_id: string;
   device_id: string;
   owner_name: string;
   server_id: string;
@@ -373,7 +375,7 @@ export type GenEvent =
     }
   | { event: "image"; call_id: string; mime: string; data: string }
   /** A borrowed tool call: the webview sends `call_lent_tool` for it. */
-  | { event: "lent_call"; call_id: string; device_id: string; server_id: string; tool: string; args: unknown }
+  | { event: "lent_call"; call_id: string; user_id: string; device_id: string; server_id: string; tool: string; args: unknown }
   | { event: "notice"; message: string }
   | { event: "done"; content: string; stopped: boolean }
   | { event: "error"; message: string; partial: string };

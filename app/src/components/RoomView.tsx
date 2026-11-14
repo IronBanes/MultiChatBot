@@ -1441,8 +1441,8 @@ function SharedWithYou({ room }: { room: RoomInfo }) {
   const roomTools = useChat((s) => s.roomTools[room.id]);
   const borrowed = useChat((s) => s.client?.borrowed_mcp_by_room[room.id] ?? NO_KEYS);
   const setMcpBorrow = useChat((s) => s.setMcpBorrow);
-  const entries = Object.entries(roomTools ?? {}).flatMap(([deviceId, lender]) =>
-    lender.servers.map((server) => ({ deviceId, lender, server, key: `${deviceId}:${server.id}` })),
+  const entries = Object.entries(roomTools ?? {}).flatMap(([lenderKey, lender]) =>
+    lender.servers.map((server) => ({ lender, server, key: `${lenderKey}:${server.id}` })),
   );
   if (entries.length === 0) return null;
   return (

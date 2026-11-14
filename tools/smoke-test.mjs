@@ -547,7 +547,7 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
 
   // Bob's AI calls the lent tool; Alice's connection gets it with Bob's real id.
   const req = uuid();
-  bobL.send({ type: "call_lent_tool", request_id: req, room_id: lentRoom.id, device_id: tools.device_id, server_id: "srv-lend", tool: "generate", args: { prompt: "a cat" } });
+  bobL.send({ type: "call_lent_tool", request_id: req, room_id: lentRoom.id, user_id: alice.userId, device_id: tools.device_id, server_id: "srv-lend", tool: "generate", args: { prompt: "a cat" } });
   const call = await alice.wait(type("lent_tool_call", (m) => m.args?.prompt === "a cat"), "lent_tool_call");
   ok(call.request_id !== req, "the lender sees an id the relay made, not the caller's");
   ok(call.from_user_id === bob.userId && call.from_name === "Bob" && call.server_id === "srv-lend" && call.tool === "generate",
@@ -569,16 +569,37 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   ok(!bobL.inbox.some((m) => m.type === "lent_tool_result" && m.request_id === req && m.content === "again"),
     "a lent_tool_result for a finished call is ignored");
 
+  // Another member claims Alice's device id and lends the same server: Bob's call to
+  // Alice's account still reaches Alice, never the impostor.
+  const carol = new Client("Carol");
+  carol.deviceId = tools.device_id;
+  await carol.open();
+  await carol.wait(type("welcome"), "welcome (lending, Carol)");
+  carol.send({ type: "join_room", request_id: "r-lend-carol", invite_code: lentRoom.invite_code });
+  await carol.wait(type("room_joined", (m) => m.request_id === "r-lend-carol"), "room_joined (lending, Carol)");
+  carol.send({
+    type: "lend_tools",
+    room_id: lentRoom.id,
+    servers: [{ id: "srv-lend", name: "ComfyUI", tools: [{ name: "generate", description: "Make a picture", input_schema: { type: "object" } }] }],
+  });
+  await bobL.wait(type("room_tools", (m) => m.user_id === carol.userId && m.servers.length > 0), "room_tools (Carol)");
+  bobL.send({ type: "call_lent_tool", request_id: uuid(), room_id: lentRoom.id, user_id: alice.userId, device_id: tools.device_id, server_id: "srv-lend", tool: "generate", args: { prompt: "a fox" } });
+  const toAlice = await alice.wait(type("lent_tool_call", (m) => m.args?.prompt === "a fox"), "lent_tool_call (not to the impostor)");
+  await new Promise((r) => setTimeout(r, 150));
+  ok(!!toAlice && !carol.inbox.some((m) => m.type === "lent_tool_call"), "a call goes to the lender's account, not another member claiming its device id");
+  alice.send({ type: "lent_tool_result", request_id: toAlice.request_id, content: "fox.png", is_error: false, images: [] });
+  carol.close();
+
   // The caller cancels: the lender hears it under the relay's id.
   const req2 = uuid();
-  bobL.send({ type: "call_lent_tool", request_id: req2, room_id: lentRoom.id, device_id: tools.device_id, server_id: "srv-lend", tool: "generate", args: { prompt: "a dog" } });
+  bobL.send({ type: "call_lent_tool", request_id: req2, room_id: lentRoom.id, user_id: alice.userId, device_id: tools.device_id, server_id: "srv-lend", tool: "generate", args: { prompt: "a dog" } });
   const call2 = await alice.wait(type("lent_tool_call", (m) => m.args?.prompt === "a dog"), "lent_tool_call (to cancel)");
   bobL.send({ type: "cancel_lent_tool", request_id: req2 });
   await alice.wait(type("lent_tool_cancelled", (m) => m.request_id === call2.request_id), "lent_tool_cancelled");
   ok(true, "a cancelled call reaches the lender as lent_tool_cancelled");
 
   // A call to something that isn't lent is refused.
-  bobL.send({ type: "call_lent_tool", request_id: "lend-missing", room_id: lentRoom.id, device_id: tools.device_id, server_id: "srv-lend", tool: "nope", args: {} });
+  bobL.send({ type: "call_lent_tool", request_id: "lend-missing", room_id: lentRoom.id, user_id: alice.userId, device_id: tools.device_id, server_id: "srv-lend", tool: "nope", args: {} });
   await bobL.wait(type("error", (m) => m.request_id === "lend-missing"), "error (tool not lent)");
   ok(true, "a call to a tool that isn't lent gets an error frame");
 
@@ -586,10 +607,11 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   const mallory = new Client("Mallory");
   await mallory.open();
   await mallory.wait(type("welcome"), "welcome (lending non-member)");
-  mallory.send({ type: "call_lent_tool", request_id: "lend-x", room_id: lentRoom.id, device_id: tools.device_id, server_id: "srv-lend", tool: "generate", args: {} });
+  mallory.send({ type: "call_lent_tool", request_id: "lend-x", room_id: lentRoom.id, user_id: alice.userId, device_id: tools.device_id, server_id: "srv-lend", tool: "generate", args: { marker: "mallory-call" } });
   const refused = await mallory.wait(type("error", (m) => m.request_id === "lend-x"), "error (non-member call)");
   ok(/Not a member/.test(refused.message), "a call from a non-member gets an error frame");
-  ok(!alice.inbox.some((m) => m.type === "lent_tool_call" && m.args && JSON.stringify(m).includes("lend-x")), "the non-member's call never reaches the lender");
+  await new Promise((r) => setTimeout(r, 150));
+  ok(!alice.inbox.some((m) => m.type === "lent_tool_call" && m.args?.marker === "mallory-call"), "the non-member's call never reaches the lender");
   mallory.close();
   bobL.close();
 }

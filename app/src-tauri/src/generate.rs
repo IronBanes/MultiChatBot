@@ -43,7 +43,7 @@ pub enum GenEvent {
     Tool { call_id: String, server: String, tool: String, status: ToolStatus, args: Option<String>, detail: Option<String> },
     /// The model called a tool borrowed from a room member: the webview sends
     /// `call_lent_tool` with `call_id` and waits for the answer.
-    LentCall { call_id: String, device_id: String, server_id: String, tool: String, args: serde_json::Value },
+    LentCall { call_id: String, user_id: String, device_id: String, server_id: String, tool: String, args: serde_json::Value },
     /// An image a tool produced, to share with the room (base64).
     Image { call_id: String, mime: String, data: String },
     /// Something the sender should know that doesn't fail the reply.
@@ -58,6 +58,8 @@ pub type Approvals = Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>;
 /// A tool borrowed from a room member, as `generate` receives it.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct LentToolSpec {
+    /// The lender's account: a device id is self-reported, so the relay routes by both.
+    pub owner_user_id: String,
     pub device_id: String,
     pub owner_name: String,
     pub server_id: String,
@@ -216,18 +218,20 @@ pub async fn run(job: Job) {
                         args: Some(serde_json::to_string_pretty(&args).unwrap_or_default()),
                         detail: Some(format!("Waiting for {}", spec.owner_name)),
                     });
-                    let _ = events.send(GenEvent::LentCall {
-                        call_id: call.id.clone(),
-                        device_id: spec.device_id.clone(),
-                        server_id: spec.server_id.clone(),
-                        tool: spec.tool.clone(),
-                        args,
-                    });
+                    // Waiting before the call goes out, so an answer can't arrive first.
                     let key = format!("{id}:{}", call.id);
                     let (tx, rx) = oneshot::channel();
                     if let Ok(mut waiting) = lent_results.lock() {
                         waiting.insert(key.clone(), tx);
                     }
+                    let _ = events.send(GenEvent::LentCall {
+                        call_id: call.id.clone(),
+                        user_id: spec.owner_user_id.clone(),
+                        device_id: spec.device_id.clone(),
+                        server_id: spec.server_id.clone(),
+                        tool: spec.tool.clone(),
+                        args,
+                    });
                     let answer = tokio::select! {
                         _ = &mut stop => {
                             if let Ok(mut waiting) = lent_results.lock() { waiting.remove(&key); }

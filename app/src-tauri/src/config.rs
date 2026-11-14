@@ -150,7 +150,7 @@ pub struct Config {
     /// An entry means lent; `auto_users` lists members whose calls run unseen.
     #[serde(default)]
     pub lent_mcp_by_room: HashMap<String, HashMap<String, LendRule>>,
-    /// room id → "<device_id>:<server_id>" of other members' servers this
+    /// room id → "<user_id>:<device_id>:<server_id>" of other members' servers this
     /// device borrows in that room. Off by default.
     #[serde(default)]
     pub borrowed_mcp_by_room: HashMap<String, Vec<String>>,

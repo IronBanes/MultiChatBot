@@ -58,6 +58,7 @@ export interface LentPrompt {
 /** What one room member currently lends: their identity plus their lent servers. */
 export interface RoomLender {
   user_id: string;
+  device_id: string;
   display_name: string;
   servers: LentServer[];
 }
@@ -92,7 +93,8 @@ interface ChatState {
   remoteTools: Record<string, Record<string, RemoteTool>>;
   /** attachment id → data URL ("" while loading). */
   images: Record<string, string>;
-  /** Room id → device id → what that member's device lends there. */
+  /** Room id → "<user id>:<device id>" → what that member's device lends there. A
+   *  device id alone is self-reported, so another account could claim it. */
   roomTools: Record<string, Record<string, RoomLender>>;
   /** Approvals waiting here: another member's AI wants to run a lent tool. */
   lentPrompts: LentPrompt[];
@@ -197,14 +199,15 @@ export function lentToolsFor(roomId: string, s: { client: ClientState | null; ro
   if (on.length === 0) return [];
   const out: LentToolSpec[] = [];
   const seen = new Set<string>();
-  for (const [deviceId, lender] of Object.entries(s.roomTools[roomId] ?? {})) {
+  for (const [lenderKey, lender] of Object.entries(s.roomTools[roomId] ?? {})) {
     for (const server of lender.servers) {
       for (const t of server.tools) {
-        const key = `${deviceId}:${server.id}`;
+        const key = `${lenderKey}:${server.id}`;
         if (!on.includes(key) || seen.has(`${key}:${t.name}`)) continue;
         seen.add(`${key}:${t.name}`);
         out.push({
-          device_id: deviceId,
+          owner_user_id: lender.user_id,
+          device_id: lender.device_id,
           owner_name: lender.display_name,
           server_id: server.id,
           server_name: server.name,
@@ -668,6 +671,10 @@ export const useChat = create<ChatState>((set, get) => {
           if (status === "offline") {
             pendingLentCalls.clear();
             set({ roomTools: {} });
+            // The relay ended the calls waiting on this device too: deny them here,
+            // so a late Approve can't run a tool nobody is waiting for.
+            for (const p of get().lentPrompts) void backend.cancelLentTool(p.approvalId).catch(() => {});
+            set({ lentPrompts: [] });
           }
           if (status !== "online") set({ devices: [] });
           if (status === "online") set({ status, connError: null });
@@ -919,6 +926,7 @@ export const useChat = create<ChatState>((set, get) => {
             type: "call_lent_tool",
             request_id,
             room_id: roomId,
+            user_id: ev.user_id,
             device_id: ev.device_id,
             server_id: ev.server_id,
             tool: ev.tool,
@@ -1146,18 +1154,22 @@ export const useChat = create<ChatState>((set, get) => {
         // What one room member's device lends. Our own device's frames are
         // ignored (this device's lending is configured here, not received).
         const me = get().client;
-        if (me && msg.device_id === me.device_id) break;
+        if (me && msg.device_id === me.device_id && msg.user_id === me.user_id) break;
+        const lenderKey = `${msg.user_id}:${msg.device_id}`;
         set((s) => {
           const room = s.roomTools[msg.room_id] ?? {};
           if (msg.servers.length === 0) {
-            if (!(msg.device_id in room)) return {};
-            const { [msg.device_id]: _, ...rest } = room;
+            if (!(lenderKey in room)) return {};
+            const { [lenderKey]: _, ...rest } = room;
             return { roomTools: { ...s.roomTools, [msg.room_id]: rest } };
           }
           return {
             roomTools: {
               ...s.roomTools,
-              [msg.room_id]: { ...room, [msg.device_id]: { user_id: msg.user_id, display_name: msg.display_name, servers: msg.servers } },
+              [msg.room_id]: {
+                ...room,
+                [lenderKey]: { user_id: msg.user_id, device_id: msg.device_id, display_name: msg.display_name, servers: msg.servers },
+              },
             },
           };
         });
