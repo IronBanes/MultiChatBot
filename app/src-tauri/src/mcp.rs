@@ -41,7 +41,7 @@ pub struct McpManager {
 }
 
 /// An image produced by a tool call, base64-encoded.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ToolImage {
     pub mime: String,
     pub data: String,
@@ -57,6 +57,21 @@ pub struct ToolOutput {
 pub struct ToolInfo {
     pub name: String,
     pub description: String,
+}
+
+/// A tool offered to the model in one generation from a lent (borrowed) server.
+/// Serializes with the wire shape (`input_schema`), so `lent_tools` output can
+/// be sent on as `lend_tools` unchanged.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct LentToolInfo {
+    pub device_id: String,
+    pub owner_name: String,
+    pub server_id: String,
+    pub server_name: String,
+    pub tool: String,
+    pub description: String,
+    #[serde(rename = "input_schema")]
+    pub schema: serde_json::Value,
 }
 
 /// A tool offered to the model in one generation.
@@ -75,7 +90,7 @@ fn fingerprint(server: &McpServer, secrets: &McpSecrets) -> String {
 }
 
 /// Tool names must match `^[a-zA-Z0-9_-]{1,64}$` for both OpenAI and Anthropic.
-fn qualified_name(server: &str, tool: &str, taken: &HashMap<String, ()>) -> String {
+pub fn qualified_name(server: &str, tool: &str, taken: &HashMap<String, ()>) -> String {
     let clean = |s: &str| -> String {
         s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect()
     };
@@ -195,6 +210,34 @@ impl McpManager {
 
     pub async fn disconnect(&self, server_id: &str) {
         self.conns.lock().await.remove(server_id);
+    }
+
+    /// The servers this device lends to `room_id`, with each one's real tool
+    /// names, descriptions and input schemas (unqualified). A server that
+    /// fails to connect is left out. `servers` are (server, its secrets) for
+    /// the servers lent in that room, in the caller's order.
+    pub async fn lent_tools(
+        &self,
+        servers: &[(McpServer, McpSecrets)],
+        device_id: &str,
+        owner_name: &str,
+    ) -> Vec<LentToolInfo> {
+        let mut out = Vec::new();
+        for (server, secrets) in servers {
+            let Ok(conn) = self.get(server, secrets).await else { continue };
+            for t in &conn.tools {
+                out.push(LentToolInfo {
+                    device_id: device_id.to_string(),
+                    owner_name: owner_name.to_string(),
+                    server_id: server.id.clone(),
+                    server_name: server.name.clone(),
+                    tool: t.name.to_string(),
+                    description: t.description.as_deref().unwrap_or_default().to_string(),
+                    schema: serde_json::Value::Object((*t.input_schema).clone()),
+                });
+            }
+        }
+        out
     }
 
     /// Tools from every active server. Servers that fail to connect are skipped

@@ -183,6 +183,36 @@ pub enum ClientMsg {
         #[serde(default)]
         error: Option<String>,
     },
+    /// Replaces what this connection lends to `room_id` (empty = stops lending
+    /// there). Only tool names, descriptions and input schemas cross the wire;
+    /// broadcast to the room as `room_tools`.
+    LendTools {
+        room_id: String,
+        servers: Vec<LentServer>,
+    },
+    /// Asks a room member's device that lends `server_id` to run one tool.
+    /// Forwarded to that lender only, as `lent_tool_call`; never stored.
+    CallLentTool {
+        request_id: String,
+        room_id: String,
+        device_id: String,
+        server_id: String,
+        tool: String,
+        args: serde_json::Value,
+    },
+    /// The lender's answer to a `call_lent_tool`; accepted only from the
+    /// lender connection recorded for that request. Forwarded to the caller.
+    LentToolResult {
+        request_id: String,
+        content: String,
+        is_error: bool,
+        images: Vec<LentImage>,
+    },
+    /// The caller gives up on a pending `call_lent_tool`; forwarded to the
+    /// lender as `lent_tool_cancelled`.
+    CancelLentTool {
+        request_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -325,6 +355,38 @@ pub enum ServerMsg {
         from_device_id: String,
         command: DeviceCommand,
     },
+    /// What one connection currently lends in a room: sent on every change, on
+    /// joining (one per other lending connection) and as an empty `servers`
+    /// when that connection stops lending there.
+    RoomTools {
+        room_id: String,
+        user_id: String,
+        display_name: String,
+        device_id: String,
+        servers: Vec<LentServer>,
+    },
+    /// Forwards `call_lent_tool` to the lending connection only; never stored.
+    LentToolCall {
+        request_id: String,
+        room_id: String,
+        from_user_id: String,
+        from_name: String,
+        server_id: String,
+        tool: String,
+        args: serde_json::Value,
+    },
+    /// The lender's answer to a `lent_toolCall`: forwarded to the caller
+    /// connection only, and the pending entry is removed.
+    LentToolResult {
+        request_id: String,
+        content: String,
+        is_error: bool,
+        images: Vec<LentImage>,
+    },
+    /// The caller gave up on a pending lent tool call.
+    LentToolCancelled {
+        request_id: String,
+    },
     /// The target device did what a `device_command` asked (failures arrive as `error`).
     DeviceReply {
         request_id: String,
@@ -402,6 +464,31 @@ pub struct SharedProfile {
 
 fn yes() -> bool {
     true
+}
+
+/// A tool a room member's AI may call on the lender's computer. Only names,
+/// descriptions and input schemas cross the wire — never the server's
+/// command, URL, env or headers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LentTool {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// An MCP server one connection lends to a room.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LentServer {
+    pub id: String,
+    pub name: String,
+    pub tools: Vec<LentTool>,
+}
+
+/// An image returned by a lent tool call (base64).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LentImage {
+    pub mime: String,
+    pub data: String,
 }
 
 /// An MCP server another of the user's devices may switch. Only its name and modes

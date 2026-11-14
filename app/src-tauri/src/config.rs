@@ -107,6 +107,15 @@ fn default_timeout() -> u32 {
     120
 }
 
+/// How this device lends one MCP server to one room: every member's AI may
+/// call it, each call approved here, except members in `auto_users`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LendRule {
+    /// User ids whose calls run without asking (Auto for that one person).
+    #[serde(default)]
+    pub auto_users: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub user_id: String,
@@ -137,6 +146,14 @@ pub struct Config {
     /// entry use `NotifyMode::Mentions`.
     #[serde(default)]
     pub notify_by_room: HashMap<String, NotifyMode>,
+    /// room id → server id → how this device lends that server to the room.
+    /// An entry means lent; `auto_users` lists members whose calls run unseen.
+    #[serde(default)]
+    pub lent_mcp_by_room: HashMap<String, HashMap<String, LendRule>>,
+    /// room id → "<device_id>:<server_id>" of other members' servers this
+    /// device borrows in that room. Off by default.
+    #[serde(default)]
+    pub borrowed_mcp_by_room: HashMap<String, Vec<String>>,
     /// Port of the relay this app hosts (desktop only); `None` when not hosting.
     /// Hosting resumes on the next launch.
     #[serde(default)]
@@ -173,6 +190,22 @@ impl Config {
         Ok(())
     }
 
+    /// How this device treats a call by `user_id` to `server_id` in `room_id`,
+    /// lent to that room: `None` when the server isn't lent there (or has been
+    /// deleted since), `Some(Auto)` only for a member the lender allowed.
+    pub fn lend_mode(&self, room_id: &str, server_id: &str, user_id: &str) -> Option<McpMode> {
+        let rule = self
+            .lent_mcp_by_room
+            .get(room_id)?
+            .get(server_id)
+            .filter(|_| self.mcp_servers.iter().any(|s| s.id == server_id))?;
+        Some(if rule.auto_users.iter().any(|u| u == user_id) {
+            McpMode::Auto
+        } else {
+            McpMode::Ask
+        })
+    }
+
     pub fn mcp_for_reply(&self, room_id: &str, delegated: bool) -> Vec<(McpServer, McpMode)> {
         if !delegated {
             return self.active_mcp(room_id);
@@ -206,6 +239,8 @@ impl Default for Config {
             mcp_servers: Vec::new(),
             mcp_modes_by_room: HashMap::new(),
             notify_by_room: HashMap::new(),
+            lent_mcp_by_room: HashMap::new(),
+            borrowed_mcp_by_room: HashMap::new(),
             host_relay_port: None,
             remote_control: false,
         }
@@ -319,6 +354,44 @@ mod tests {
         assert!(c.allow_remote(true).is_err());
         c.remote_control = true;
         assert!(c.allow_remote(true).is_ok());
+    }
+
+    #[test]
+    fn a_server_not_lent_to_a_room_lends_nothing() {
+        let mut c = config();
+        c.lent_mcp_by_room.insert("room".into(), HashMap::from([("auto".to_string(), LendRule::default())]));
+        // Lending off for the room: nothing to borrow.
+        c.lent_mcp_by_room.remove("room");
+        assert_eq!(c.lend_mode("room", "auto", "u1"), None);
+        // A room the server was never lent to.
+        assert_eq!(c.lend_mode("other", "auto", "u1"), None);
+    }
+
+    #[test]
+    fn a_lent_server_asks_for_every_member_without_auto() {
+        let mut c = config();
+        c.lent_mcp_by_room.insert("room".into(), HashMap::from([("auto".to_string(), LendRule::default())]));
+        assert_eq!(c.lend_mode("room", "auto", "u1"), Some(McpMode::Ask));
+        assert_eq!(c.lend_mode("room", "auto", "u2"), Some(McpMode::Ask));
+    }
+
+    #[test]
+    fn a_member_in_auto_users_runs_without_asking() {
+        let mut c = config();
+        c.lent_mcp_by_room.insert(
+            "room".into(),
+            HashMap::from([("auto".to_string(), LendRule { auto_users: vec!["u1".into()] })]),
+        );
+        assert_eq!(c.lend_mode("room", "auto", "u1"), Some(McpMode::Auto));
+        assert_eq!(c.lend_mode("room", "auto", "u2"), Some(McpMode::Ask));
+    }
+
+    #[test]
+    fn a_server_removed_after_lending_lends_nothing() {
+        let mut c = config();
+        c.lent_mcp_by_room.insert("room".into(), HashMap::from([("gone".to_string(), LendRule::default())]));
+        // No MCP server with that id exists anymore.
+        assert_eq!(c.lend_mode("room", "gone", "u1"), None);
     }
 
     #[test]

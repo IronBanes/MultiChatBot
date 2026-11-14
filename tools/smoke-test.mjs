@@ -513,6 +513,72 @@ ok(finalB.attachments.some((a) => a.attachment_id === bobAtt), "image uploaded j
   bobd.close();
 }
 
+// Lending tools to a room: one member's connection publishes its servers, the
+// other's AI calls one, the lender answers, and only the right connections see
+// any of it.
+{
+  // Bob's earlier connection closed mid-stream above, so this is a fresh one
+  // on the same account.
+  const bobL = new Client("Bob");
+  bobL.userId = bob.userId;
+  bobL.secret = bob.secret;
+  bobL.deviceId = "bob-lend";
+  await bobL.open();
+  await bobL.wait(type("welcome"), "welcome (lending, Bob)");
+  alice.send({ type: "create_room", request_id: "r-lend", name: "Lending" });
+  const lentRoom = (await alice.wait(type("room_joined", (m) => m.request_id === "r-lend"), "room_joined (lending)")).room;
+  bobL.send({ type: "join_room", request_id: "r-lend-join", invite_code: lentRoom.invite_code });
+  await bobL.wait(type("room_joined", (m) => m.request_id === "r-lend-join"), "room_joined (lending, Bob)");
+
+  // Alice lends one server with one tool.
+  alice.send({
+    type: "lend_tools",
+    room_id: lentRoom.id,
+    servers: [{ id: "srv-lend", name: "ComfyUI", tools: [{ name: "generate", description: "Make a picture", input_schema: { type: "object" } }] }],
+  });
+  const tools = await bobL.wait(type("room_tools", (m) => m.device_id !== ""), "room_tools (Bob)");
+  ok(tools.user_id === alice.userId && tools.display_name === "Alice" && tools.servers.length === 1 && tools.servers[0].tools[0].name === "generate",
+    "Bob hears what Alice lends, stamped with Alice's id and name");
+  // Alice hears her own broadcast too (she's in the room); Bob's own join
+  // may have brought another one, so just check one arrived at all.
+  await new Promise((r) => setTimeout(r, 150));
+  ok(alice.inbox.some((m) => m.type === "room_tools" && m.user_id === alice.userId && m.servers.length === 1),
+    "the lender's own room_tools broadcast reaches the room (the lender included)");
+
+  // Bob's AI calls the lent tool; Alice's connection gets it with Bob's real id.
+  const req = uuid();
+  bobL.send({ type: "call_lent_tool", request_id: req, room_id: lentRoom.id, device_id: tools.device_id, server_id: "srv-lend", tool: "generate", args: { prompt: "a cat" } });
+  const call = await alice.wait(type("lent_tool_call", (m) => m.request_id === req), "lent_tool_call");
+  ok(call.from_user_id === bob.userId && call.from_name === "Bob" && call.server_id === "srv-lend" && call.tool === "generate",
+    "the lender receives the call stamped with the caller's real user id and name");
+  ok(call.args && call.args.prompt === "a cat", "the lender receives the tool arguments");
+  // Bob can't answer his own call.
+  bobL.send({ type: "lent_tool_result", request_id: req, content: "forged", is_error: false, images: [] });
+  await new Promise((r) => setTimeout(r, 150));
+  ok(!bobL.inbox.some((m) => m.type === "lent_tool_result" && m.request_id === req), "a lent_tool_result from the caller is ignored");
+
+  // Alice answers; only Bob gets it.
+  alice.send({ type: "lent_tool_result", request_id: req, content: "meow.png", is_error: false, images: [] });
+  const result = await bobL.wait(type("lent_tool_result", (m) => m.request_id === req), "lent_tool_result (Bob)");
+  ok(result.content === "meow.png" && result.is_error === false, "the lender's answer reaches the caller");
+  // A second answer for a finished call goes nowhere.
+  alice.send({ type: "lent_tool_result", request_id: req, content: "again", is_error: false, images: [] });
+  await new Promise((r) => setTimeout(r, 150));
+  ok(!bobL.inbox.some((m) => m.type === "lent_tool_result" && m.request_id === req && m.content === "again"),
+    "a lent_tool_result for a finished call is ignored");
+
+  // A non-member's call is refused.
+  const mallory = new Client("Mallory");
+  await mallory.open();
+  await mallory.wait(type("welcome"), "welcome (lending non-member)");
+  mallory.send({ type: "call_lent_tool", request_id: "lend-x", room_id: lentRoom.id, device_id: tools.device_id, server_id: "srv-lend", tool: "generate", args: {} });
+  const refused = await mallory.wait(type("error", (m) => m.request_id === "lend-x"), "error (non-member call)");
+  ok(/Not a member/.test(refused.message), "a call from a non-member gets an error frame");
+  ok(!alice.inbox.some((m) => m.type === "lent_tool_call" && m.args && JSON.stringify(m).includes("lend-x")), "the non-member's call never reaches the lender");
+  mallory.close();
+  bobL.close();
+}
+
 // Accounts are authenticated: knowing someone's user id (every room member does)
 // isn't enough to connect as them; a link code hands over the account's secret.
 {

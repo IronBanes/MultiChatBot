@@ -3,7 +3,7 @@ import { memberColor } from "../lib/colors";
 import { useWidth } from "../lib/useWidth";
 import { mentions, parseRemoteProfileId, remoteMode, remoteProfileId } from "../store";
 import type { Attachment, Device, McpMode, Member, Message, NotifyMode, RoomInfo, SearchHit, ToolActivity } from "../lib/types";
-import { useChat, type LocalTool } from "../store";
+import { useChat, type LentPrompt, type LocalTool } from "../store";
 import { confirmAction } from "./Confirm";
 import { Markdown } from "./Markdown";
 import { MODE_OPTIONS, type SettingsTab } from "./Settings";
@@ -1335,22 +1335,181 @@ function RemoteToolsList({ room, device }: { room: RoomInfo; device: Device | nu
   );
 }
 
-/** The Off / Ask / Auto switch for each MCP server, in this room. */
+/** The Off / Ask / Auto switch for each MCP server, in this room, with the
+ *  "Share with this room" switch and per-member Auto toggles under it. */
 function ToolsList({ room }: { room: RoomInfo }) {
   const servers = useChat((s) => s.client!.mcp_servers);
   const modes = useChat((s) => s.client!.mcp_modes_by_room[room.id]);
   const setRoomMcpMode = useChat((s) => s.setRoomMcpMode);
+  const lent = useChat((s) => s.client!.lent_mcp_by_room[room.id]);
+  const setMcpLend = useChat((s) => s.setMcpLend);
+  const setMcpLendAuto = useChat((s) => s.setMcpLendAuto);
+  const myId = useChat((s) => s.client!.user_id);
   if (servers.length === 0) return <p className="py-2 text-sm text-zinc-500">No MCP servers yet. Add one to let the AI use tools.</p>;
   return (
     <div className="space-y-2">
-      {servers.map((s) => (
-        <div key={s.id} className="flex items-center justify-between gap-2">
-          <span className="min-w-0 truncate text-sm" title={s.name}>
-            {s.name}
-          </span>
-          <Segmented size="sm" value={modes?.[s.id] ?? s.default_mode} onChange={(mode) => setRoomMcpMode(room.id, s.id, mode)} options={MODE_OPTIONS} />
-        </div>
+      {servers.map((s) => {
+        const isLent = !!lent?.[s.id];
+        const autoUsers = lent?.[s.id]?.auto_users ?? [];
+        const others = room.members.filter((m) => m.user_id !== myId);
+        return (
+          <div key={s.id} className="rounded-lg border border-zinc-200 p-2 dark:border-zinc-700">
+            <div className="flex items-center justify-between gap-2">
+              <span className="min-w-0 truncate text-sm" title={s.name}>
+                {s.name}
+              </span>
+              <Segmented size="sm" value={modes?.[s.id] ?? s.default_mode} onChange={(mode) => setRoomMcpMode(room.id, s.id, mode)} options={MODE_OPTIONS} />
+            </div>
+            <div className="mt-1.5 flex items-center justify-between gap-2">
+              <span className="text-xs text-zinc-500">Share with this room</span>
+              <input
+                type="checkbox"
+                checked={isLent}
+                onChange={(e) => {
+                  const next = e.target.checked;
+                  if (next) {
+                    confirmAction(`Share ${s.name} with this room?`, `Everyone's AI in this room will be able to ask to run ${s.name}'s tools on this computer. You'll approve each call here first.`, "Share").then((ok) => {
+                      if (ok) void setMcpLend(room.id, s.id, true);
+                    });
+                  } else {
+                    void setMcpLend(room.id, s.id, false);
+                  }
+                }}
+                className="h-4 w-4 accent-indigo-600"
+                aria-label={`Share ${s.name} with this room`}
+              />
+            </div>
+            {isLent && (
+              <div className="mt-2 border-t border-zinc-100 pt-2 dark:border-zinc-800">
+                <p className="mb-1 text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Run without asking</p>
+                {others.length === 0 ? (
+                  <p className="text-xs text-zinc-500">No one else in this room yet.</p>
+                ) : (
+                  others.map((m) => {
+                    const auto = autoUsers.includes(m.user_id);
+                    return (
+                      <div key={m.user_id} className="flex items-center justify-between gap-2 py-0.5">
+                        <span className="min-w-0 truncate text-xs" title={m.display_name}>
+                          {m.display_name}
+                        </span>
+                        <button
+                          onClick={() => {
+                            if (!auto) {
+                              confirmAction(
+                                `Let ${m.display_name}'s AI run ${s.name} without asking?`,
+                                `${m.display_name}'s AI will be able to run any ${s.name} tool on this computer, as often as it wants, without you seeing the request first. Only allow this for someone you trust. The relay tells this app who is asking, so whoever runs the relay could use it too.`,
+                                "Allow without asking",
+                              ).then((ok) => {
+                                if (ok) void setMcpLendAuto(room.id, s.id, m.user_id, true);
+                              });
+                            } else {
+                              void setMcpLendAuto(room.id, s.id, m.user_id, false);
+                            }
+                          }}
+                          className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium transition ${
+                            auto
+                              ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300"
+                              : "border-zinc-300 text-zinc-500 dark:border-zinc-700"
+                          }`}
+                          aria-label={`Auto for ${m.display_name}`}
+                        >
+                          Auto
+                        </button>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Another member's lent servers this device can borrow in this room. */
+function SharedWithYou({ room }: { room: RoomInfo }) {
+  const roomTools = useChat((s) => s.roomTools[room.id]);
+  const borrowed = useChat((s) => s.client?.borrowed_mcp_by_room[room.id] ?? []);
+  const setMcpBorrow = useChat((s) => s.setMcpBorrow);
+  const entries = Object.entries(roomTools ?? {}).flatMap(([deviceId, lender]) =>
+    lender.servers.map((server) => ({ deviceId, lender, server, key: `${deviceId}:${server.id}` })),
+  );
+  if (entries.length === 0) return null;
+  return (
+    <div className="mt-3 border-t border-zinc-100 pt-2 dark:border-zinc-800">
+      <p className="mb-1 text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Shared with you</p>
+      <div className="space-y-1.5">
+        {entries.map(({ key, lender, server }) => (
+          <div key={key} className="flex items-center justify-between gap-2">
+            <span className="min-w-0 truncate text-sm" title={`${server.name} · from ${lender.display_name}`}>
+              {server.name} · from {lender.display_name}
+            </span>
+            <input
+              type="checkbox"
+              checked={borrowed.includes(key)}
+              onChange={(e) => void setMcpBorrow(room.id, key, e.target.checked)}
+              className="h-4 w-4 accent-indigo-600"
+              aria-label={`Use ${server.name} from ${lender.display_name}`}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Lender approval prompts for one room: the cards above the composer, and a
+ *  toast when the prompt belongs to a room that isn't open. */
+const toastedLentPrompts = new Set<string>();
+
+function LentApprovalList({ roomId }: { roomId: string }) {
+  const prompts = useChat((s) => s.lentPrompts);
+  const activeRoomId = useChat((s) => s.activeRoomId);
+  const toast = useChat((s) => s.toast);
+  const mine = prompts.filter((p) => p.roomId === roomId);
+  const elsewhere = prompts.filter((p) => p.roomId !== roomId);
+  // One toast per prompt, while this room is the open one.
+  useEffect(() => {
+    const p = elsewhere.find((x) => !toastedLentPrompts.has(x.approvalId));
+    if (p && activeRoomId === roomId) {
+      toastedLentPrompts.add(p.approvalId);
+      toast(`${p.fromName}'s AI wants to run ${p.serverName} › ${p.tool} (in another room)`, "info");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when the prompt set changes
+  }, [prompts, activeRoomId, roomId]);
+  if (mine.length === 0) return null;
+  return (
+    <div className="mx-auto max-w-4xl space-y-2 border-t border-zinc-200 px-3 pt-3 sm:px-4 dark:border-zinc-800">
+      {mine.map((p) => (
+        <LentApprovalCard key={p.approvalId} p={p} />
       ))}
+    </div>
+  );
+}
+
+/** A room member's AI asking to run one of this device's lent tools. */
+function LentApprovalCard({ p }: { p: LentPrompt }) {
+  const answerLentTool = useChat((s) => s.answerLentTool);
+  return (
+    <div className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950/40">
+      <p className="text-zinc-800 dark:text-zinc-200">
+        <span className="font-semibold">{p.fromName}'s AI</span> wants to run <span className="font-semibold">{p.serverName}</span> ›{" "}
+        <span className="font-mono text-xs">{p.tool}</span>
+      </p>
+      <details className="mt-1.5">
+        <summary className="cursor-pointer text-xs text-zinc-600 dark:text-zinc-400">Show arguments</summary>
+        <pre className="mt-1 max-h-48 overflow-auto rounded-md bg-zinc-100 p-2 font-mono text-[11px] whitespace-pre-wrap dark:bg-zinc-950">{p.args}</pre>
+      </details>
+      <div className="mt-2 flex gap-2">
+        <Button className="!px-4 !py-2 text-xs sm:!px-3 sm:!py-1" onClick={() => void answerLentTool(p.approvalId, true)}>
+          Approve
+        </Button>
+        <Button variant="outline" className="!px-4 !py-2 text-xs sm:!px-3 sm:!py-1" onClick={() => void answerLentTool(p.approvalId, false)}>
+          Deny
+        </Button>
+      </div>
     </div>
   );
 }
@@ -1407,6 +1566,7 @@ function ToolsMenu({ room, onOpenSettings, profileId }: { room: RoomInfo; onOpen
             <span className="text-[11px] text-zinc-500">{remote ? `on ${device?.device_name}` : "for your replies"}</span>
           </div>
           {remote ? <RemoteToolsList room={room} device={device} /> : <ToolsList room={room} />}
+          {!remote && <SharedWithYou room={room} />}
           <p className="mt-3 text-[11px] leading-snug text-zinc-500">
             {remote ? (
               <>
@@ -1529,6 +1689,7 @@ function ComposerSheet({
           )}
         </div>
         {remote ? <RemoteToolsList room={room} device={device} /> : <ToolsList room={room} />}
+        {!remote && <SharedWithYou room={room} />}
         <Button variant="outline" className="mt-5 w-full !py-3" onClick={onClose}>
           Done
         </Button>
@@ -2463,6 +2624,8 @@ export function RoomView({
               header; on phones SearchPanel renders a full-screen overlay instead. */}
           {searchOpen && !phone && <SearchPanel room={room} phone={false} onJump={jumpToHit} onClose={closeSearch} />}
         </div>
+        {/* Approvals for room members' borrowed tool calls, above the composer. */}
+        <LentApprovalList roomId={room.id} />
         {/* Keyed by room: each room gets a fresh draft, and a send that finishes after
             switching rooms can't edit the new room's text. The editing/replying state
             lives here so both the list and the composer reach it. */}
