@@ -358,13 +358,14 @@ impl State {
     /// the room, so a connection that joins or opens it knows what it may call.
     fn send_room_tools(&self, room_id: &str, to: ConnId) {
         let hub = self.hub();
-        let lenders: Vec<ConnId> = hub
-            .conns
-            .iter()
-            .filter(|(id, c)| **id != to && c.lent.get(room_id).is_some_and(|s| !s.is_empty()))
-            .map(|(id, _)| *id)
-            .collect();
-        for id in lenders {
+        // Borrowers list lenders per account and device, so send only the newest
+        // lending connection of each (one that reconnected may still overlap the old).
+        let mut newest: HashMap<(Option<String>, String), ConnId> = HashMap::new();
+        for (id, c) in hub.conns.iter().filter(|(id, c)| **id != to && c.lent.get(room_id).is_some_and(|s| !s.is_empty())) {
+            let e = newest.entry((c.user_id.clone(), c.device_id.clone())).or_insert(*id);
+            *e = (*e).max(*id);
+        }
+        for id in newest.into_values() {
             if let Some(msg) = hub.room_tools_msg(room_id, id) {
                 hub.send(to, &msg);
             }
