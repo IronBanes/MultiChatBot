@@ -2022,16 +2022,14 @@ ${before}` : t);
   );
 }
 
-function MemberList({ room, overlay, onClose }: { room: RoomInfo; overlay: boolean; onClose: () => void }) {
+function MemberList({ room, overlay, phone, onClose }: { room: RoomInfo; overlay: boolean; phone?: boolean; onClose: () => void }) {
   const myId = useChat((s) => s.client!.user_id);
   const members = [...room.members].sort((a, b) => Number(b.online) - Number(a.online) || a.display_name.localeCompare(b.display_name));
   const online = members.filter((m) => m.online).length;
   const panel = (
     <aside
       className={`flex w-60 shrink-0 flex-col overflow-y-auto border-l border-zinc-200 bg-white p-3 dark:border-zinc-800 dark:bg-zinc-950 ${
-        // As an overlay it reaches the screen's top and bottom edges, so it keeps clear
-        // of the status bar and the home indicator.
-        overlay ? "h-full pt-[calc(env(safe-area-inset-top)+0.75rem)] pb-[max(0.75rem,env(safe-area-inset-bottom))] shadow-2xl" : ""
+        overlay ? "h-full shadow-2xl" : ""
       }`}
     >
       <div className="mb-2 flex items-center justify-between px-1">
@@ -2041,7 +2039,10 @@ function MemberList({ room, overlay, onClose }: { room: RoomInfo; overlay: boole
         {overlay && (
           <button
             onClick={onClose}
-            className="-mr-2 flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-zinc-500 hover:bg-zinc-100 sm:-mr-0 sm:min-h-0 sm:min-w-0 sm:p-1 dark:hover:bg-zinc-800"
+            // The phone layout keeps a 44px target at every width (landscape phones are wider than sm).
+            className={`-mr-2 flex min-h-[44px] min-w-[44px] items-center justify-center rounded text-zinc-500 hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
+              phone ? "" : "sm:-mr-0 sm:min-h-0 sm:min-w-0 sm:p-1"
+            }`}
             aria-label="Close members"
           >
             <Icon name="x" size={14} />
@@ -2069,7 +2070,13 @@ function MemberList({ room, overlay, onClose }: { room: RoomInfo; overlay: boole
   if (!overlay) return panel;
   return (
     <div className="fixed inset-0 z-30 flex justify-end bg-black/30" onMouseDown={onClose}>
-      <div className="h-full bg-white pr-[env(safe-area-inset-right)] dark:bg-zinc-950" onMouseDown={(e) => e.stopPropagation()}>
+      {/* The overlay reaches the screen's edges, so this non-scrolling wrapper keeps the
+          list clear of the status bar and home indicator (padding on the scrolling
+          aside would scroll away with the rows). */}
+      <div
+        className="h-full bg-white pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pb-[env(safe-area-inset-bottom)] dark:bg-zinc-950"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
         {panel}
       </div>
     </div>
@@ -2485,7 +2492,7 @@ export function RoomView({
         />
       </div>
       {inlineMembers && membersPref && <MemberList room={room} overlay={false} onClose={() => setMembersPref(false)} />}
-      {!inlineMembers && membersOverlay && <MemberList room={room} overlay onClose={() => setMembersOverlay(false)} />}
+      {!inlineMembers && membersOverlay && <MemberList room={room} overlay phone={phone} onClose={() => setMembersOverlay(false)} />}
       {searchOpen && phone && <SearchPanel room={room} phone onJump={jumpToHit} onClose={closeSearch} />}
       {promptOpen && <RoomPromptDialog room={room} onClose={() => setPromptOpen(false)} />}
       {menuOpen && (
