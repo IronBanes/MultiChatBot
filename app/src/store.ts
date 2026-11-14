@@ -166,6 +166,9 @@ interface ChatState {
   setMcpBorrow(roomId: string, key: string, on: boolean): Promise<void>;
   /** Lender: answers a room member's tool call request. */
   answerLentTool(approvalId: string, approved: boolean): Promise<void>;
+  /** Lender: tells each room again what this device shares there (after a server
+   *  it shares was edited or removed). */
+  shareLentTools(): Promise<void>;
   loadImage(attachmentId: string): void;
   toast(text: string, kind?: Toast["kind"]): void;
   dismissToast(id: number): void;
@@ -1767,6 +1770,8 @@ export const useChat = create<ChatState>((set, get) => {
         await get().refreshClient();
       }
     },
+
+    shareLentTools: () => shareMyLentTools(),
 
     async answerLentTool(approvalId, approved) {
       set((s) => ({ lentPrompts: s.lentPrompts.filter((p) => p.approvalId !== approvalId) }));
