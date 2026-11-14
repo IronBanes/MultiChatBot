@@ -855,6 +855,11 @@ async fn run_lent_tool(
     let my_name = state.snapshot()?.display_name;
     // 2. Ask here at this desktop, unless Auto for this member.
     if mode == McpMode::Ask {
+        // Waiting before the prompt shows, so a quick answer or cancel can't arrive first.
+        let (tx, rx) = oneshot::channel();
+        if let Ok(mut a) = state.approvals.lock() {
+            a.insert(format!("lent:{approval_id}"), tx);
+        }
         let _ = app.emit(
             "lent_tool_approval",
             &LentApproval {
@@ -867,10 +872,6 @@ async fn run_lent_tool(
                 args: serde_json::to_string_pretty(&args).unwrap_or_default(),
             },
         );
-        let (tx, rx) = oneshot::channel();
-        if let Ok(mut a) = state.approvals.lock() {
-            a.insert(format!("lent:{approval_id}"), tx);
-        }
         let approved = tokio::select! {
             r = rx => r.ok(),
             _ = tokio::time::sleep(APPROVAL_TIMEOUT) => None,

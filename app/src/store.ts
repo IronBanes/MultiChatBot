@@ -253,6 +253,8 @@ const delegatedGenerations = new Map<string, string>();
 /** "<message id>:<call id>" → the approval a delegated reply is waiting on, kept so
  *  it can be sent again if the asking device was away (phones drop off often). */
 const pendingApprovals = new Map<string, { deviceId: string; command: DeviceCommand }>();
+/** Counts `shareMyLentTools` runs, so only the newest one sends. */
+let lentPublishes = 0;
 /** "<message id>:<call id>" → the lent call this client is waiting on (borrower side). */
 const pendingLentCalls = new Map<string, { deviceId: string }>();
 /** Tool arguments sent for approval: enough to judge, and well inside the relay's limit. */
@@ -524,11 +526,15 @@ export const useChat = create<ChatState>((set, get) => {
   async function shareMyLentTools() {
     const client = get().client;
     if (!relay || !client || client.platform !== "desktop") return;
+    // Listing tools can be slow; a newer publish reads newer settings, so an older
+    // one still running must not send after it (the relay keeps the last frame).
+    const publish = ++lentPublishes;
     for (const roomId of Object.keys(client.lent_mcp_by_room)) {
       try {
         const servers = await backend.lentTools(roomId);
+        if (publish !== lentPublishes) return;
         // Sending an empty list stops lending there (the last one was unlent).
-        relay.send({ type: "lend_tools", room_id: roomId, servers });
+        relay?.send({ type: "lend_tools", room_id: roomId, servers });
       } catch {
         // Never log the failure: tool names could hint at what's shared.
       }
@@ -1033,6 +1039,9 @@ export const useChat = create<ChatState>((set, get) => {
           // A load_older sent around leaving is refused without an answer; a flag left
           // set would block loading older pages (and replies waiting on them) after a rejoin.
           const { [msg.room_id]: _o, ...loadingOlder } = s.loadingOlder;
+          // Other members' shared tools: a rejoin hears the current ones again, and a
+          // stop missed while away must not leave a stale entry.
+          const { [msg.room_id]: _t, ...roomTools } = s.roomTools;
           const client = s.client && { ...s.client, notify_by_room: withoutKey(s.client.notify_by_room, msg.room_id) };
           return {
             client,
@@ -1042,6 +1051,7 @@ export const useChat = create<ChatState>((set, get) => {
             loaded,
             hasMore,
             loadingOlder,
+            roomTools,
             activeRoomId: s.activeRoomId === msg.room_id ? (roomOrder[0] ?? null) : s.activeRoomId,
           };
         });
