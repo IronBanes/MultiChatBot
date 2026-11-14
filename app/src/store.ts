@@ -544,6 +544,9 @@ export const useChat = create<ChatState>((set, get) => {
       relay?.send({ type: "lent_tool_result", request_id: requestId, content: out.content, is_error: out.is_error, images: out.images });
     } catch (e) {
       relay?.send({ type: "lent_tool_result", request_id: requestId, content: errorText(e), is_error: true, images: [] });
+    } finally {
+      // Answered here, timed out, or refused: the prompt (if any) is done.
+      set((s) => ({ lentPrompts: s.lentPrompts.filter((p) => p.approvalId !== requestId) }));
     }
   }
 
@@ -1438,12 +1441,16 @@ export const useChat = create<ChatState>((set, get) => {
       await get().refreshClient();
       connect();
       // The lender side: prompts for room members' tool calls, from the backend.
-      void listen<LentPrompt>("lent_tool_approval", (event) => {
-        const p = event.payload;
+      void listen<{ approval_id: string; room_id: string; from_name: string; server_name: string; tool: string; args: string }>(
+        "lent_tool_approval",
+        (event) => {
+        const e = event.payload;
+        const p: LentPrompt = { approvalId: e.approval_id, roomId: e.room_id, fromName: e.from_name, serverName: e.server_name, tool: e.tool, args: e.args };
         set((s) => ({
           lentPrompts: s.lentPrompts.some((x) => x.approvalId === p.approvalId) ? s.lentPrompts : [...s.lentPrompts, p],
         }));
-      });
+        },
+      );
     },
 
     async refreshClient() {

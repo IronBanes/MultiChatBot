@@ -61,6 +61,8 @@ const TYPING_MIN_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_LENT_SERVERS: usize = 20;
 /// Tools one connection may lend across all its lent servers.
 const MAX_LENT_TOOLS: usize = 100;
+/// Characters kept from a lent tool's description (the model reads it to pick tools).
+const MAX_LENT_DESCRIPTION: usize = 2_000;
 /// Serialized size one `lend_tools` frame may reach.
 const MAX_LENT_JSON: usize = 256 * 1024;
 /// Serialized size of one lent tool call's `args`.
@@ -118,10 +120,14 @@ struct Stream {
     attachments: Vec<Attachment>,
 }
 
-/// A lent tool call waiting for the lender's answer: both ends' connections.
+/// A lent tool call waiting for the lender's answer, keyed in `Hub::lent_calls` by an
+/// id the relay made up. The lender only ever sees that id, so a caller can't pick
+/// one that collides with (and takes over) another caller's call.
 struct PendingLentCall {
     room_id: String,
     caller: ConnId,
+    /// The id the caller chose, used on everything sent back to it.
+    caller_request_id: String,
     lender: ConnId,
 }
 
@@ -228,6 +234,33 @@ impl Hub {
             device_id: c.device_id.clone(),
             servers: c.lent.get(room_id).cloned().unwrap_or_default(),
         })
+    }
+
+    /// Ends the pending lent calls `ends` matches. A caller still connected hears
+    /// `why` as the tool's error; a lender still connected hears the call was
+    /// cancelled. Connections in `gone` hear nothing (they're leaving).
+    fn end_lent_calls(&mut self, ends: impl Fn(&PendingLentCall) -> bool, gone: &[ConnId], why: &str) {
+        let ids: Vec<String> = self.lent_calls.iter().filter(|(_, p)| ends(p)).map(|(id, _)| id.clone()).collect();
+        for id in ids {
+            let Some(p) = self.lent_calls.remove(&id) else { continue };
+            if let Some(c) = self.conns.get_mut(&p.caller) {
+                c.lent_calls = c.lent_calls.saturating_sub(1);
+            }
+            if !gone.contains(&p.caller) {
+                self.send(
+                    p.caller,
+                    &ServerMsg::LentToolResult {
+                        request_id: p.caller_request_id,
+                        content: why.to_string(),
+                        is_error: true,
+                        images: Vec::new(),
+                    },
+                );
+            }
+            if !gone.contains(&p.lender) {
+                self.send(p.lender, &ServerMsg::LentToolCancelled { request_id: id });
+            }
+        }
     }
 
     /// The newest connection of `user_id`'s device `device_id`, other than `except`.
@@ -478,18 +511,13 @@ impl State {
                     .filter(|(_, c)| c.user_id.as_deref() == Some(user_id.as_str()))
                     .map(|(id, _)| *id)
                     .collect();
-                // Lent tool calls into or out of this room end here: the room
-                // gets an empty `room_tools` below, and a lender outside the
-                // room can't answer a call into it anymore.
-                let lent_gone: Vec<(String, ConnId, ConnId)> = hub
-                    .lent_calls
-                    .iter()
-                    .filter(|(_, p)| p.room_id == room_id)
-                    .map(|(id, p)| (id.clone(), p.caller, p.lender))
-                    .collect();
-                for (id, ..) in &lent_gone {
-                    hub.lent_calls.remove(id);
-                }
+                // This user's lent calls in this room end, as lender (the room gets
+                // an empty `room_tools` below) and as caller. Other members' calls go on.
+                hub.end_lent_calls(
+                    |p| p.room_id == room_id && (mine.contains(&p.caller) || mine.contains(&p.lender)),
+                    &[],
+                    &format!("{display_name} left the room"),
+                );
                 let mut lent_here: Vec<ConnId> = Vec::new();
                 for id in &mine {
                     hub.send(*id, &ServerMsg::RoomLeft { room_id: room_id.clone() });
@@ -510,21 +538,6 @@ impl State {
                 for id in &lent_here {
                     if let Some(msg) = hub.room_tools_msg(&room_id, *id) {
                         hub.broadcast(&room_id, &msg);
-                    }
-                }
-                for (request_id, caller, lender) in lent_gone {
-                    if caller != conn {
-                        self.send(
-                            caller,
-                            ServerMsg::LentToolResult {
-                                request_id,
-                                content: format!("{display_name}'s computer went offline"),
-                                is_error: true,
-                                images: Vec::new(),
-                            },
-                        );
-                    } else {
-                        self.send(lender, ServerMsg::LentToolCancelled { request_id });
                     }
                 }
             }
@@ -1160,7 +1173,7 @@ impl State {
                             .into_iter()
                             .map(|t| LentTool {
                                 name: clip(&t.name, 100),
-                                description: clip(&t.description, MAX_NAME),
+                                description: clip(&t.description, MAX_LENT_DESCRIPTION),
                                 input_schema: t.input_schema,
                             })
                             .collect(),
@@ -1225,11 +1238,13 @@ impl State {
                     .map(|(id, _)| *id)
                     .max();
                 let from_name = hub.conns.get(&conn).map(|c| c.display_name.clone()).unwrap_or_default();
+                // The lender sees only an id made here (see `PendingLentCall`).
+                let lent_id = uuid::Uuid::new_v4().to_string();
                 let delivered = target.is_some_and(|t| {
                     hub.send(
                         t,
                         &ServerMsg::LentToolCall {
-                            request_id: request_id.clone(),
+                            request_id: lent_id.clone(),
                             room_id: room_id.clone(),
                             from_user_id: user_id.clone(),
                             from_name,
@@ -1246,8 +1261,8 @@ impl State {
                     // never exists without a lender that heard the call.
                     c.lent_calls += 1;
                     hub.lent_calls.insert(
-                        request_id,
-                        PendingLentCall { room_id: room_id.clone(), caller: conn, lender: t },
+                        lent_id,
+                        PendingLentCall { room_id: room_id.clone(), caller: conn, caller_request_id: request_id, lender: t },
                     );
                 }
             }
@@ -1256,9 +1271,11 @@ impl State {
                 let mut hub = self.hub();
                 // Only the lender connection recorded for this call may answer,
                 // and only once: the entry is taken, not read.
-                let caller = match hub.lent_calls.remove(&request_id) {
-                    Some(p) if p.lender == conn => p.caller,
-                    _ => return Ok(()),
+                if !hub.lent_calls.get(&request_id).is_some_and(|p| p.lender == conn) {
+                    return Ok(());
+                }
+                let Some(PendingLentCall { caller, caller_request_id, .. }) = hub.lent_calls.remove(&request_id) else {
+                    return Ok(());
                 };
                 if let Some(c) = hub.conns.get_mut(&caller) {
                     c.lent_calls = c.lent_calls.saturating_sub(1);
@@ -1271,21 +1288,14 @@ impl State {
                     .collect();
                 hub.send(
                     caller,
-                    &ServerMsg::LentToolResult { request_id, content, is_error, images },
+                    &ServerMsg::LentToolResult { request_id: caller_request_id, content, is_error, images },
                 );
             }
 
             ClientMsg::CancelLentTool { request_id } => {
                 let mut hub = self.hub();
                 // Only the caller connection may cancel its own call.
-                let lender = match hub.lent_calls.remove(&request_id) {
-                    Some(p) if p.caller == conn => p.lender,
-                    _ => return Ok(()),
-                };
-                if let Some(c) = hub.conns.get_mut(&conn) {
-                    c.lent_calls = c.lent_calls.saturating_sub(1);
-                }
-                hub.send(lender, &ServerMsg::LentToolCancelled { request_id });
+                hub.end_lent_calls(|p| p.caller == conn && p.caller_request_id == request_id, &[conn], "");
             }
 
             ClientMsg::DeviceReply { request_id, to_device_id, error } => {
@@ -1558,61 +1568,32 @@ impl State {
     }
 
     pub async fn disconnect(&self, conn: ConnId) {
-        let (orphaned, user_id, display_name, rooms, lent_rooms, gone) = {
+        let (orphaned, user_id, rooms) = {
             let mut hub = self.hub();
             let Some(c) = hub.conns.remove(&conn) else { return };
-            // What this connection lent: the room gets an empty `room_tools`.
-            let lent_rooms: Vec<String> = c
-                .lent
-                .iter()
-                .filter(|(_, s)| !s.is_empty())
-                .map(|(room, _)| room.clone())
-                .collect();
-            // Its pending lent calls, both as lender and as caller.
-            let gone: Vec<(String, ConnId, ConnId)> = hub
-                .lent_calls
-                .iter()
-                .filter(|(_, p)| p.caller == conn || p.lender == conn)
-                .map(|(id, p)| (id.clone(), p.caller, p.lender))
-                .collect();
-            for (id, ..) in &gone {
-                hub.lent_calls.remove(id);
+            // What this connection lent is gone: an empty `room_tools` for each room.
+            for room_id in c.lent.iter().filter(|(_, s)| !s.is_empty()).map(|(room, _)| room) {
+                let msg = ServerMsg::RoomTools {
+                    room_id: room_id.clone(),
+                    user_id: c.user_id.clone().unwrap_or_default(),
+                    display_name: c.display_name.clone(),
+                    device_id: c.device_id.clone(),
+                    servers: Vec::new(),
+                };
+                hub.broadcast(room_id, &msg);
             }
+            // Its pending lent calls end, as lender and as caller.
+            hub.end_lent_calls(
+                |p| p.caller == conn || p.lender == conn,
+                &[conn],
+                &format!("{}'s computer went offline", c.display_name),
+            );
             let ids: Vec<String> =
                 hub.streams.iter().filter(|(_, s)| s.conn_id == conn).map(|(id, _)| id.clone()).collect();
             let orphaned: Vec<(String, Stream)> =
                 ids.into_iter().filter_map(|id| hub.streams.remove(&id).map(|s| (id, s))).collect();
-            (orphaned, c.user_id, c.display_name, c.rooms, lent_rooms, gone)
+            (orphaned, c.user_id, c.rooms)
         };
-
-        // What it lent in each room is gone: say so with an empty `room_tools`.
-        for room_id in &lent_rooms {
-            let msg = ServerMsg::RoomTools {
-                room_id: room_id.clone(),
-                user_id: user_id.clone().unwrap_or_default(),
-                display_name: display_name.clone(),
-                device_id: String::new(),
-                servers: Vec::new(),
-            };
-            self.broadcast(room_id, msg);
-        }
-        // Its pending lent calls end: the callers hear the computer went
-        // offline, and the lenders of its own calls stop waiting.
-        for (request_id, caller, lender) in gone {
-            if caller != conn {
-                self.send(
-                    caller,
-                    ServerMsg::LentToolResult {
-                        request_id,
-                        content: format!("{display_name}'s computer went offline"),
-                        is_error: true,
-                        images: Vec::new(),
-                    },
-                );
-            } else {
-                self.send(lender, ServerMsg::LentToolCancelled { request_id });
-            }
-        }
 
         for (id, s) in orphaned {
             // Like AiComplete: a delete can't be announced between the write and this.

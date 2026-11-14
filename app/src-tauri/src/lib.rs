@@ -100,7 +100,15 @@ fn mcp_view(server: McpServer) -> McpServerView {
 struct LentServerOut {
     id: String,
     name: String,
-    tools: Vec<mcp::LentToolInfo>,
+    tools: Vec<LentToolOut>,
+}
+
+/// One lent tool in the relay's `LentTool` shape.
+#[derive(Serialize)]
+struct LentToolOut {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -777,9 +785,10 @@ async fn lent_tools(state: State<'_, AppState>, room_id: String) -> Result<Vec<L
     let tools = state.mcp.lent_tools(&servers, &device_id, &owner_name).await;
     let mut out: Vec<LentServerOut> = Vec::new();
     for t in tools {
+        let tool = LentToolOut { name: t.tool, description: t.description, input_schema: t.schema };
         match out.iter_mut().find(|s| s.id == t.server_id) {
-            Some(server) => server.tools.push(t),
-            None => out.push(LentServerOut { id: t.server_id.clone(), name: t.server_name.clone(), tools: vec![t] }),
+            Some(server) => server.tools.push(tool),
+            None => out.push(LentServerOut { id: t.server_id, name: t.server_name, tools: vec![tool] }),
         }
     }
     Ok(out)

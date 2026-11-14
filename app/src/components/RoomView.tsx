@@ -1345,6 +1345,8 @@ function ToolsList({ room }: { room: RoomInfo }) {
   const setMcpLend = useChat((s) => s.setMcpLend);
   const setMcpLendAuto = useChat((s) => s.setMcpLendAuto);
   const myId = useChat((s) => s.client!.user_id);
+  // Lending runs the tools on this computer, which only the desktop app can do.
+  const canLend = useChat((s) => s.client!.platform === "desktop");
   if (servers.length === 0) return <p className="py-2 text-sm text-zinc-500">No MCP servers yet. Add one to let the AI use tools.</p>;
   return (
     <div className="space-y-2">
@@ -1360,7 +1362,8 @@ function ToolsList({ room }: { room: RoomInfo }) {
               </span>
               <Segmented size="sm" value={modes?.[s.id] ?? s.default_mode} onChange={(mode) => setRoomMcpMode(room.id, s.id, mode)} options={MODE_OPTIONS} />
             </div>
-            <div className="mt-1.5 flex items-center justify-between gap-2">
+            {canLend && (
+            <label className="mt-1.5 flex min-h-[44px] items-center justify-between gap-2 sm:min-h-0">
               <span className="text-xs text-zinc-500">Share with this room</span>
               <input
                 type="checkbox"
@@ -1378,8 +1381,9 @@ function ToolsList({ room }: { room: RoomInfo }) {
                 className="h-4 w-4 accent-indigo-600"
                 aria-label={`Share ${s.name} with this room`}
               />
-            </div>
-            {isLent && (
+            </label>
+            )}
+            {canLend && isLent && (
               <div className="mt-2 border-t border-zinc-100 pt-2 dark:border-zinc-800">
                 <p className="mb-1 text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Run without asking</p>
                 {others.length === 0 ? (
@@ -1406,11 +1410,12 @@ function ToolsList({ room }: { room: RoomInfo }) {
                               void setMcpLendAuto(room.id, s.id, m.user_id, false);
                             }
                           }}
-                          className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium transition ${
+                          className={`flex min-h-[44px] items-center gap-1 rounded-full border px-3 py-0.5 text-[11px] font-medium transition sm:min-h-0 sm:px-2 ${
                             auto
                               ? "border-indigo-300 bg-indigo-50 text-indigo-700 dark:border-indigo-800 dark:bg-indigo-950/60 dark:text-indigo-300"
                               : "border-zinc-300 text-zinc-500 dark:border-zinc-700"
                           }`}
+                          aria-pressed={auto}
                           aria-label={`Auto for ${m.display_name}`}
                         >
                           Auto
@@ -1428,10 +1433,13 @@ function ToolsList({ room }: { room: RoomInfo }) {
   );
 }
 
+/** A stable empty list for selectors (a new [] each time would re-render forever). */
+const NO_KEYS: string[] = [];
+
 /** Another member's lent servers this device can borrow in this room. */
 function SharedWithYou({ room }: { room: RoomInfo }) {
   const roomTools = useChat((s) => s.roomTools[room.id]);
-  const borrowed = useChat((s) => s.client?.borrowed_mcp_by_room[room.id] ?? []);
+  const borrowed = useChat((s) => s.client?.borrowed_mcp_by_room[room.id] ?? NO_KEYS);
   const setMcpBorrow = useChat((s) => s.setMcpBorrow);
   const entries = Object.entries(roomTools ?? {}).flatMap(([deviceId, lender]) =>
     lender.servers.map((server) => ({ deviceId, lender, server, key: `${deviceId}:${server.id}` })),
@@ -1442,7 +1450,7 @@ function SharedWithYou({ room }: { room: RoomInfo }) {
       <p className="mb-1 text-[11px] font-semibold tracking-wider text-zinc-400 uppercase">Shared with you</p>
       <div className="space-y-1.5">
         {entries.map(({ key, lender, server }) => (
-          <div key={key} className="flex items-center justify-between gap-2">
+          <label key={key} className="flex min-h-[44px] items-center justify-between gap-2 sm:min-h-0">
             <span className="min-w-0 truncate text-sm" title={`${server.name} · from ${lender.display_name}`}>
               {server.name} · from {lender.display_name}
             </span>
@@ -1453,7 +1461,7 @@ function SharedWithYou({ room }: { room: RoomInfo }) {
               className="h-4 w-4 accent-indigo-600"
               aria-label={`Use ${server.name} from ${lender.display_name}`}
             />
-          </div>
+          </label>
         ))}
       </div>
     </div>
@@ -1503,10 +1511,10 @@ function LentApprovalCard({ p }: { p: LentPrompt }) {
         <pre className="mt-1 max-h-48 overflow-auto rounded-md bg-zinc-100 p-2 font-mono text-[11px] whitespace-pre-wrap dark:bg-zinc-950">{p.args}</pre>
       </details>
       <div className="mt-2 flex gap-2">
-        <Button className="!px-4 !py-2 text-xs sm:!px-3 sm:!py-1" onClick={() => void answerLentTool(p.approvalId, true)}>
+        <Button className="min-h-[44px] !px-4 text-xs sm:min-h-0 sm:!px-3 sm:!py-1" onClick={() => void answerLentTool(p.approvalId, true)}>
           Approve
         </Button>
-        <Button variant="outline" className="!px-4 !py-2 text-xs sm:!px-3 sm:!py-1" onClick={() => void answerLentTool(p.approvalId, false)}>
+        <Button variant="outline" className="min-h-[44px] !px-4 text-xs sm:min-h-0 sm:!px-3 sm:!py-1" onClick={() => void answerLentTool(p.approvalId, false)}>
           Deny
         </Button>
       </div>
