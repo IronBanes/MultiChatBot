@@ -9,6 +9,7 @@ A group chat where everyone brings their own AI. Tauri desktop and mobile app (R
 - `app/src-tauri/src/`: Rust client (`lib.rs` commands, `generate.rs` AI replies and tool rounds, `mcp.rs` MCP client, `config.rs`, `secrets.rs`, `context.rs`, `host.rs` in-app relay, providers).
 - `server/src/`: relay (`hub.rs` handlers, `db.rs`, `protocol.rs`).
 - `docs/PLAN.md`: data models, WebSocket protocol, accounts, delegated replies, remote control, notifications. Check it before changing the protocol, and update it when you do.
+- `docs/design/multichat-ui.pen`: UI reference sheet (desktop, iOS and Android, light and dark) with shared components and color tokens. Open and edit it in pen.dev; the file is encrypted, so don't read it as text. When you change the UI, update the matching screen.
 - `tools/`: `smoke-test.mjs` (relay protocol test), `mock-llm.mjs` and `mock-mcp.mjs` (no real keys needed).
 
 Roadmap: GitHub issue #22.
